@@ -97,6 +97,8 @@
 "auth.password.placeholder" = "Գաղտնաբառ";
 "auth.server.placeholder" = "Backend URL";
 "auth.error.generic" = "Մուտքը չհաջողվեց։";
+"auth.error.invalid_credentials" = "Գաղտնաբառը կամ մուտքի տվյալները սխալ են։";
+"auth.error.account_not_found" = "Հաշիվը սերվերի վրա չի գտնվել։";
 "auth.server.unavailable" = "Օնլայն սերվերն այժմ հասանելի չէ։";
 "contact.search.section" = "Գտնել յուզերնեյմով";
 "contact.search.placeholder" = "Փնտրել յուզերնեյմ";

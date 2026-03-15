@@ -97,6 +97,8 @@
 "auth.password.placeholder" = "Password";
 "auth.server.placeholder" = "Backend URL";
 "auth.error.generic" = "Authentication failed.";
+"auth.error.invalid_credentials" = "Incorrect password or login details.";
+"auth.error.account_not_found" = "Account not found on the server.";
 "auth.server.unavailable" = "Online server unavailable right now.";
 "contact.search.section" = "Find by username";
 "contact.search.placeholder" = "Search username";

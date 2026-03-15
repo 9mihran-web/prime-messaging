@@ -319,7 +319,9 @@ class Handler(BaseHTTPRequestHandler):
                 identifier = str(payload.get("identifier", "")).strip().lower()
                 password = str(payload.get("password", ""))
                 user = find_user_by_identifier(database, identifier)
-                if not user or user.get("password") != password:
+                if not user:
+                    return self.respond(404, {"error": "user_not_found"})
+                if user.get("password") != password:
                     return self.respond(401, {"error": "invalid_credentials"})
                 return self.respond(200, serialize_user(user))
 

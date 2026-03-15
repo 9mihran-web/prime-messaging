@@ -1,5 +1,25 @@
 import Foundation
 
+enum AuthRepositoryError: LocalizedError {
+    case invalidCredentials
+    case accountNotFound
+    case usernameTaken
+    case backendUnavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidCredentials:
+            return "auth.error.invalid_credentials".localized
+        case .accountNotFound:
+            return "auth.error.account_not_found".localized
+        case .usernameTaken:
+            return "onboarding.username.taken".localized
+        case .backendUnavailable:
+            return "auth.server.unavailable".localized
+        }
+    }
+}
+
 struct BackendAuthRepository: AuthRepository {
     let fallback: AuthRepository
     private let decoder = BackendAuthRepository.makeDecoder()
@@ -146,8 +166,21 @@ struct BackendAuthRepository: AuthRepository {
     }
 
     private func validate(response: URLResponse) throws {
-        guard let httpResponse = response as? HTTPURLResponse, 200 ..< 300 ~= httpResponse.statusCode else {
-            throw UsernameRepositoryError.backendUnavailable
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw AuthRepositoryError.backendUnavailable
+        }
+
+        switch httpResponse.statusCode {
+        case 200 ..< 300:
+            return
+        case 401:
+            throw AuthRepositoryError.invalidCredentials
+        case 404:
+            throw AuthRepositoryError.accountNotFound
+        case 409:
+            throw AuthRepositoryError.usernameTaken
+        default:
+            throw AuthRepositoryError.backendUnavailable
         }
     }
 
