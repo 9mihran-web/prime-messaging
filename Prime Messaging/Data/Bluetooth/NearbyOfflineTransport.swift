@@ -545,8 +545,9 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
         knownPeer.offlinePeer = updatedPeer
         knownPeersByPeripheralID[peripheral.identifier] = knownPeer
 
-        peripheralIDsByPeerID[previousPeerID] = nil
+        peripheralIDsByPeerID[previousPeerID] = peripheral.identifier
         peripheralIDsByPeerID[profile.userID] = peripheral.identifier
+        migrateExistingChatIfNeeded(from: previousPeerID, to: updatedPeer)
 
         resolveConnection(
             for: peripheral.identifier,
@@ -656,6 +657,63 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
         let identity = resolvedIdentity()
         let profile = PeerProfile(userID: identity.userID, displayName: identity.displayName, alias: identity.alias)
         return try? encoder.encode(profile)
+    }
+
+    private func migrateExistingChatIfNeeded(from previousPeerID: UUID, to updatedPeer: OfflinePeer) {
+        guard previousPeerID != updatedPeer.id else {
+            return
+        }
+
+        let localUserID = resolvedIdentity().userID
+        let oldChatID = Self.chatID(for: localUserID, and: previousPeerID)
+        let newChatID = Self.chatID(for: localUserID, and: updatedPeer.id)
+
+        guard oldChatID != newChatID else {
+            return
+        }
+
+        if let oldChat = chatsByID.removeValue(forKey: oldChatID) {
+            let migratedChat = Chat(
+                id: newChatID,
+                mode: oldChat.mode,
+                type: oldChat.type,
+                title: updatedPeer.displayName,
+                subtitle: updatedPeer.alias.isEmpty ? "Nearby" : "@\(updatedPeer.alias)",
+                participantIDs: [localUserID, updatedPeer.id],
+                group: oldChat.group,
+                lastMessagePreview: oldChat.lastMessagePreview,
+                lastActivityAt: oldChat.lastActivityAt,
+                unreadCount: oldChat.unreadCount,
+                isPinned: oldChat.isPinned,
+                draft: oldChat.draft,
+                disappearingPolicy: oldChat.disappearingPolicy,
+                notificationPreferences: oldChat.notificationPreferences
+            )
+            chatsByID[newChatID] = migratedChat
+        }
+
+        if let messages = messagesByChatID.removeValue(forKey: oldChatID) {
+            let migratedMessages = messages.map { message in
+                Message(
+                    id: message.id,
+                    chatID: newChatID,
+                    senderID: message.senderID,
+                    mode: message.mode,
+                    kind: message.kind,
+                    text: message.text,
+                    attachments: message.attachments,
+                    replyToMessageID: message.replyToMessageID,
+                    status: message.status,
+                    createdAt: message.createdAt,
+                    editedAt: message.editedAt,
+                    deletedForEveryoneAt: message.deletedForEveryoneAt,
+                    reactions: message.reactions,
+                    voiceMessage: message.voiceMessage,
+                    liveLocation: message.liveLocation
+                )
+            }
+            messagesByChatID[newChatID] = migratedMessages
+        }
     }
 
     private func resolvedIdentity() -> (userID: UUID, displayName: String, alias: String, user: User?) {
