@@ -1,0 +1,11 @@
+services:
+  prime-messaging-backend:
+    build:
+      context: ./Backend
+    ports:
+      - "8080:8080"
+    environment:
+      PRIME_MESSAGING_HOST: "0.0.0.0"
+      PRIME_MESSAGING_PORT: "8080"
+    volumes:
+      - ./Backend/data:/app/data

@@ -1,0 +1,11 @@
+.DS_Store
+.deriveddata/
+DerivedData/
+
+# Xcode user data
+xcuserdata/
+*.xcuserstate
+
+# Local scratch files
+kjekjekje.png
+vhgw.png
