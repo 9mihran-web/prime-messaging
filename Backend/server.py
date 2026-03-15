@@ -220,13 +220,6 @@ class Handler(BaseHTTPRequestHandler):
                 available = bool(username) and not username_taken(database, username, user_id)
                 return self.respond(200, {"available": available})
 
-            if parsed.path.startswith("/users/") and "/profile" not in parsed.path and "/avatar" not in parsed.path:
-                user_id = parsed.path.split("/")[2]
-                user = find_user(database, user_id)
-                if not user:
-                    return self.respond(404, {"error": "user_not_found"})
-                return self.respond(200, serialize_user(user))
-
             if parsed.path == "/users/search":
                 params = parse_qs(parsed.query)
                 query = (params.get("query") or [""])[0].strip().lower()
@@ -240,6 +233,13 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 ]
                 return self.respond(200, users[:20])
+
+            if parsed.path.startswith("/users/") and "/profile" not in parsed.path and "/avatar" not in parsed.path:
+                user_id = parsed.path.split("/")[2]
+                user = find_user(database, user_id)
+                if not user:
+                    return self.respond(404, {"error": "user_not_found"})
+                return self.respond(200, serialize_user(user))
 
             if parsed.path == "/chats":
                 params = parse_qs(parsed.query)
