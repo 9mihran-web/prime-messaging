@@ -117,7 +117,7 @@ final class LocalPushNotificationService: NSObject, PushNotificationService {
 
     private func scheduleNotification(for item: NotifiableMessage) async {
         let content = UNMutableNotificationContent()
-        content.title = item.chat.title
+        content.title = item.chat.resolvedDisplayTitle
         content.body = item.message.text ?? "New message"
         content.sound = .default
         content.badge = 1

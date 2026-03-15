@@ -45,7 +45,7 @@ struct ChatView: View {
                 }
             )
         }
-        .navigationTitle(chat.title)
+        .navigationTitle(chat.resolvedDisplayTitle)
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             appState.selectedChat = chat

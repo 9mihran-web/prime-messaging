@@ -48,6 +48,29 @@ struct NotificationPreferences: Codable, Hashable {
 }
 
 extension Chat {
+    var resolvedDisplayTitle: String {
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard type == .direct else {
+            return trimmedTitle.isEmpty ? title : trimmedTitle
+        }
+
+        let isGenericTitle = trimmedTitle.isEmpty || trimmedTitle.caseInsensitiveCompare("Direct Chat") == .orderedSame
+        guard isGenericTitle else {
+            return trimmedTitle
+        }
+
+        let trimmedSubtitle = subtitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedSubtitle.hasPrefix("@") {
+            return String(trimmedSubtitle.dropFirst())
+        }
+
+        if !trimmedSubtitle.isEmpty && trimmedSubtitle.caseInsensitiveCompare("Direct conversation") != .orderedSame {
+            return trimmedSubtitle
+        }
+
+        return "Chat"
+    }
+
     static func mock(mode: ChatMode, currentUserID: UUID) -> [Chat] {
         return [
             Chat(

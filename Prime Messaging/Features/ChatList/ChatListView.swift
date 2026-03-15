@@ -48,14 +48,14 @@ struct ChatRowView: View {
                 .fill(chat.mode == .online ? PrimeTheme.Colors.accent.opacity(0.85) : PrimeTheme.Colors.offlineAccent.opacity(0.9))
                 .frame(width: 52, height: 52)
                 .overlay(
-                    Text(String(chat.title.prefix(1)))
+                    Text(String(chat.resolvedDisplayTitle.prefix(1)))
                         .font(.headline)
                         .foregroundStyle(Color.white)
                 )
 
             VStack(alignment: .leading, spacing: PrimeTheme.Spacing.xSmall) {
                 HStack {
-                    Text(chat.title)
+                    Text(chat.resolvedDisplayTitle)
                         .font(.headline)
                     Spacer()
                     Text(chat.lastActivityAt.formatted(date: .omitted, time: .shortened))

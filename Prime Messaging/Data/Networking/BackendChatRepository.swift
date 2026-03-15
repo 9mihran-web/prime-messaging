@@ -25,7 +25,8 @@ struct BackendChatRepository: ChatRepository {
             let (data, response) = try await URLSession.shared.data(from: url)
             try validate(response: response)
             let chats = try decoder.decode([Chat].self, from: data)
-            return injectingSavedMessages(into: chats, mode: mode, userID: userID)
+            let preparedChats = injectingSavedMessages(into: chats, mode: mode, userID: userID)
+            return try await hydratingDirectChatTitles(in: preparedChats, currentUserID: userID, baseURL: baseURL)
         } catch {
             throw error
         }
@@ -147,6 +148,39 @@ struct BackendChatRepository: ChatRepository {
         guard let httpResponse = response as? HTTPURLResponse, 200 ..< 300 ~= httpResponse.statusCode else {
             throw UsernameRepositoryError.backendUnavailable
         }
+    }
+
+    private func hydratingDirectChatTitles(in chats: [Chat], currentUserID: UUID, baseURL: URL) async throws -> [Chat] {
+        var hydratedChats = chats
+
+        for index in hydratedChats.indices {
+            guard needsHydration(hydratedChats[index]) else { continue }
+            guard let otherUserID = hydratedChats[index].participantIDs.first(where: { $0 != currentUserID }) else { continue }
+
+            do {
+                let user = try await fetchUser(id: otherUserID, baseURL: baseURL)
+                hydratedChats[index].title = user.profile.displayName
+                hydratedChats[index].subtitle = "@\(user.profile.username)"
+            } catch { }
+        }
+
+        return hydratedChats
+    }
+
+    private func needsHydration(_ chat: Chat) -> Bool {
+        guard chat.type == .direct else {
+            return false
+        }
+
+        let trimmedTitle = chat.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedTitle.isEmpty || trimmedTitle.caseInsensitiveCompare("Direct Chat") == .orderedSame
+    }
+
+    private func fetchUser(id: UUID, baseURL: URL) async throws -> User {
+        let url = baseURL.appending(path: "/users/\(id.uuidString)")
+        let (data, response) = try await URLSession.shared.data(from: url)
+        try validate(response: response)
+        return try decoder.decode(User.self, from: data)
     }
 
     private static func makeDecoder() -> JSONDecoder {
