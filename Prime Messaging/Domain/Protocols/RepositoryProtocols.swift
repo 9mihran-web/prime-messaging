@@ -36,9 +36,37 @@ protocol SettingsRepository {
     func claimUsername(_ username: String, for userID: UUID) async throws
 }
 
-protocol PushNotificationService {
+enum PushAuthorizationStatus: String {
+    case notDetermined
+    case denied
+    case authorized
+    case provisional
+    case ephemeral
+
+    var localizationKey: String {
+        switch self {
+        case .notDetermined:
+            return "settings.notifications.status.not_determined"
+        case .denied:
+            return "settings.notifications.status.denied"
+        case .authorized:
+            return "settings.notifications.status.authorized"
+        case .provisional:
+            return "settings.notifications.status.provisional"
+        case .ephemeral:
+            return "settings.notifications.status.ephemeral"
+        }
+    }
+}
+
+@MainActor
+protocol PushNotificationService: AnyObject {
     func registerForRemoteNotifications() async
     func syncDeviceToken(_ token: Data) async
+    func authorizationStatus() async -> PushAuthorizationStatus
+    func startMonitoring(currentUser: User, chatRepository: ChatRepository) async
+    func stopMonitoring() async
+    func updateActiveChat(_ chat: Chat?) async
 }
 
 protocol OfflineTransporting {

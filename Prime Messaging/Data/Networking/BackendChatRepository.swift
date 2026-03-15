@@ -2,6 +2,7 @@ import Foundation
 
 struct BackendChatRepository: ChatRepository {
     let fallback: ChatRepository
+    private let decoder = BackendChatRepository.makeDecoder()
 
     func fetchChats(mode: ChatMode, for userID: UUID) async throws -> [Chat] {
         guard
@@ -23,10 +24,10 @@ struct BackendChatRepository: ChatRepository {
         do {
             let (data, response) = try await URLSession.shared.data(from: url)
             try validate(response: response)
-            let chats = try JSONDecoder().decode([Chat].self, from: data)
+            let chats = try decoder.decode([Chat].self, from: data)
             return injectingSavedMessages(into: chats, mode: mode, userID: userID)
         } catch {
-            return try await fallback.fetchChats(mode: mode, for: userID)
+            throw error
         }
     }
 
@@ -47,9 +48,9 @@ struct BackendChatRepository: ChatRepository {
         do {
             let (data, response) = try await URLSession.shared.data(from: url)
             try validate(response: response)
-            return try JSONDecoder().decode([Message].self, from: data)
+            return try decoder.decode([Message].self, from: data)
         } catch {
-            return try await fallback.fetchMessages(chatID: chatID, mode: mode)
+            throw error
         }
     }
 
@@ -136,11 +137,8 @@ struct BackendChatRepository: ChatRepository {
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             try validate(response: response)
-            return try JSONDecoder().decode(Response.self, from: data)
+            return try decoder.decode(Response.self, from: data)
         } catch {
-            if let fallback {
-                return try await fallback()
-            }
             throw error
         }
     }
@@ -149,6 +147,12 @@ struct BackendChatRepository: ChatRepository {
         guard let httpResponse = response as? HTTPURLResponse, 200 ..< 300 ~= httpResponse.statusCode else {
             throw UsernameRepositoryError.backendUnavailable
         }
+    }
+
+    private static func makeDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
     }
 }
 

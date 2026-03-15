@@ -17,7 +17,11 @@ struct MockChatRepository: ChatRepository {
     }
 
     func fetchMessages(chatID: UUID, mode: ChatMode) async throws -> [Message] {
-        Message.mock(chatID: chatID, mode: mode, currentUserID: User.mockCurrentUser.id)
+        if mode == .online {
+            return []
+        }
+
+        return Message.mock(chatID: chatID, mode: mode, currentUserID: User.mockCurrentUser.id)
     }
 
     func sendMessage(_ text: String, in chatID: UUID, mode: ChatMode, senderID: UUID) async throws -> Message {
@@ -30,7 +34,7 @@ struct MockChatRepository: ChatRepository {
             text: text,
             attachments: [],
             replyToMessageID: nil,
-            status: mode == .offline ? .sent : .sending,
+            status: .sent,
             createdAt: .now,
             editedAt: nil,
             deletedForEveryoneAt: nil,

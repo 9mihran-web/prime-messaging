@@ -131,11 +131,11 @@ def chat_title_for(chat, current_user_id, database):
 
     other_ids = [user_id for user_id in chat["participantIDs"] if user_id != current_user_id]
     if not other_ids:
-        return "Direct Chat"
+        return chat.get("cachedTitle", "Direct Chat")
 
     other_user = find_user(database, other_ids[0])
     if not other_user:
-        return "Direct Chat"
+        return chat.get("cachedTitle", "Direct Chat")
 
     return other_user["profile"]["displayName"]
 
@@ -143,11 +143,11 @@ def chat_title_for(chat, current_user_id, database):
 def chat_subtitle_for(chat, current_user_id, database):
     other_ids = [user_id for user_id in chat["participantIDs"] if user_id != current_user_id]
     if not other_ids:
-        return "Notes and drafts"
+        return chat.get("cachedSubtitle", "Notes and drafts")
 
     other_user = find_user(database, other_ids[0])
     if not other_user:
-        return "Direct conversation"
+        return chat.get("cachedSubtitle", "Direct conversation")
 
     return f"@{other_user['profile']['username']}"
 
@@ -385,6 +385,9 @@ class Handler(BaseHTTPRequestHandler):
                 current_user_id = str(payload.get("current_user_id", "")).strip()
                 other_user_id = str(payload.get("other_user_id", "")).strip()
                 mode = str(payload.get("mode", "online")).strip()
+                other_user = find_user(database, other_user_id)
+                cached_title = other_user["profile"]["displayName"] if other_user else "Direct Chat"
+                cached_subtitle = f"@{other_user['profile']['username']}" if other_user else "Direct conversation"
 
                 existing = next(
                     (
@@ -402,10 +405,16 @@ class Handler(BaseHTTPRequestHandler):
                         "mode": mode,
                         "type": "direct",
                         "participantIDs": [current_user_id, other_user_id],
+                        "cachedTitle": cached_title,
+                        "cachedSubtitle": cached_subtitle,
                         "createdAt": now_iso(),
                     }
                     database["chats"].append(existing)
-                    save_db(database)
+                else:
+                    existing["cachedTitle"] = cached_title
+                    existing["cachedSubtitle"] = cached_subtitle
+
+                save_db(database)
 
                 return self.respond(200, serialize_chat(existing, current_user_id, database))
 

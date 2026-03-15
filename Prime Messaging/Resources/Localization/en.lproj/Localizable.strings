@@ -19,6 +19,16 @@
 "settings.notifications" = "Notifications";
 "settings.notifications.push" = "Push notifications";
 "settings.notifications.preview" = "Preview text";
+"settings.notifications.body" = "Prime Messaging can show system notifications for new incoming online and nearby messages on this iPhone.";
+"settings.notifications.status" = "Status";
+"settings.notifications.status.not_determined" = "Not requested yet";
+"settings.notifications.status.denied" = "Denied";
+"settings.notifications.status.authorized" = "Allowed";
+"settings.notifications.status.provisional" = "Provisional";
+"settings.notifications.status.ephemeral" = "Ephemeral";
+"settings.notifications.request" = "Enable notifications";
+"settings.notifications.open" = "Open iPhone Settings";
+"settings.notifications.typing" = "Typing is better handled live inside the chat, so it is not sent as a push notification.";
 "settings.offline" = "Offline Mode";
 "settings.offline.nearby" = "Nearby Bluetooth";
 "settings.nearby.access" = "Nearby Access";

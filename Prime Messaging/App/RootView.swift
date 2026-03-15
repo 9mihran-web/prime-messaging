@@ -37,11 +37,20 @@ struct RootView: View {
         }
         .task(id: rootTaskID) {
             if appState.hasCompletedOnboarding {
+                await environment.pushNotificationService.registerForRemoteNotifications()
+                await environment.pushNotificationService.startMonitoring(
+                    currentUser: appState.currentUser,
+                    chatRepository: environment.chatRepository
+                )
                 await environment.offlineTransport.updateCurrentUser(appState.currentUser)
                 await environment.offlineTransport.startScanning()
             } else {
+                await environment.pushNotificationService.stopMonitoring()
                 await environment.offlineTransport.stopScanning()
             }
+        }
+        .task(id: appState.selectedChat?.id.uuidString ?? "no-active-chat") {
+            await environment.pushNotificationService.updateActiveChat(appState.selectedChat)
         }
     }
 

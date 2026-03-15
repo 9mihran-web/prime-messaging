@@ -19,6 +19,16 @@
 "settings.notifications" = "Ծանուցումներ";
 "settings.notifications.push" = "Push ծանուցումներ";
 "settings.notifications.preview" = "Տեքստի նախադիտում";
+"settings.notifications.body" = "Prime Messaging-ը կարող է այս iPhone-ի վրա ցույց տալ համակարգային ծանուցումներ նոր առցանց և nearby մուտքային հաղորդագրությունների համար։";
+"settings.notifications.status" = "Կարգավիճակ";
+"settings.notifications.status.not_determined" = "Դեռ չի հարցվել";
+"settings.notifications.status.denied" = "Մերժված է";
+"settings.notifications.status.authorized" = "Թույլատրված է";
+"settings.notifications.status.provisional" = "Provisional";
+"settings.notifications.status.ephemeral" = "Ephemeral";
+"settings.notifications.request" = "Միացնել ծանուցումները";
+"settings.notifications.open" = "Բացել iPhone Settings-ը";
+"settings.notifications.typing" = "Typing-ը ճիշտ է ցույց տալ հենց չատի ներսում, դրա համար այն push ծանուցմամբ չի ուղարկվում։";
 "settings.offline" = "Անցանց ռեժիմ";
 "settings.offline.nearby" = "Մոտակա Bluetooth";
 "settings.nearby.access" = "Nearby հասանելիություն";

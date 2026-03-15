@@ -2,6 +2,7 @@ import Foundation
 
 struct BackendAuthRepository: AuthRepository {
     let fallback: AuthRepository
+    private let decoder = BackendAuthRepository.makeDecoder()
 
     func currentUser() async throws -> User {
         try await fallback.currentUser()
@@ -109,9 +110,9 @@ struct BackendAuthRepository: AuthRepository {
         do {
             let (data, response) = try await URLSession.shared.data(from: url)
             try validate(response: response)
-            return try JSONDecoder().decode([User].self, from: data)
+            return try decoder.decode([User].self, from: data)
         } catch {
-            return try await fallback.searchUsers(query: query, excluding: userID)
+            throw error
         }
     }
 
@@ -138,11 +139,8 @@ struct BackendAuthRepository: AuthRepository {
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             try validate(response: response)
-            return try JSONDecoder().decode(Response.self, from: data)
+            return try decoder.decode(Response.self, from: data)
         } catch {
-            if let fallback {
-                return try await fallback()
-            }
             throw error
         }
     }
@@ -151,6 +149,12 @@ struct BackendAuthRepository: AuthRepository {
         guard let httpResponse = response as? HTTPURLResponse, 200 ..< 300 ~= httpResponse.statusCode else {
             throw UsernameRepositoryError.backendUnavailable
         }
+    }
+
+    private static func makeDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
     }
 }
 

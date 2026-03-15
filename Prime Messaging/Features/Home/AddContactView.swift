@@ -127,11 +127,14 @@ struct AddContactView: View {
     @MainActor
     private func openOnlineChat(with user: User) async {
         do {
-            createdChat = try await environment.chatRepository.createDirectChat(
+            var chat = try await environment.chatRepository.createDirectChat(
                 with: user.id,
                 currentUserID: appState.currentUser.id,
                 mode: appState.selectedMode
             )
+            chat.title = user.profile.displayName
+            chat.subtitle = "@\(user.profile.username)"
+            createdChat = chat
             errorText = ""
         } catch {
             errorText = error.localizedDescription.isEmpty ? "contact.chat.failed".localized : error.localizedDescription

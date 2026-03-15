@@ -39,7 +39,9 @@ struct SettingsView: View {
             }
 
             Section("settings.notifications".localized) {
-                Label("settings.notifications.push".localized, systemImage: "bell.badge")
+                NavigationLink("settings.notifications.push".localized) {
+                    NotificationsView()
+                }
                 Label("settings.notifications.preview".localized, systemImage: "text.bubble")
             }
 

@@ -47,6 +47,14 @@ struct ChatView: View {
         }
         .navigationTitle(chat.title)
         .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            appState.selectedChat = chat
+        }
+        .onDisappear {
+            if appState.selectedChat?.id == chat.id {
+                appState.selectedChat = nil
+            }
+        }
         .task {
             await viewModel.loadMessages(chat: chat, repository: environment.chatRepository)
         }

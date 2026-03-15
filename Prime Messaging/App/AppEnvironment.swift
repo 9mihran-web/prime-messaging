@@ -46,7 +46,7 @@ struct AppEnvironment {
                 fallback: mockSettings
             ),
             localStore: store,
-            pushNotificationService: MockPushNotificationService(),
+            pushNotificationService: LocalPushNotificationService(),
             offlineTransport: offlineTransport
         )
     }
