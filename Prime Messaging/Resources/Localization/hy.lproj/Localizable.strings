@@ -32,7 +32,7 @@
 "settings.offline" = "Անցանց ռեժիմ";
 "settings.offline.nearby" = "Մոտակա Bluetooth";
 "settings.nearby.access" = "Nearby հասանելիություն";
-"settings.nearby.access.body" = "Այս էջը բացիր յուրաքանչյուր հեռախոսի վրա մեկ անգամ, որպեսզի համակարգը հարցնի Local Network և Bluetooth հասանելիությունը։ Եթե toggle-ները դեռ չկան, բացիր iPhone Settings-ը Prime Messaging-ի համար։";
+"settings.nearby.access.body" = "Այս էջը բացիր յուրաքանչյուր հեռախոսի վրա մեկ անգամ, որպեսզի համակարգը հարցնի Bluetooth հասանելիությունը մոտակա անցանց հաղորդակցության համար։ Եթե Bluetooth toggle-ը դեռ չկա, բացիր iPhone Settings-ը Prime Messaging-ի համար։";
 "settings.nearby.request" = "Հարցնել nearby հասանելիություն";
 "settings.nearby.open" = "Բացել iPhone Settings-ը";
 "settings.nearby.status.requested" = "Հարցումը ուղարկված է։ Եթե iPhone-ը ցույց տա թույլտվության պատուհան, հաստատիր այն։";
@@ -87,7 +87,7 @@
 "contact.handle.placeholder" = "Հեռախոս, էլ. փոստ կամ օգտանուն";
 "contact.create.chat" = "Բացել չատը";
 "contact.bluetooth.section" = "Մոտակայքում Bluetooth-ով";
-"contact.bluetooth.empty" = "Մոտակա սարքեր չեն գտնվել։ Բացիր Prime Messaging-ը երկու հեռախոսների վրա և թույլ տուր Bluetooth ու Local Network հասանելիությունը։";
+"contact.bluetooth.empty" = "Մոտակա Bluetooth սարքեր չեն գտնվել։ Բացիր Prime Messaging-ը երկու հեռախոսների վրա և թույլ տուր Bluetooth հասանելիությունը։";
 "contact.new.subtitle" = "Նոր կոնտակտ";
 "auth.subtitle" = "Գրանցվիր կամ մուտք գործիր, որպեսզի շարունակես նամակագրությունը։";
 "auth.mode" = "Մուտք";

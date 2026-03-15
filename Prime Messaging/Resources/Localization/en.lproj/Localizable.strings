@@ -32,7 +32,7 @@
 "settings.offline" = "Offline Mode";
 "settings.offline.nearby" = "Nearby Bluetooth";
 "settings.nearby.access" = "Nearby Access";
-"settings.nearby.access.body" = "Use this page once on each phone to trigger Local Network and Bluetooth discovery. If the system toggles are still missing, open iPhone Settings for Prime Messaging.";
+"settings.nearby.access.body" = "Use this page once on each phone to trigger Bluetooth discovery for nearby offline messaging. If the Bluetooth toggle is still missing, open iPhone Settings for Prime Messaging.";
 "settings.nearby.request" = "Request nearby access";
 "settings.nearby.open" = "Open iPhone Settings";
 "settings.nearby.status.requested" = "Request sent. If iPhone shows a permission popup, allow it.";
@@ -87,7 +87,7 @@
 "contact.handle.placeholder" = "Phone, e-mail, or username";
 "contact.create.chat" = "Open chat";
 "contact.bluetooth.section" = "Nearby via Bluetooth";
-"contact.bluetooth.empty" = "No nearby devices found. Open Prime Messaging on both phones and allow Bluetooth and Local Network access.";
+"contact.bluetooth.empty" = "No nearby Bluetooth devices found. Open Prime Messaging on both phones and allow Bluetooth access.";
 "contact.new.subtitle" = "New contact";
 "auth.subtitle" = "Sign up for a new account or log in to continue messaging.";
 "auth.mode" = "Authentication";

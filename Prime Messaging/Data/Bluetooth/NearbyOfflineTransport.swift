@@ -1,37 +1,55 @@
+import CoreBluetooth
 import CryptoKit
 import Foundation
-import MultipeerConnectivity
 import UIKit
 
 @MainActor
 final class NearbyOfflineTransport: NSObject, OfflineTransporting {
     private struct KnownPeer {
-        let peerID: MCPeerID
+        let peripheralID: UUID
+        var peripheral: CBPeripheral
         var offlinePeer: OfflinePeer
+        var writableCharacteristic: CBCharacteristic?
+        var profileCharacteristic: CBCharacteristic?
+    }
+
+    private struct PeerProfile: Codable {
+        let userID: UUID
+        let displayName: String
+        let alias: String
     }
 
     private struct WireMessage: Codable {
         let id: UUID
         let chatID: UUID
         let senderID: UUID
+        let senderName: String
+        let senderAlias: String
         let text: String
         let createdAt: TimeInterval
     }
 
-    private static let serviceType = "prmsgchat"
+    private static let serviceUUID = CBUUID(string: "6A0C1001-2D2E-4A9E-A0C2-9C6C2F1D1001")
+    private static let profileCharacteristicUUID = CBUUID(string: "6A0C1002-2D2E-4A9E-A0C2-9C6C2F1D1002")
+    private static let inboxCharacteristicUUID = CBUUID(string: "6A0C1003-2D2E-4A9E-A0C2-9C6C2F1D1003")
     private static let currentUserKey = "app_state.current_user"
     private static let installationIDKey = "offline_transport.installation_id"
+    private static let centralRestoreID = "mirowin.prime-messaging.ble.central"
+    private static let peripheralRestoreID = "mirowin.prime-messaging.ble.peripheral"
 
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+
     private var currentUser: User?
-    private var localPeerID: MCPeerID?
-    private var session: MCSession?
-    private var advertiser: MCNearbyServiceAdvertiser?
-    private var browser: MCNearbyServiceBrowser?
     private var isScanning = false
-    private var knownPeers: [UUID: KnownPeer] = [:]
-    private var peerIDsByDisplayName: [String: UUID] = [:]
+
+    private var centralManager: CBCentralManager?
+    private var peripheralManager: CBPeripheralManager?
+    private var profileCharacteristic: CBMutableCharacteristic?
+    private var inboxCharacteristic: CBMutableCharacteristic?
+
+    private var knownPeersByPeripheralID: [UUID: KnownPeer] = [:]
+    private var peripheralIDsByPeerID: [UUID: UUID] = [:]
     private var chatsByID: [UUID: Chat] = [:]
     private var messagesByChatID: [UUID: [Message]] = [:]
     private var pendingConnections: [UUID: CheckedContinuation<BluetoothSession, Error>] = [:]
@@ -48,27 +66,28 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
 
         currentUser = user
 
-        if shouldRestart && isScanning {
-            rebuildTransport()
+        if shouldRestart {
+            restartTransport()
         }
     }
 
     func startScanning() async {
         isScanning = true
-        ensureTransport()
-        advertiser?.startAdvertisingPeer()
-        browser?.startBrowsingForPeers()
+        ensureManagers()
+        restartAdvertisingIfNeeded()
+        restartScanningIfNeeded()
     }
 
     func stopScanning() async {
         isScanning = false
-        advertiser?.stopAdvertisingPeer()
-        browser?.stopBrowsingForPeers()
+        centralManager?.stopScan()
+        peripheralManager?.stopAdvertising()
     }
 
     func discoveredPeers() async -> [OfflinePeer] {
-        knownPeers.values
+        knownPeersByPeripheralID.values
             .map(\.offlinePeer)
+            .filter(\.isReachable)
             .sorted(by: { lhs, rhs in
                 if lhs.signalStrength != rhs.signalStrength {
                     return lhs.signalStrength > rhs.signalStrength
@@ -78,21 +97,27 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
     }
 
     func connect(to peer: OfflinePeer) async throws -> BluetoothSession {
-        ensureTransport()
+        ensureManagers()
 
-        guard let knownPeer = knownPeers[peer.id], let session, let browser else {
+        guard let peripheralID = peripheralIDsByPeerID[peer.id] else {
             throw OfflineTransportError.peerUnavailable
         }
 
-        if session.connectedPeers.contains(knownPeer.peerID) {
-            return bluetoothSession(for: peer.id, state: .connected)
+        guard let knownPeer = knownPeersByPeripheralID[peripheralID], let centralManager else {
+            throw OfflineTransportError.peerUnavailable
         }
 
-        browser.invitePeer(knownPeer.peerID, to: session, withContext: nil, timeout: 10)
+        if knownPeer.peripheral.state == .connected, knownPeer.writableCharacteristic != nil {
+            return bluetoothSession(for: knownPeer.offlinePeer.id, state: .connected)
+        }
+
+        knownPeer.peripheral.delegate = self
+        knownPeersByPeripheralID[peripheralID] = knownPeer
+        centralManager.connect(knownPeer.peripheral, options: nil)
 
         return try await withCheckedThrowingContinuation { continuation in
-            pendingConnections[peer.id] = continuation
-            scheduleConnectionTimeout(for: peer.id)
+            pendingConnections[peripheralID] = continuation
+            scheduleConnectionTimeout(for: peripheralID)
         }
     }
 
@@ -114,7 +139,9 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
         await updateCurrentUser(currentUser)
         _ = try await connect(to: peer)
 
-        let chatID = Self.chatID(for: currentUser.id, and: peer.id)
+        let resolvedPeer = resolvedPeer(afterConnectingTo: peer.id) ?? peer
+        let chatID = Self.chatID(for: currentUser.id, and: resolvedPeer.id)
+
         if let existing = chatsByID[chatID] {
             return existing
         }
@@ -123,9 +150,9 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
             id: chatID,
             mode: .offline,
             type: .direct,
-            title: peer.displayName,
-            subtitle: peer.alias.isEmpty ? "Nearby" : "@\(peer.alias)",
-            participantIDs: [currentUser.id, peer.id],
+            title: resolvedPeer.displayName,
+            subtitle: resolvedPeer.alias.isEmpty ? "Nearby" : "@\(resolvedPeer.alias)",
+            participantIDs: [currentUser.id, resolvedPeer.id],
             group: nil,
             lastMessagePreview: nil,
             lastActivityAt: .now,
@@ -175,29 +202,41 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
             return message
         }
 
-        guard let remoteUserID = chat.participantIDs.first(where: { $0 != senderID }) else {
+        guard let remotePeerID = chat.participantIDs.first(where: { $0 != senderID }) else {
             throw OfflineTransportError.chatUnavailable
         }
 
-        guard let knownPeer = knownPeers[remoteUserID], let session else {
+        guard let peripheralID = peripheralIDsByPeerID[remotePeerID], var knownPeer = knownPeersByPeripheralID[peripheralID] else {
             throw OfflineTransportError.peerUnavailable
         }
 
-        if session.connectedPeers.contains(knownPeer.peerID) == false {
+        if knownPeer.peripheral.state != .connected || knownPeer.writableCharacteristic == nil {
             _ = try await connect(to: knownPeer.offlinePeer)
+            guard let refreshedPeer = knownPeersByPeripheralID[peripheralID] else {
+                throw OfflineTransportError.peerUnavailable
+            }
+            knownPeer = refreshedPeer
         }
 
+        guard let characteristic = knownPeer.writableCharacteristic else {
+            throw OfflineTransportError.peerUnavailable
+        }
+
+        let identity = resolvedIdentity()
         let wireMessage = WireMessage(
             id: message.id,
             chatID: chat.id,
             senderID: senderID,
+            senderName: identity.displayName,
+            senderAlias: identity.alias,
             text: trimmed,
             createdAt: message.createdAt.timeIntervalSince1970
         )
 
         do {
             let data = try encoder.encode(wireMessage)
-            try session.send(data, toPeers: [knownPeer.peerID], with: .reliable)
+            let writeType: CBCharacteristicWriteType = characteristic.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
+            knownPeer.peripheral.writeValue(data, for: characteristic, type: writeType)
             return message
         } catch {
             replaceMessageStatus(messageID: message.id, in: chat.id, status: .failed)
@@ -205,68 +244,128 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
         }
     }
 
-    private func ensureTransport() {
-        if session != nil, advertiser != nil, browser != nil {
+    private func ensureManagers() {
+        if centralManager == nil {
+            centralManager = CBCentralManager(
+                delegate: self,
+                queue: nil,
+                options: [
+                    CBCentralManagerOptionShowPowerAlertKey: true,
+                    CBCentralManagerOptionRestoreIdentifierKey: Self.centralRestoreID,
+                ]
+            )
+        }
+
+        if peripheralManager == nil {
+            peripheralManager = CBPeripheralManager(
+                delegate: self,
+                queue: nil,
+                options: [
+                    CBPeripheralManagerOptionShowPowerAlertKey: true,
+                    CBPeripheralManagerOptionRestoreIdentifierKey: Self.peripheralRestoreID,
+                ]
+            )
+        }
+    }
+
+    private func restartTransport() {
+        centralManager?.stopScan()
+        peripheralManager?.stopAdvertising()
+
+        for knownPeer in knownPeersByPeripheralID.values where knownPeer.peripheral.state != .disconnected {
+            centralManager?.cancelPeripheralConnection(knownPeer.peripheral)
+        }
+
+        knownPeersByPeripheralID.removeAll()
+        peripheralIDsByPeerID.removeAll()
+        pendingConnections.removeAll()
+        pendingConnectionTimeouts.values.forEach { $0.cancel() }
+        pendingConnectionTimeouts.removeAll()
+
+        restartAdvertisingIfNeeded()
+        restartScanningIfNeeded()
+    }
+
+    private func restartScanningIfNeeded() {
+        guard isScanning, let centralManager, centralManager.state == .poweredOn else {
             return
         }
 
+        centralManager.stopScan()
+        centralManager.scanForPeripherals(
+            withServices: [Self.serviceUUID],
+            options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+        )
+    }
+
+    private func restartAdvertisingIfNeeded() {
+        guard isScanning, let peripheralManager, peripheralManager.state == .poweredOn else {
+            return
+        }
+
+        ensurePeripheralService()
+
         let identity = resolvedIdentity()
-        currentUser = identity.user ?? currentUser
+        let advertisedName = String((identity.alias.isEmpty ? identity.displayName : identity.alias).prefix(20))
 
-        let displayName = Self.peerDisplayName(alias: identity.alias, userID: identity.userID)
-        let peerID = MCPeerID(displayName: displayName)
-        let session = MCSession(peer: peerID, securityIdentity: nil, encryptionPreference: .required)
-        let advertiser = MCNearbyServiceAdvertiser(peer: peerID, discoveryInfo: [
-            "uid": identity.userID.uuidString,
-            "nm": identity.displayName,
-            "un": identity.alias
-        ], serviceType: Self.serviceType)
-        let browser = MCNearbyServiceBrowser(peer: peerID, serviceType: Self.serviceType)
-
-        session.delegate = self
-        advertiser.delegate = self
-        browser.delegate = self
-
-        localPeerID = peerID
-        self.session = session
-        self.advertiser = advertiser
-        self.browser = browser
+        peripheralManager.stopAdvertising()
+        peripheralManager.startAdvertising([
+            CBAdvertisementDataServiceUUIDsKey: [Self.serviceUUID],
+            CBAdvertisementDataLocalNameKey: advertisedName,
+        ])
     }
 
-    private func rebuildTransport() {
-        advertiser?.stopAdvertisingPeer()
-        browser?.stopBrowsingForPeers()
-        session?.disconnect()
-
-        localPeerID = nil
-        session = nil
-        advertiser = nil
-        browser = nil
-        knownPeers.removeAll()
-        peerIDsByDisplayName.removeAll()
-
-        if isScanning {
-            ensureTransport()
-            advertiser?.startAdvertisingPeer()
-            browser?.startBrowsingForPeers()
+    private func ensurePeripheralService() {
+        guard profileCharacteristic == nil, let peripheralManager, peripheralManager.state == .poweredOn else {
+            return
         }
+
+        let profileCharacteristic = CBMutableCharacteristic(
+            type: Self.profileCharacteristicUUID,
+            properties: [.read],
+            value: nil,
+            permissions: [.readable]
+        )
+
+        let inboxCharacteristic = CBMutableCharacteristic(
+            type: Self.inboxCharacteristicUUID,
+            properties: [.write, .writeWithoutResponse],
+            value: nil,
+            permissions: [.writeable]
+        )
+
+        let service = CBMutableService(type: Self.serviceUUID, primary: true)
+        service.characteristics = [profileCharacteristic, inboxCharacteristic]
+
+        self.profileCharacteristic = profileCharacteristic
+        self.inboxCharacteristic = inboxCharacteristic
+        peripheralManager.removeAllServices()
+        peripheralManager.add(service)
     }
 
-    private func scheduleConnectionTimeout(for peerID: UUID) {
-        pendingConnectionTimeouts[peerID]?.cancel()
-        pendingConnectionTimeouts[peerID] = Task { @MainActor [weak self] in
+    private func resolvedPeer(afterConnectingTo peerID: UUID) -> OfflinePeer? {
+        if let peripheralID = peripheralIDsByPeerID[peerID] {
+            return knownPeersByPeripheralID[peripheralID]?.offlinePeer
+        }
+
+        return nil
+    }
+
+    private func scheduleConnectionTimeout(for peripheralID: UUID) {
+        pendingConnectionTimeouts[peripheralID]?.cancel()
+        pendingConnectionTimeouts[peripheralID] = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(12))
-            guard let self, let continuation = self.pendingConnections.removeValue(forKey: peerID) else { return }
+            guard let self, let continuation = self.pendingConnections.removeValue(forKey: peripheralID) else { return }
             continuation.resume(throwing: OfflineTransportError.connectionTimedOut)
-            self.pendingConnectionTimeouts[peerID] = nil
+            self.pendingConnectionTimeouts[peripheralID] = nil
         }
     }
 
-    private func resolveConnection(for peerID: UUID, result: Result<BluetoothSession, Error>) {
-        pendingConnectionTimeouts[peerID]?.cancel()
-        pendingConnectionTimeouts[peerID] = nil
+    private func resolveConnection(for peripheralID: UUID, result: Result<BluetoothSession, Error>) {
+        pendingConnectionTimeouts[peripheralID]?.cancel()
+        pendingConnectionTimeouts[peripheralID] = nil
 
-        guard let continuation = pendingConnections.removeValue(forKey: peerID) else {
+        guard let continuation = pendingConnections.removeValue(forKey: peripheralID) else {
             return
         }
 
@@ -319,121 +418,244 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
         messagesByChatID[chatID] = messages
     }
 
-    private func handleFoundPeer(_ peerID: MCPeerID, discoveryInfo: [String: String]?) {
-        guard localPeerID != peerID else {
-            return
-        }
-
-        let peerUserID = UUID(uuidString: discoveryInfo?["uid"] ?? "") ?? Self.fallbackPeerID(from: peerID.displayName)
-        guard peerUserID != resolvedIdentity().userID else {
-            return
-        }
-
-        let displayName = discoveryInfo?["nm"]?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let alias = discoveryInfo?["un"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+    private func handleDiscoveredPeripheral(_ peripheral: CBPeripheral, advertisementData: [String: Any], rssi: NSNumber) {
+        let provisionalPeerID = Self.fallbackPeerID(from: peripheral.identifier.uuidString)
+        let advertisedName = (advertisementData[CBAdvertisementDataLocalNameKey] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayName = advertisedName?.isEmpty == false ? advertisedName! : (peripheral.name ?? "Nearby iPhone")
+        let alias = Self.normalizedAlias(from: advertisedName ?? peripheral.name ?? "")
+        let existingKnownPeer = knownPeersByPeripheralID[peripheral.identifier]
 
         let offlinePeer = OfflinePeer(
-            id: peerUserID,
-            displayName: displayName?.isEmpty == false ? displayName! : peerID.displayName,
-            alias: alias?.isEmpty == false ? alias! : Self.normalizedAlias(from: peerID.displayName),
-            signalStrength: -55,
+            id: existingKnownPeer?.offlinePeer.id ?? provisionalPeerID,
+            displayName: existingKnownPeer?.offlinePeer.displayName ?? displayName,
+            alias: existingKnownPeer?.offlinePeer.alias.isEmpty == false
+                ? existingKnownPeer!.offlinePeer.alias
+                : alias,
+            signalStrength: rssi.intValue,
             isReachable: true
         )
 
-        knownPeers[peerUserID] = KnownPeer(peerID: peerID, offlinePeer: offlinePeer)
-        peerIDsByDisplayName[peerID.displayName] = peerUserID
+        if let previousPeer = existingKnownPeer?.offlinePeer {
+            peripheralIDsByPeerID[previousPeer.id] = peripheral.identifier
+        }
+
+        knownPeersByPeripheralID[peripheral.identifier] = KnownPeer(
+            peripheralID: peripheral.identifier,
+            peripheral: peripheral,
+            offlinePeer: offlinePeer,
+            writableCharacteristic: existingKnownPeer?.writableCharacteristic,
+            profileCharacteristic: existingKnownPeer?.profileCharacteristic
+        )
+        peripheralIDsByPeerID[offlinePeer.id] = peripheral.identifier
     }
 
-    private func handleLostPeer(_ peerID: MCPeerID) {
-        guard let knownPeerID = peerIDsByDisplayName[peerID.displayName], var knownPeer = knownPeers[knownPeerID] else {
+    private func handleConnectedPeripheral(_ peripheral: CBPeripheral) {
+        peripheral.delegate = self
+        peripheral.discoverServices([Self.serviceUUID])
+    }
+
+    private func handleDisconnectedPeripheral(_ peripheral: CBPeripheral, error: Error?) {
+        guard var knownPeer = knownPeersByPeripheralID[peripheral.identifier] else {
             return
         }
 
         knownPeer.offlinePeer.isReachable = false
-        knownPeers[knownPeerID] = nil
-        peerIDsByDisplayName[peerID.displayName] = nil
-    }
+        knownPeer.writableCharacteristic = nil
+        knownPeer.profileCharacteristic = nil
+        knownPeersByPeripheralID[peripheral.identifier] = knownPeer
 
-    private func handlePeerStateChange(_ peerID: MCPeerID, state: MCSessionState) {
-        guard let knownPeerID = peerIDsByDisplayName[peerID.displayName] else {
-            return
-        }
-
-        switch state {
-        case .connected:
-            resolveConnection(for: knownPeerID, result: .success(bluetoothSession(for: knownPeerID, state: .connected)))
-        case .notConnected:
-            resolveConnection(for: knownPeerID, result: .failure(OfflineTransportError.connectionFailed))
-        case .connecting:
-            break
-        @unknown default:
-            resolveConnection(for: knownPeerID, result: .failure(OfflineTransportError.connectionFailed))
+        if pendingConnections[peripheral.identifier] != nil {
+            resolveConnection(for: peripheral.identifier, result: .failure(OfflineTransportError.connectionFailed))
         }
     }
 
-    private func handleReceivedData(_ data: Data, from peerID: MCPeerID) {
-        guard let wireMessage = try? decoder.decode(WireMessage.self, from: data) else {
+    private func handleDiscoveredServices(for peripheral: CBPeripheral, error: Error?) {
+        guard error == nil else {
+            resolveConnection(for: peripheral.identifier, result: .failure(OfflineTransportError.connectionFailed))
             return
         }
 
+        guard let services = peripheral.services else {
+            resolveConnection(for: peripheral.identifier, result: .failure(OfflineTransportError.connectionFailed))
+            return
+        }
+
+        for service in services where service.uuid == Self.serviceUUID {
+            peripheral.discoverCharacteristics([Self.profileCharacteristicUUID, Self.inboxCharacteristicUUID], for: service)
+        }
+    }
+
+    private func handleDiscoveredCharacteristics(for peripheral: CBPeripheral, service: CBService, error: Error?) {
+        guard error == nil, var knownPeer = knownPeersByPeripheralID[peripheral.identifier] else {
+            resolveConnection(for: peripheral.identifier, result: .failure(OfflineTransportError.connectionFailed))
+            return
+        }
+
+        for characteristic in service.characteristics ?? [] {
+            if characteristic.uuid == Self.inboxCharacteristicUUID {
+                knownPeer.writableCharacteristic = characteristic
+            } else if characteristic.uuid == Self.profileCharacteristicUUID {
+                knownPeer.profileCharacteristic = characteristic
+                peripheral.readValue(for: characteristic)
+            }
+        }
+
+        knownPeersByPeripheralID[peripheral.identifier] = knownPeer
+
+        if knownPeer.profileCharacteristic == nil {
+            resolveConnection(
+                for: peripheral.identifier,
+                result: .success(bluetoothSession(for: knownPeer.offlinePeer.id, state: .connected))
+            )
+        }
+    }
+
+    private func handleUpdatedValue(for peripheral: CBPeripheral, characteristic: CBCharacteristic, error: Error?) {
+        guard error == nil, characteristic.uuid == Self.profileCharacteristicUUID, let data = characteristic.value else {
+            if let knownPeer = knownPeersByPeripheralID[peripheral.identifier] {
+                resolveConnection(
+                    for: peripheral.identifier,
+                    result: .success(bluetoothSession(for: knownPeer.offlinePeer.id, state: .connected))
+                )
+            }
+            return
+        }
+
+        guard
+            let profile = try? decoder.decode(PeerProfile.self, from: data),
+            var knownPeer = knownPeersByPeripheralID[peripheral.identifier]
+        else {
+            if let knownPeer = knownPeersByPeripheralID[peripheral.identifier] {
+                resolveConnection(
+                    for: peripheral.identifier,
+                    result: .success(bluetoothSession(for: knownPeer.offlinePeer.id, state: .connected))
+                )
+            }
+            return
+        }
+
+        let previousPeerID = knownPeer.offlinePeer.id
+        let updatedPeer = OfflinePeer(
+            id: profile.userID,
+            displayName: profile.displayName,
+            alias: profile.alias,
+            signalStrength: knownPeer.offlinePeer.signalStrength,
+            isReachable: true
+        )
+        knownPeer.offlinePeer = updatedPeer
+        knownPeersByPeripheralID[peripheral.identifier] = knownPeer
+
+        peripheralIDsByPeerID[previousPeerID] = nil
+        peripheralIDsByPeerID[profile.userID] = peripheral.identifier
+
+        resolveConnection(
+            for: peripheral.identifier,
+            result: .success(bluetoothSession(for: profile.userID, state: .connected))
+        )
+    }
+
+    private func handleIncomingWriteRequests(_ requests: [CBATTRequest]) {
         let localUserID = resolvedIdentity().userID
-        let knownPeerID = peerIDsByDisplayName[peerID.displayName] ?? wireMessage.senderID
-        let knownPeer = knownPeers[knownPeerID]?.offlinePeer ?? OfflinePeer(
-            id: knownPeerID,
-            displayName: peerID.displayName,
-            alias: Self.normalizedAlias(from: peerID.displayName),
-            signalStrength: -55,
+
+        for request in requests where request.characteristic.uuid == Self.inboxCharacteristicUUID {
+            guard let data = request.value, let wireMessage = try? decoder.decode(WireMessage.self, from: data) else {
+                peripheralManager?.respond(to: request, withResult: .unlikelyError)
+                continue
+            }
+
+            upsertKnownPeerFromIncomingMessage(wireMessage, centralID: request.central.identifier)
+
+            let chatID = wireMessage.chatID
+            let senderPeerID = wireMessage.senderID
+            let knownPeer = resolvedPeer(afterConnectingTo: senderPeerID) ?? OfflinePeer(
+                id: senderPeerID,
+                displayName: wireMessage.senderName,
+                alias: wireMessage.senderAlias,
+                signalStrength: -60,
+                isReachable: true
+            )
+
+            if chatsByID[chatID] == nil {
+                chatsByID[chatID] = Chat(
+                    id: chatID,
+                    mode: .offline,
+                    type: .direct,
+                    title: knownPeer.displayName,
+                    subtitle: knownPeer.alias.isEmpty ? "Nearby" : "@\(knownPeer.alias)",
+                    participantIDs: [localUserID, knownPeer.id],
+                    group: nil,
+                    lastMessagePreview: nil,
+                    lastActivityAt: Date(timeIntervalSince1970: wireMessage.createdAt),
+                    unreadCount: 1,
+                    isPinned: false,
+                    draft: nil,
+                    disappearingPolicy: nil,
+                    notificationPreferences: NotificationPreferences(muteState: .active, previewEnabled: true, customSoundName: nil, badgeEnabled: true)
+                )
+            }
+
+            let message = Message(
+                id: wireMessage.id,
+                chatID: chatID,
+                senderID: senderPeerID,
+                mode: .offline,
+                kind: .text,
+                text: wireMessage.text,
+                attachments: [],
+                replyToMessageID: nil,
+                status: .delivered,
+                createdAt: Date(timeIntervalSince1970: wireMessage.createdAt),
+                editedAt: nil,
+                deletedForEveryoneAt: nil,
+                reactions: [],
+                voiceMessage: nil,
+                liveLocation: nil
+            )
+
+            if messagesByChatID[chatID]?.contains(where: { $0.id == message.id }) != true, let chat = chatsByID[chatID] {
+                append(message: message, to: chat)
+                var updatedChat = chatsByID[chatID]
+                updatedChat?.unreadCount += 1
+                chatsByID[chatID] = updatedChat
+            }
+
+            peripheralManager?.respond(to: request, withResult: .success)
+        }
+    }
+
+    private func upsertKnownPeerFromIncomingMessage(_ wireMessage: WireMessage, centralID: UUID) {
+        let current = knownPeersByPeripheralID[centralID]
+        guard let current else {
+            peripheralIDsByPeerID[wireMessage.senderID] = centralID
+            return
+        }
+
+        let previousPeerID = current.offlinePeer.id
+
+        let offlinePeer = OfflinePeer(
+            id: wireMessage.senderID,
+            displayName: wireMessage.senderName,
+            alias: wireMessage.senderAlias,
+            signalStrength: current.offlinePeer.signalStrength,
             isReachable: true
         )
 
-        let chatID = wireMessage.chatID
-        if chatsByID[chatID] == nil {
-            chatsByID[chatID] = Chat(
-                id: chatID,
-                mode: .offline,
-                type: .direct,
-                title: knownPeer.displayName,
-                subtitle: knownPeer.alias.isEmpty ? "Nearby" : "@\(knownPeer.alias)",
-                participantIDs: [localUserID, knownPeer.id],
-                group: nil,
-                lastMessagePreview: nil,
-                lastActivityAt: Date(timeIntervalSince1970: wireMessage.createdAt),
-                unreadCount: 1,
-                isPinned: false,
-                draft: nil,
-                disappearingPolicy: nil,
-                notificationPreferences: NotificationPreferences(muteState: .active, previewEnabled: true, customSoundName: nil, badgeEnabled: true)
-            )
-        }
-
-        let message = Message(
-            id: wireMessage.id,
-            chatID: chatID,
-            senderID: wireMessage.senderID,
-            mode: .offline,
-            kind: .text,
-            text: wireMessage.text,
-            attachments: [],
-            replyToMessageID: nil,
-            status: .delivered,
-            createdAt: Date(timeIntervalSince1970: wireMessage.createdAt),
-            editedAt: nil,
-            deletedForEveryoneAt: nil,
-            reactions: [],
-            voiceMessage: nil,
-            liveLocation: nil
+        knownPeersByPeripheralID[centralID] = KnownPeer(
+            peripheralID: centralID,
+            peripheral: current.peripheral,
+            offlinePeer: offlinePeer,
+            writableCharacteristic: current.writableCharacteristic,
+            profileCharacteristic: current.profileCharacteristic
         )
 
-        if messagesByChatID[chatID]?.contains(where: { $0.id == message.id }) == true {
-            return
-        }
+        peripheralIDsByPeerID[previousPeerID] = nil
+        peripheralIDsByPeerID[wireMessage.senderID] = centralID
+    }
 
-        if let chat = chatsByID[chatID] {
-            append(message: message, to: chat)
-            var updatedChat = chatsByID[chatID]
-            updatedChat?.unreadCount += 1
-            chatsByID[chatID] = updatedChat
-        }
+    private func encodedProfileData() -> Data? {
+        let identity = resolvedIdentity()
+        let profile = PeerProfile(userID: identity.userID, displayName: identity.displayName, alias: identity.alias)
+        return try? encoder.encode(profile)
     }
 
     private func resolvedIdentity() -> (userID: UUID, displayName: String, alias: String, user: User?) {
@@ -475,12 +697,6 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
         )
     }
 
-    private static func peerDisplayName(alias: String, userID: UUID) -> String {
-        let cleanAlias = alias.isEmpty ? "prime" : normalizedAlias(from: alias)
-        let suffix = userID.uuidString.prefix(4)
-        return String("\(cleanAlias)-\(suffix)".prefix(32))
-    }
-
     private static func normalizedAlias(from value: String) -> String {
         let lowered = value.lowercased()
         let allowed = lowered.filter { $0.isASCII && ($0.isLetter || $0.isNumber) }
@@ -503,49 +719,116 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
     }
 }
 
-extension NearbyOfflineTransport: MCSessionDelegate {
-    nonisolated func session(_ session: MCSession, peer peerID: MCPeerID, didChange state: MCSessionState) {
+extension NearbyOfflineTransport: CBCentralManagerDelegate {
+    nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
         Task { @MainActor in
-            self.handlePeerStateChange(peerID, state: state)
+            if central.state == .poweredOn {
+                self.restartScanningIfNeeded()
+            } else if central.state == .poweredOff {
+                self.knownPeersByPeripheralID.removeAll()
+                self.peripheralIDsByPeerID.removeAll()
+            }
         }
     }
 
-    nonisolated func session(_ session: MCSession, didReceive data: Data, fromPeer peerID: MCPeerID) {
+    nonisolated func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {
         Task { @MainActor in
-            self.handleReceivedData(data, from: peerID)
+            let restoredPeripherals = (dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral]) ?? []
+            for peripheral in restoredPeripherals {
+                self.handleDiscoveredPeripheral(peripheral, advertisementData: [:], rssi: -60)
+            }
         }
     }
 
-    nonisolated func session(_ session: MCSession, didReceive stream: InputStream, withName streamName: String, fromPeer peerID: MCPeerID) { }
-    nonisolated func session(_ session: MCSession, didStartReceivingResourceWithName resourceName: String, fromPeer peerID: MCPeerID, with progress: Progress) { }
-    nonisolated func session(_ session: MCSession, didFinishReceivingResourceWithName resourceName: String, fromPeer peerID: MCPeerID, at localURL: URL?, withError error: Error?) { }
+    nonisolated func centralManager(
+        _ central: CBCentralManager,
+        didDiscover peripheral: CBPeripheral,
+        advertisementData: [String : Any],
+        rssi RSSI: NSNumber
+    ) {
+        Task { @MainActor in
+            self.handleDiscoveredPeripheral(peripheral, advertisementData: advertisementData, rssi: RSSI)
+        }
+    }
+
+    nonisolated func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        Task { @MainActor in
+            self.handleConnectedPeripheral(peripheral)
+        }
+    }
+
+    nonisolated func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        Task { @MainActor in
+            self.resolveConnection(for: peripheral.identifier, result: .failure(OfflineTransportError.connectionFailed))
+        }
+    }
+
+    nonisolated func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        Task { @MainActor in
+            self.handleDisconnectedPeripheral(peripheral, error: error)
+        }
+    }
 }
 
-extension NearbyOfflineTransport: MCNearbyServiceBrowserDelegate {
-    nonisolated func browser(_ browser: MCNearbyServiceBrowser, foundPeer peerID: MCPeerID, withDiscoveryInfo info: [String: String]?) {
+extension NearbyOfflineTransport: CBPeripheralDelegate {
+    nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         Task { @MainActor in
-            self.handleFoundPeer(peerID, discoveryInfo: info)
+            self.handleDiscoveredServices(for: peripheral, error: error)
         }
     }
 
-    nonisolated func browser(_ browser: MCNearbyServiceBrowser, lostPeer peerID: MCPeerID) {
+    nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         Task { @MainActor in
-            self.handleLostPeer(peerID)
+            self.handleDiscoveredCharacteristics(for: peripheral, service: service, error: error)
         }
     }
 
-    nonisolated func browser(_ browser: MCNearbyServiceBrowser, didNotStartBrowsingForPeers error: Error) { }
+    nonisolated func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        Task { @MainActor in
+            self.handleUpdatedValue(for: peripheral, characteristic: characteristic, error: error)
+        }
+    }
 }
 
-extension NearbyOfflineTransport: MCNearbyServiceAdvertiserDelegate {
-    nonisolated func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didReceiveInvitationFromPeer peerID: MCPeerID, withContext context: Data?, invitationHandler: @escaping (Bool, MCSession?) -> Void) {
+extension NearbyOfflineTransport: CBPeripheralManagerDelegate {
+    nonisolated func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
         Task { @MainActor in
-            self.handleFoundPeer(peerID, discoveryInfo: nil)
-            invitationHandler(true, self.session)
+            if peripheral.state == .poweredOn {
+                self.ensurePeripheralService()
+                self.restartAdvertisingIfNeeded()
+            }
         }
     }
 
-    nonisolated func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didNotStartAdvertisingPeer error: Error) { }
+    nonisolated func peripheralManager(_ peripheral: CBPeripheralManager, willRestoreState dict: [String : Any]) {
+        Task { @MainActor in
+            self.ensurePeripheralService()
+            self.restartAdvertisingIfNeeded()
+        }
+    }
+
+    nonisolated func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
+        Task { @MainActor in
+            guard request.characteristic.uuid == Self.profileCharacteristicUUID, let data = self.encodedProfileData() else {
+                peripheral.respond(to: request, withResult: .attributeNotFound)
+                return
+            }
+
+            guard request.offset <= data.count else {
+                peripheral.respond(to: request, withResult: .invalidOffset)
+                return
+            }
+
+            request.value = data.subdata(in: request.offset ..< data.count)
+            peripheral.respond(to: request, withResult: .success)
+        }
+    }
+
+    nonisolated func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
+        Task { @MainActor in
+            self.handleIncomingWriteRequests(requests)
+        }
+    }
 }
 
 enum OfflineTransportError: LocalizedError {
@@ -560,17 +843,17 @@ enum OfflineTransportError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .peerUnavailable:
-            return "Nearby device unavailable."
+            return "Nearby Bluetooth device unavailable."
         case .connectionTimedOut:
-            return "Nearby connection timed out."
+            return "Nearby Bluetooth connection timed out."
         case .connectionFailed:
-            return "Could not connect to the nearby device."
+            return "Could not connect to the nearby Bluetooth device."
         case .deliveryFailed:
-            return "Could not deliver the message."
+            return "Could not deliver the Bluetooth message."
         case .chatUnavailable:
             return "Chat is unavailable."
         case .nearbySelectionRequired:
-            return "Choose a nearby device to start an offline chat."
+            return "Choose a nearby Bluetooth device to start an offline chat."
         case .emptyMessage:
             return "Message is empty."
         }
