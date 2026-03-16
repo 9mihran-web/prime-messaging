@@ -254,6 +254,17 @@ def ensure_legacy_placeholder_user(database, user_id):
     return user
 
 
+def is_legacy_placeholder_user(user):
+    profile = user.get("profile") or {}
+    username = (profile.get("username") or "").strip().lower()
+    return (
+        not user.get("password")
+        and not normalized_optional_string(profile.get("email"))
+        and not normalized_optional_string(profile.get("phoneNumber"))
+        and username.startswith("legacy_")
+    )
+
+
 def payload_string(payload, *keys):
     for key in keys:
         value = normalized_optional_string(payload.get(key))
@@ -1153,11 +1164,12 @@ class Handler(BaseHTTPRequestHandler):
 
             if method == "POST" and parsed.path == "/auth/signup":
                 username = str(payload.get("username", "")).strip().lower()
-                if username_taken(database, username):
+                requested_user_id = normalized_optional_string(payload.get("user_id"))
+                existing_requested_user = find_user(database, requested_user_id) if requested_user_id else None
+                if username_taken(database, username, requested_user_id):
                     return self.respond(409, {"error": "username_taken"})
 
-                requested_user_id = normalized_optional_string(payload.get("user_id"))
-                if requested_user_id and find_user(database, requested_user_id):
+                if existing_requested_user and not is_legacy_placeholder_user(existing_requested_user):
                     return self.respond(409, {"error": "user_id_taken"})
 
                 user_id = requested_user_id or str(uuid.uuid4())
@@ -1165,23 +1177,40 @@ class Handler(BaseHTTPRequestHandler):
                 contact_value = normalized_optional_string(payload.get("contact_value"))
                 email = contact_value if method_type == "email" else None
                 phone_number = contact_value if method_type == "phone" else None
-                user = {
-                    "id": user_id,
-                    "password": payload.get("password", ""),
-                    "profile": {
+                if existing_requested_user and is_legacy_placeholder_user(existing_requested_user):
+                    user = existing_requested_user
+                    user["password"] = payload.get("password", "")
+                    user["profile"] = {
                         "displayName": payload.get("display_name", ""),
                         "username": username,
-                        "bio": "Welcome to Prime Messaging.",
-                        "status": "Available",
+                        "bio": user["profile"].get("bio") or "Welcome to Prime Messaging.",
+                        "status": user["profile"].get("status") or "Available",
                         "email": email,
                         "phoneNumber": phone_number,
-                        "profilePhotoURL": None,
-                        "socialLink": None,
-                    },
-                    "identityMethods": build_identity_methods(username, email=email, phone_number=phone_number),
-                    "privacySettings": default_privacy_settings(),
-                }
-                database["users"].append(user)
+                        "profilePhotoURL": user["profile"].get("profilePhotoURL"),
+                        "socialLink": user["profile"].get("socialLink"),
+                    }
+                    user["identityMethods"] = build_identity_methods(username, email=email, phone_number=phone_number)
+                    user["privacySettings"] = user.get("privacySettings") or default_privacy_settings()
+                    sync_user_snapshots(database, user)
+                else:
+                    user = {
+                        "id": user_id,
+                        "password": payload.get("password", ""),
+                        "profile": {
+                            "displayName": payload.get("display_name", ""),
+                            "username": username,
+                            "bio": "Welcome to Prime Messaging.",
+                            "status": "Available",
+                            "email": email,
+                            "phoneNumber": phone_number,
+                            "profilePhotoURL": None,
+                            "socialLink": None,
+                        },
+                        "identityMethods": build_identity_methods(username, email=email, phone_number=phone_number),
+                        "privacySettings": default_privacy_settings(),
+                    }
+                    database["users"].append(user)
                 ensure_saved_messages_chat(database, user_id, "online")
                 ensure_saved_messages_chat(database, user_id, "offline")
                 session, access_token, refresh_token = issue_session(database, user_id)
