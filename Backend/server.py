@@ -197,7 +197,7 @@ def authenticated_user(database, headers):
     return user, session, None
 
 
-def request_user_with_fallback(database, headers, fallback_user_id=None):
+def request_user_with_fallback(database, headers, fallback_user_id=None, create_if_missing=False):
     user, session, auth_error = authenticated_user(database, headers)
     if not auth_error:
         return user, session, None
@@ -208,9 +208,50 @@ def request_user_with_fallback(database, headers, fallback_user_id=None):
 
     fallback_user = find_user(database, fallback_user_id)
     if not fallback_user:
+        if create_if_missing:
+            return ensure_legacy_placeholder_user(database, fallback_user_id), None, None
         return None, None, "user_not_found"
 
     return fallback_user, None, None
+
+
+def unique_legacy_username(database, user_id):
+    base = f"legacy_{str(user_id).replace('-', '')[:8]}".lower()
+    candidate = base
+    counter = 1
+    while username_taken(database, candidate):
+        candidate = f"{base}_{counter}"
+        counter += 1
+    return candidate
+
+
+def ensure_legacy_placeholder_user(database, user_id):
+    existing_user = find_user(database, user_id)
+    if existing_user:
+        return existing_user
+
+    username = unique_legacy_username(database, user_id)
+    user = {
+        "id": user_id,
+        "password": "",
+        "profile": {
+            "displayName": "Prime User",
+            "username": username,
+            "bio": "Welcome to Prime Messaging.",
+            "status": "Available",
+            "email": None,
+            "phoneNumber": None,
+            "profilePhotoURL": None,
+            "socialLink": None,
+        },
+        "identityMethods": build_identity_methods(username),
+        "privacySettings": default_privacy_settings(),
+    }
+    database["users"].append(user)
+    ensure_saved_messages_chat(database, user_id, "online")
+    ensure_saved_messages_chat(database, user_id, "offline")
+    save_db(database)
+    return user
 
 
 def payload_string(payload, *keys):
@@ -972,7 +1013,12 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/users/search":
                 params = parse_qs(parsed.query)
                 fallback_user_id = (params.get("exclude_user_id") or [""])[0].strip() or None
-                current_user, _, auth_error = request_user_with_fallback(database, self.headers, fallback_user_id)
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    fallback_user_id,
+                    create_if_missing=True
+                )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
@@ -1005,7 +1051,12 @@ class Handler(BaseHTTPRequestHandler):
                     or (params.get("user_id") or [""])[0].strip()
                     or None
                 )
-                current_user, _, auth_error = request_user_with_fallback(database, self.headers, fallback_user_id)
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    fallback_user_id,
+                    create_if_missing=True
+                )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
@@ -1021,7 +1072,12 @@ class Handler(BaseHTTPRequestHandler):
                 params = parse_qs(parsed.query)
                 mode = (params.get("mode") or ["online"])[0].strip()
                 fallback_user_id = (params.get("user_id") or [""])[0].strip() or None
-                user, _, auth_error = request_user_with_fallback(database, self.headers, fallback_user_id)
+                user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    fallback_user_id,
+                    create_if_missing=True
+                )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
@@ -1047,7 +1103,12 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/messages":
                 params = parse_qs(parsed.query)
                 fallback_user_id = (params.get("user_id") or [""])[0].strip() or None
-                current_user, _, auth_error = request_user_with_fallback(database, self.headers, fallback_user_id)
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    fallback_user_id,
+                    create_if_missing=True
+                )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
@@ -1162,7 +1223,8 @@ class Handler(BaseHTTPRequestHandler):
                 current_user, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
-                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID")
+                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID"),
+                    create_if_missing=True
                 )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
@@ -1220,7 +1282,8 @@ class Handler(BaseHTTPRequestHandler):
                 current_user, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
-                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID") or user_id
+                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID") or user_id,
+                    create_if_missing=True
                 )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
@@ -1257,7 +1320,8 @@ class Handler(BaseHTTPRequestHandler):
                 current_user, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
-                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID") or user_id
+                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID") or user_id,
+                    create_if_missing=True
                 )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
@@ -1275,7 +1339,8 @@ class Handler(BaseHTTPRequestHandler):
                 current_user, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
-                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID") or user_id
+                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID") or user_id,
+                    create_if_missing=True
                 )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
@@ -1300,7 +1365,8 @@ class Handler(BaseHTTPRequestHandler):
                 current_user, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
-                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID") or user_id
+                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID") or user_id,
+                    create_if_missing=True
                 )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
@@ -1328,7 +1394,8 @@ class Handler(BaseHTTPRequestHandler):
                         "requesterID",
                         "owner_id",
                         "ownerID"
-                    )
+                    ),
+                    create_if_missing=True
                 )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
@@ -1392,7 +1459,8 @@ class Handler(BaseHTTPRequestHandler):
                 current_user, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
-                    payload.get("owner_id")
+                    payload.get("owner_id"),
+                    create_if_missing=True
                 )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
@@ -1446,7 +1514,8 @@ class Handler(BaseHTTPRequestHandler):
                 requester, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
-                    payload.get("requester_id")
+                    payload.get("requester_id"),
+                    create_if_missing=True
                 )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
@@ -1475,7 +1544,8 @@ class Handler(BaseHTTPRequestHandler):
                 requester, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
-                    payload.get("requester_id")
+                    payload.get("requester_id"),
+                    create_if_missing=True
                 )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
@@ -1507,7 +1577,8 @@ class Handler(BaseHTTPRequestHandler):
                 requester, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
-                    payload.get("requester_id")
+                    payload.get("requester_id"),
+                    create_if_missing=True
                 )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
@@ -1533,7 +1604,8 @@ class Handler(BaseHTTPRequestHandler):
                 requester, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
-                    payload.get("requester_id")
+                    payload.get("requester_id"),
+                    create_if_missing=True
                 )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
@@ -1578,7 +1650,8 @@ class Handler(BaseHTTPRequestHandler):
                 reader, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
-                    payload.get("reader_id")
+                    payload.get("reader_id"),
+                    create_if_missing=True
                 )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
@@ -1601,7 +1674,8 @@ class Handler(BaseHTTPRequestHandler):
                 sender, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
-                    payload.get("sender_id")
+                    payload.get("sender_id"),
+                    create_if_missing=True
                 )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
@@ -1691,7 +1765,8 @@ class Handler(BaseHTTPRequestHandler):
                 editor, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
-                    payload.get("editor_id")
+                    payload.get("editor_id"),
+                    create_if_missing=True
                 )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
@@ -1728,7 +1803,8 @@ class Handler(BaseHTTPRequestHandler):
                 requester, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
-                    payload.get("requester_id")
+                    payload.get("requester_id"),
+                    create_if_missing=True
                 )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
