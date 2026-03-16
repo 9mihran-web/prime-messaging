@@ -199,6 +199,9 @@ def save_base64_blob(directory, file_name, encoded_data):
 
 
 def message_preview(message):
+    if message.get("deletedForEveryoneAt"):
+        return "Message deleted"
+
     if message.get("text"):
         return message["text"]
 
@@ -219,6 +222,15 @@ def message_preview(message):
         "location": "Location",
     }
     return previews.get(first_type, "Attachment")
+
+
+def sender_display_name_for(message, database):
+    sender = find_user(database, message.get("senderID"))
+    if not sender:
+        return "Unknown user"
+
+    display_name = (sender["profile"].get("displayName") or "").strip()
+    return display_name or sender["profile"]["username"]
 
 
 def generic_direct_title(value):
@@ -328,22 +340,24 @@ def serialize_chat(chat, current_user_id, database):
     }
 
 
-def serialize_message(message):
+def serialize_message(message, database):
+    is_deleted = message.get("deletedForEveryoneAt") is not None
     return {
         "id": message["id"],
         "chatID": message["chatID"],
         "senderID": message["senderID"],
+        "senderDisplayName": sender_display_name_for(message, database),
         "mode": message["mode"],
         "kind": message.get("kind", "text"),
-        "text": message["text"],
-        "attachments": message.get("attachments", []),
+        "text": None if is_deleted else message["text"],
+        "attachments": [] if is_deleted else message.get("attachments", []),
         "replyToMessageID": None,
         "status": message.get("status", "sent"),
         "createdAt": message["createdAt"],
-        "editedAt": None,
-        "deletedForEveryoneAt": None,
+        "editedAt": message.get("editedAt"),
+        "deletedForEveryoneAt": message.get("deletedForEveryoneAt"),
         "reactions": [],
-        "voiceMessage": message.get("voiceMessage"),
+        "voiceMessage": None if is_deleted else message.get("voiceMessage"),
         "liveLocation": None,
     }
 
@@ -408,7 +422,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/messages":
                 params = parse_qs(parsed.query)
                 chat_id = (params.get("chat_id") or [""])[0].strip()
-                messages = [serialize_message(item) for item in database["messages"] if item["chatID"] == chat_id]
+                messages = [serialize_message(item, database) for item in database["messages"] if item["chatID"] == chat_id]
                 messages.sort(key=lambda item: item["createdAt"])
                 return self.respond(200, messages)
 
@@ -425,7 +439,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_mutation(self, method):
         parsed = urlparse(self.path)
-        payload = self.read_json() if method != "DELETE" else {}
+        payload = self.read_json()
 
         with LOCK:
             database = load_db()
@@ -683,10 +697,65 @@ class Handler(BaseHTTPRequestHandler):
                     "voiceMessage": voice_message,
                     "status": "sent",
                     "createdAt": now_iso(),
+                    "editedAt": None,
+                    "deletedForEveryoneAt": None,
                 }
                 database["messages"].append(message)
                 save_db(database)
-                return self.respond(200, serialize_message(message))
+                return self.respond(200, serialize_message(message, database))
+
+            if method == "PATCH" and parsed.path.startswith("/messages/"):
+                message_id = parsed.path.split("/")[2]
+                chat_id = str(payload.get("chat_id", "")).strip()
+                editor_id = str(payload.get("editor_id", "")).strip()
+                updated_text = normalized_optional_string(payload.get("text"))
+
+                message = next(
+                    (
+                        item for item in database["messages"]
+                        if item["id"] == message_id and item["chatID"] == chat_id
+                    ),
+                    None
+                )
+                if not message:
+                    return self.respond(404, {"error": "message_not_found"})
+                if message["senderID"] != editor_id:
+                    return self.respond(403, {"error": "edit_not_allowed"})
+                if message.get("deletedForEveryoneAt"):
+                    return self.respond(409, {"error": "message_deleted"})
+                if message.get("attachments") or message.get("voiceMessage"):
+                    return self.respond(409, {"error": "edit_not_supported"})
+                if not updated_text:
+                    return self.respond(409, {"error": "empty_message"})
+
+                message["text"] = updated_text
+                message["editedAt"] = now_iso()
+                save_db(database)
+                return self.respond(200, serialize_message(message, database))
+
+            if method == "DELETE" and parsed.path.startswith("/messages/"):
+                message_id = parsed.path.split("/")[2]
+                chat_id = str(payload.get("chat_id", "")).strip()
+                requester_id = str(payload.get("requester_id", "")).strip()
+
+                message = next(
+                    (
+                        item for item in database["messages"]
+                        if item["id"] == message_id and item["chatID"] == chat_id
+                    ),
+                    None
+                )
+                if not message:
+                    return self.respond(404, {"error": "message_not_found"})
+                if message["senderID"] != requester_id:
+                    return self.respond(403, {"error": "delete_not_allowed"})
+
+                message["text"] = None
+                message["attachments"] = []
+                message["voiceMessage"] = None
+                message["deletedForEveryoneAt"] = now_iso()
+                save_db(database)
+                return self.respond(200, serialize_message(message, database))
 
         return self.respond(404, {"error": "not_found"})
 

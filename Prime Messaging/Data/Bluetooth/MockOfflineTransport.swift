@@ -70,31 +70,142 @@ struct MockOfflineTransport: OfflineTransporting {
     }
 
     func sendMessage(_ text: String, in chat: Chat, senderID: UUID) async throws -> Message {
+        try await sendMessage(OutgoingMessageDraft(text: text), in: chat, senderID: senderID)
+    }
+
+    func sendMessage(_ draft: OutgoingMessageDraft, in chat: Chat, senderID: UUID) async throws -> Message {
         let message = Message(
             id: UUID(),
             chatID: chat.id,
             senderID: senderID,
+            senderDisplayName: senderID == Self.currentUser.id ? Self.currentUser.profile.displayName : chat.title,
             mode: .offline,
-            kind: .text,
-            text: text,
-            attachments: [],
+            kind: resolvedKind(for: draft),
+            text: draft.normalizedText,
+            attachments: draft.attachments,
             replyToMessageID: nil,
             status: .sent,
             createdAt: .now,
             editedAt: nil,
             deletedForEveryoneAt: nil,
             reactions: [],
-            voiceMessage: nil,
+            voiceMessage: draft.voiceMessage,
             liveLocation: nil
         )
 
         Self.messagesByChatID[chat.id, default: []].append(message)
         if chat.type != .selfChat {
             var updatedChat = chat
-            updatedChat.lastMessagePreview = text
+            updatedChat.lastMessagePreview = draft.normalizedText ?? mediaSummary(for: message)
             updatedChat.lastActivityAt = message.createdAt
             Self.chats[chat.id] = updatedChat
         }
         return message
+    }
+
+    func editMessage(_ messageID: UUID, text: String, in chatID: UUID, editorID: UUID) async throws -> Message {
+        guard var messages = Self.messagesByChatID[chatID], let index = messages.firstIndex(where: { $0.id == messageID && $0.senderID == editorID }) else {
+            throw OfflineTransportError.chatUnavailable
+        }
+
+        let normalizedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalizedText.isEmpty == false else {
+            throw OfflineTransportError.emptyMessage
+        }
+
+        messages[index].text = normalizedText
+        messages[index].editedAt = .now
+        Self.messagesByChatID[chatID] = messages
+        refreshChatPreview(chatID: chatID)
+        return messages[index]
+    }
+
+    func deleteMessage(_ messageID: UUID, in chatID: UUID, requesterID: UUID) async throws -> Message {
+        guard var messages = Self.messagesByChatID[chatID], let index = messages.firstIndex(where: { $0.id == messageID && $0.senderID == requesterID }) else {
+            throw OfflineTransportError.chatUnavailable
+        }
+
+        messages[index].text = nil
+        messages[index].attachments = []
+        messages[index].voiceMessage = nil
+        messages[index].deletedForEveryoneAt = .now
+        Self.messagesByChatID[chatID] = messages
+        refreshChatPreview(chatID: chatID)
+        return messages[index]
+    }
+
+    private func resolvedKind(for draft: OutgoingMessageDraft) -> MessageKind {
+        if draft.voiceMessage != nil {
+            return .voice
+        }
+
+        switch draft.attachments.first?.type {
+        case .photo:
+            return .photo
+        case .audio:
+            return .audio
+        case .video:
+            return .video
+        case .document:
+            return .document
+        case .contact:
+            return .contact
+        case .location:
+            return .location
+        case nil:
+            return .text
+        }
+    }
+
+    private func mediaSummary(for message: Message) -> String {
+        if message.deletedForEveryoneAt != nil {
+            return "Message deleted"
+        }
+
+        if message.voiceMessage != nil {
+            return "Voice message"
+        }
+
+        switch message.attachments.first?.type {
+        case .photo:
+            return "Photo"
+        case .audio:
+            return "Audio"
+        case .video:
+            return "Video"
+        case .document:
+            return "Document"
+        case .contact:
+            return "Contact"
+        case .location:
+            return "Location"
+        case nil:
+            return "Message"
+        }
+    }
+
+    private func refreshChatPreview(chatID: UUID) {
+        guard var chat = Self.chats[chatID] else { return }
+        let latestMessage = Self.messagesByChatID[chatID]?.last
+        chat.lastMessagePreview = latestMessage?.text ?? mediaSummary(for: latestMessage ?? Message(
+            id: UUID(),
+            chatID: chatID,
+            senderID: Self.currentUser.id,
+            senderDisplayName: Self.currentUser.profile.displayName,
+            mode: .offline,
+            kind: .text,
+            text: nil,
+            attachments: [],
+            replyToMessageID: nil,
+            status: .sent,
+            createdAt: .now,
+            editedAt: nil,
+            deletedForEveryoneAt: .now,
+            reactions: [],
+            voiceMessage: nil,
+            liveLocation: nil
+        ))
+        chat.lastActivityAt = latestMessage?.createdAt ?? chat.lastActivityAt
+        Self.chats[chatID] = chat
     }
 }

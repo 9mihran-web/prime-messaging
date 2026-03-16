@@ -13,6 +13,8 @@ protocol AuthRepository {
     func refreshUser(userID: UUID) async throws -> User
     func updateProfile(_ profile: Profile, for userID: UUID) async throws -> User
     func uploadAvatar(imageData: Data, for userID: UUID) async throws -> User
+    func removeAvatar(for userID: UUID) async throws -> User
+    func updatePassword(_ password: String, for userID: UUID) async throws
     func searchUsers(query: String, excluding userID: UUID) async throws -> [User]
 }
 
@@ -20,7 +22,11 @@ protocol ChatRepository {
     func fetchChats(mode: ChatMode, for userID: UUID) async throws -> [Chat]
     func fetchMessages(chatID: UUID, mode: ChatMode) async throws -> [Message]
     func sendMessage(_ text: String, in chatID: UUID, mode: ChatMode, senderID: UUID) async throws -> Message
+    func sendMessage(_ draft: OutgoingMessageDraft, in chatID: UUID, mode: ChatMode, senderID: UUID) async throws -> Message
+    func editMessage(_ messageID: UUID, text: String, in chatID: UUID, mode: ChatMode, editorID: UUID) async throws -> Message
+    func deleteMessage(_ messageID: UUID, in chatID: UUID, mode: ChatMode, requesterID: UUID) async throws -> Message
     func createDirectChat(with otherUserID: UUID, currentUserID: UUID, mode: ChatMode) async throws -> Chat
+    func createGroupChat(title: String, memberIDs: [UUID], ownerID: UUID, mode: ChatMode) async throws -> Chat
     func createNearbyChat(with peer: OfflinePeer, currentUser: User) async throws -> Chat
     func saveDraft(_ draft: Draft) async throws
 }
@@ -79,6 +85,9 @@ protocol OfflineTransporting {
     func openChat(with peer: OfflinePeer, currentUser: User) async throws -> Chat
     func fetchMessages(chatID: UUID) async -> [Message]
     func sendMessage(_ text: String, in chat: Chat, senderID: UUID) async throws -> Message
+    func sendMessage(_ draft: OutgoingMessageDraft, in chat: Chat, senderID: UUID) async throws -> Message
+    func editMessage(_ messageID: UUID, text: String, in chatID: UUID, editorID: UUID) async throws -> Message
+    func deleteMessage(_ messageID: UUID, in chatID: UUID, requesterID: UUID) async throws -> Message
 }
 
 protocol LocalStore {

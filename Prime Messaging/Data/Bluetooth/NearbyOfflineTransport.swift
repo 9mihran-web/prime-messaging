@@ -5,6 +5,12 @@ import UIKit
 
 @MainActor
 final class NearbyOfflineTransport: NSObject, OfflineTransporting {
+    private enum WireMessageAction: String, Codable {
+        case send
+        case edit
+        case delete
+    }
+
     private struct KnownPeer {
         let peripheralID: UUID
         var peripheral: CBPeripheral
@@ -20,12 +26,14 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
     }
 
     private struct WireMessage: Codable {
+        let action: WireMessageAction
         let id: UUID
         let chatID: UUID
+        let targetMessageID: UUID?
         let senderID: UUID
         let senderName: String
         let senderAlias: String
-        let text: String
+        let text: String?
         let createdAt: TimeInterval
     }
 
@@ -173,26 +181,35 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
     }
 
     func sendMessage(_ text: String, in chat: Chat, senderID: UUID) async throws -> Message {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.isEmpty == false else {
+        try await sendMessage(OutgoingMessageDraft(text: text), in: chat, senderID: senderID)
+    }
+
+    func sendMessage(_ draft: OutgoingMessageDraft, in chat: Chat, senderID: UUID) async throws -> Message {
+        guard draft.hasContent else {
             throw OfflineTransportError.emptyMessage
         }
 
+        if chat.type != .selfChat && (draft.attachments.isEmpty == false || draft.voiceMessage != nil) {
+            throw OfflineTransportError.mediaUnavailable
+        }
+
+        let identity = resolvedIdentity()
         let message = Message(
             id: UUID(),
             chatID: chat.id,
             senderID: senderID,
+            senderDisplayName: identity.displayName,
             mode: .offline,
-            kind: .text,
-            text: trimmed,
-            attachments: [],
+            kind: resolvedKind(for: draft),
+            text: draft.normalizedText,
+            attachments: draft.attachments,
             replyToMessageID: nil,
             status: .sent,
             createdAt: .now,
             editedAt: nil,
             deletedForEveryoneAt: nil,
             reactions: [],
-            voiceMessage: nil,
+            voiceMessage: draft.voiceMessage,
             liveLocation: nil
         )
 
@@ -222,26 +239,84 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
             throw OfflineTransportError.peerUnavailable
         }
 
-        let identity = resolvedIdentity()
         let wireMessage = WireMessage(
+            action: .send,
             id: message.id,
             chatID: chat.id,
+            targetMessageID: nil,
             senderID: senderID,
             senderName: identity.displayName,
             senderAlias: identity.alias,
-            text: trimmed,
+            text: draft.normalizedText,
             createdAt: message.createdAt.timeIntervalSince1970
         )
 
         do {
-            let data = try encoder.encode(wireMessage)
-            let writeType: CBCharacteristicWriteType = characteristic.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
-            knownPeer.peripheral.writeValue(data, for: characteristic, type: writeType)
+            try sendWireMessage(wireMessage, through: knownPeer.peripheral, characteristic: characteristic)
             return message
         } catch {
             replaceMessageStatus(messageID: message.id, in: chat.id, status: .failed)
             throw OfflineTransportError.deliveryFailed
         }
+    }
+
+    func editMessage(_ messageID: UUID, text: String, in chatID: UUID, editorID: UUID) async throws -> Message {
+        let normalizedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalizedText.isEmpty == false else {
+            throw OfflineTransportError.emptyMessage
+        }
+
+        guard var message = updatedMessage(
+            messageID: messageID,
+            in: chatID,
+            senderID: editorID,
+            mutate: { item in
+                guard item.deletedForEveryoneAt == nil, item.attachments.isEmpty, item.voiceMessage == nil else { return false }
+                item.text = normalizedText
+                item.editedAt = .now
+                return true
+            }
+        ) else {
+            throw OfflineTransportError.chatUnavailable
+        }
+
+        refreshChatMetadata(for: chatID)
+        try await sendWireUpdate(
+            action: .edit,
+            chatID: chatID,
+            targetMessageID: messageID,
+            text: normalizedText,
+            senderID: editorID
+        )
+        message.editedAt = .now
+        return message
+    }
+
+    func deleteMessage(_ messageID: UUID, in chatID: UUID, requesterID: UUID) async throws -> Message {
+        guard let message = updatedMessage(
+            messageID: messageID,
+            in: chatID,
+            senderID: requesterID,
+            mutate: { item in
+                item.text = nil
+                item.attachments = []
+                item.voiceMessage = nil
+                item.deletedForEveryoneAt = .now
+                return true
+            }
+        ) else {
+            throw OfflineTransportError.chatUnavailable
+        }
+
+        refreshChatMetadata(for: chatID)
+        try await sendWireUpdate(
+            action: .delete,
+            chatID: chatID,
+            targetMessageID: messageID,
+            text: nil,
+            senderID: requesterID
+        )
+        return message
     }
 
     private func ensureManagers() {
@@ -398,15 +473,73 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
 
     private func append(message: Message, to chat: Chat) {
         messagesByChatID[chat.id, default: []].append(message)
+        refreshChatMetadata(for: chat.id, fallbackChat: chat)
+    }
 
-        guard chat.type != .selfChat else {
+    private func refreshChatMetadata(for chatID: UUID, fallbackChat: Chat? = nil) {
+        let latestMessage = messagesByChatID[chatID]?.last
+
+        if chatID == resolvedIdentity().userID {
             return
         }
 
-        var updatedChat = chatsByID[chat.id] ?? chat
-        updatedChat.lastMessagePreview = message.text
-        updatedChat.lastActivityAt = message.createdAt
-        chatsByID[chat.id] = updatedChat
+        guard var updatedChat = chatsByID[chatID] ?? fallbackChat else {
+            return
+        }
+
+        updatedChat.lastMessagePreview = latestMessage.map { $0.text ?? mediaSummary(for: $0) }
+        updatedChat.lastActivityAt = latestMessage?.createdAt ?? updatedChat.lastActivityAt
+        chatsByID[chatID] = updatedChat
+    }
+
+    private func resolvedKind(for draft: OutgoingMessageDraft) -> MessageKind {
+        if draft.voiceMessage != nil {
+            return .voice
+        }
+
+        switch draft.attachments.first?.type {
+        case .photo:
+            return .photo
+        case .audio:
+            return .audio
+        case .video:
+            return .video
+        case .document:
+            return .document
+        case .contact:
+            return .contact
+        case .location:
+            return .location
+        case nil:
+            return .text
+        }
+    }
+
+    private func mediaSummary(for message: Message) -> String {
+        if message.deletedForEveryoneAt != nil {
+            return "Message deleted"
+        }
+
+        if message.voiceMessage != nil {
+            return "Voice message"
+        }
+
+        switch message.attachments.first?.type {
+        case .photo:
+            return "Photo"
+        case .audio:
+            return "Audio"
+        case .video:
+            return "Video"
+        case .document:
+            return "Document"
+        case .contact:
+            return "Contact"
+        case .location:
+            return "Location"
+        case nil:
+            return "Message"
+        }
     }
 
     private func replaceMessageStatus(messageID: UUID, in chatID: UUID, status: MessageStatus) {
@@ -416,6 +549,83 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
 
         messages[index].status = status
         messagesByChatID[chatID] = messages
+    }
+
+    private func updatedMessage(
+        messageID: UUID,
+        in chatID: UUID,
+        senderID: UUID,
+        mutate: (inout Message) -> Bool
+    ) -> Message? {
+        guard var messages = messagesByChatID[chatID], let index = messages.firstIndex(where: { $0.id == messageID && $0.senderID == senderID }) else {
+            return nil
+        }
+
+        var message = messages[index]
+        guard mutate(&message) else {
+            return nil
+        }
+
+        messages[index] = message
+        messagesByChatID[chatID] = messages
+        return message
+    }
+
+    private func sendWireUpdate(
+        action: WireMessageAction,
+        chatID: UUID,
+        targetMessageID: UUID,
+        text: String?,
+        senderID: UUID
+    ) async throws {
+        guard let chat = chatsByID[chatID] else {
+            throw OfflineTransportError.chatUnavailable
+        }
+
+        guard let remotePeerID = chat.participantIDs.first(where: { $0 != senderID }) else {
+            throw OfflineTransportError.chatUnavailable
+        }
+
+        guard let peripheralID = peripheralIDsByPeerID[remotePeerID], var knownPeer = knownPeersByPeripheralID[peripheralID] else {
+            throw OfflineTransportError.peerUnavailable
+        }
+
+        if knownPeer.peripheral.state != .connected || knownPeer.writableCharacteristic == nil {
+            _ = try await connect(to: knownPeer.offlinePeer)
+            guard let refreshedPeer = knownPeersByPeripheralID[peripheralID] else {
+                throw OfflineTransportError.peerUnavailable
+            }
+            knownPeer = refreshedPeer
+        }
+
+        guard let characteristic = knownPeer.writableCharacteristic else {
+            throw OfflineTransportError.peerUnavailable
+        }
+
+        let identity = resolvedIdentity()
+        let wireMessage = WireMessage(
+            action: action,
+            id: UUID(),
+            chatID: chatID,
+            targetMessageID: targetMessageID,
+            senderID: senderID,
+            senderName: identity.displayName,
+            senderAlias: identity.alias,
+            text: text,
+            createdAt: Date.now.timeIntervalSince1970
+        )
+
+        do {
+            try sendWireMessage(wireMessage, through: knownPeer.peripheral, characteristic: characteristic)
+        } catch {
+            throw OfflineTransportError.deliveryFailed
+        }
+    }
+
+    private func sendWireMessage(_ wireMessage: WireMessage, through peripheral: CBPeripheral, characteristic: CBCharacteristic) throws {
+        let data = try encoder.encode(wireMessage)
+        let writeType: CBCharacteristicWriteType = characteristic.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
+        peripheral.writeValue(data, for: characteristic, type: writeType)
     }
 
     private func handleDiscoveredPeripheral(_ peripheral: CBPeripheral, advertisementData: [String: Any], rssi: NSNumber) {
@@ -595,29 +805,58 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
                 )
             }
 
-            let message = Message(
-                id: wireMessage.id,
-                chatID: chatID,
-                senderID: senderPeerID,
-                mode: .offline,
-                kind: .text,
-                text: wireMessage.text,
-                attachments: [],
-                replyToMessageID: nil,
-                status: .delivered,
-                createdAt: Date(timeIntervalSince1970: wireMessage.createdAt),
-                editedAt: nil,
-                deletedForEveryoneAt: nil,
-                reactions: [],
-                voiceMessage: nil,
-                liveLocation: nil
-            )
+            if wireMessage.action == .send {
+                let message = Message(
+                    id: wireMessage.id,
+                    chatID: chatID,
+                    senderID: senderPeerID,
+                    senderDisplayName: wireMessage.senderName,
+                    mode: .offline,
+                    kind: .text,
+                    text: wireMessage.text,
+                    attachments: [],
+                    replyToMessageID: nil,
+                    status: .delivered,
+                    createdAt: Date(timeIntervalSince1970: wireMessage.createdAt),
+                    editedAt: nil,
+                    deletedForEveryoneAt: nil,
+                    reactions: [],
+                    voiceMessage: nil,
+                    liveLocation: nil
+                )
 
-            if messagesByChatID[chatID]?.contains(where: { $0.id == message.id }) != true, let chat = chatsByID[chatID] {
-                append(message: message, to: chat)
-                var updatedChat = chatsByID[chatID]
-                updatedChat?.unreadCount += 1
-                chatsByID[chatID] = updatedChat
+                if messagesByChatID[chatID]?.contains(where: { $0.id == message.id }) != true, let chat = chatsByID[chatID] {
+                    append(message: message, to: chat)
+                    var updatedChat = chatsByID[chatID]
+                    updatedChat?.unreadCount += 1
+                    chatsByID[chatID] = updatedChat
+                }
+            } else if wireMessage.action == .edit, let targetMessageID = wireMessage.targetMessageID {
+                _ = updatedMessage(
+                    messageID: targetMessageID,
+                    in: chatID,
+                    senderID: senderPeerID,
+                    mutate: { item in
+                        item.text = wireMessage.text
+                        item.editedAt = Date(timeIntervalSince1970: wireMessage.createdAt)
+                        return true
+                    }
+                )
+                refreshChatMetadata(for: chatID)
+            } else if wireMessage.action == .delete, let targetMessageID = wireMessage.targetMessageID {
+                _ = updatedMessage(
+                    messageID: targetMessageID,
+                    in: chatID,
+                    senderID: senderPeerID,
+                    mutate: { item in
+                        item.text = nil
+                        item.attachments = []
+                        item.voiceMessage = nil
+                        item.deletedForEveryoneAt = Date(timeIntervalSince1970: wireMessage.createdAt)
+                        return true
+                    }
+                )
+                refreshChatMetadata(for: chatID)
             }
 
             peripheralManager?.respond(to: request, withResult: .success)
@@ -698,6 +937,7 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
                     id: message.id,
                     chatID: newChatID,
                     senderID: message.senderID,
+                    senderDisplayName: message.senderDisplayName,
                     mode: message.mode,
                     kind: message.kind,
                     text: message.text,
@@ -894,6 +1134,7 @@ enum OfflineTransportError: LocalizedError {
     case connectionTimedOut
     case connectionFailed
     case deliveryFailed
+    case mediaUnavailable
     case chatUnavailable
     case nearbySelectionRequired
     case emptyMessage
@@ -908,6 +1149,8 @@ enum OfflineTransportError: LocalizedError {
             return "Could not connect to the nearby Bluetooth device."
         case .deliveryFailed:
             return "Could not deliver the Bluetooth message."
+        case .mediaUnavailable:
+            return "Bluetooth media sending is not available in this build yet."
         case .chatUnavailable:
             return "Chat is unavailable."
         case .nearbySelectionRequired:

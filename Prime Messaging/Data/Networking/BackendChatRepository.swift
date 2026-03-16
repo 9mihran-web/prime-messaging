@@ -76,6 +76,33 @@ struct BackendChatRepository: ChatRepository {
         )
     }
 
+    func editMessage(_ messageID: UUID, text: String, in chatID: UUID, mode: ChatMode, editorID: UUID) async throws -> Message {
+        let body = EditMessageRequest(
+            chatID: chatID.uuidString,
+            editorID: editorID.uuidString,
+            text: text.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        return try await request(
+            path: "/messages/\(messageID.uuidString)",
+            method: "PATCH",
+            body: body,
+            fallback: nil
+        )
+    }
+
+    func deleteMessage(_ messageID: UUID, in chatID: UUID, mode: ChatMode, requesterID: UUID) async throws -> Message {
+        let body = DeleteMessageRequest(
+            chatID: chatID.uuidString,
+            requesterID: requesterID.uuidString
+        )
+        return try await request(
+            path: "/messages/\(messageID.uuidString)",
+            method: "DELETE",
+            body: body,
+            fallback: nil
+        )
+    }
+
     func createDirectChat(with otherUserID: UUID, currentUserID: UUID, mode: ChatMode) async throws -> Chat {
         let body = DirectChatRequest(currentUserID: currentUserID.uuidString, otherUserID: otherUserID.uuidString, mode: mode.rawValue)
         return try await request(
@@ -367,5 +394,27 @@ private struct GroupChatRequest: Encodable {
         case ownerID = "owner_id"
         case memberIDs = "member_ids"
         case mode
+    }
+}
+
+private struct EditMessageRequest: Encodable {
+    let chatID: String
+    let editorID: String
+    let text: String
+
+    enum CodingKeys: String, CodingKey {
+        case chatID = "chat_id"
+        case editorID = "editor_id"
+        case text
+    }
+}
+
+private struct DeleteMessageRequest: Encodable {
+    let chatID: String
+    let requesterID: String
+
+    enum CodingKeys: String, CodingKey {
+        case chatID = "chat_id"
+        case requesterID = "requester_id"
     }
 }
