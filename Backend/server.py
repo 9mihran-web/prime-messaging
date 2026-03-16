@@ -213,6 +213,14 @@ def request_user_with_fallback(database, headers, fallback_user_id=None):
     return fallback_user, None, None
 
 
+def payload_string(payload, *keys):
+    for key in keys:
+        value = normalized_optional_string(payload.get(key))
+        if value:
+            return value
+    return None
+
+
 def latest_user_session_activity(database, user_id):
     latest = None
     for session in database.get("sessions", []):
@@ -984,12 +992,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, users[:20])
 
             if parsed.path.startswith("/users/") and "/profile" not in parsed.path and "/avatar" not in parsed.path:
-                current_user, _, auth_error = authenticated_user(database, self.headers)
-                if auth_error == "user_not_found":
-                    return self.respond(404, {"error": "user_not_found"})
-                if auth_error:
-                    return self.respond(401, {"error": auth_error})
-
                 user_id = parsed.path.split("/")[2]
                 user = find_user(database, user_id)
                 if not user:
@@ -1153,7 +1155,11 @@ class Handler(BaseHTTPRequestHandler):
 
             if method == "POST" and parsed.path == "/usernames/claim":
                 username = str(payload.get("username", "")).strip().lower()
-                current_user, _, auth_error = authenticated_user(database, self.headers)
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID")
+                )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
@@ -1207,7 +1213,11 @@ class Handler(BaseHTTPRequestHandler):
 
             if method == "PATCH" and parsed.path.startswith("/users/") and parsed.path.endswith("/profile"):
                 user_id = parsed.path.split("/")[2]
-                current_user, _, auth_error = authenticated_user(database, self.headers)
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID") or user_id
+                )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
@@ -1240,7 +1250,11 @@ class Handler(BaseHTTPRequestHandler):
 
             if method == "PATCH" and parsed.path.startswith("/users/") and parsed.path.endswith("/password"):
                 user_id = parsed.path.split("/")[2]
-                current_user, _, auth_error = authenticated_user(database, self.headers)
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID") or user_id
+                )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
@@ -1254,7 +1268,11 @@ class Handler(BaseHTTPRequestHandler):
 
             if method == "POST" and parsed.path.startswith("/users/") and parsed.path.endswith("/avatar"):
                 user_id = parsed.path.split("/")[2]
-                current_user, _, auth_error = authenticated_user(database, self.headers)
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID") or user_id
+                )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
@@ -1275,7 +1293,11 @@ class Handler(BaseHTTPRequestHandler):
 
             if method == "DELETE" and parsed.path.startswith("/users/") and parsed.path.endswith("/avatar"):
                 user_id = parsed.path.split("/")[2]
-                current_user, _, auth_error = authenticated_user(database, self.headers)
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID") or user_id
+                )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
@@ -1292,7 +1314,17 @@ class Handler(BaseHTTPRequestHandler):
                 current_user, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
-                    payload.get("current_user_id")
+                    payload_string(
+                        payload,
+                        "current_user_id",
+                        "currentUserID",
+                        "user_id",
+                        "userID",
+                        "requester_id",
+                        "requesterID",
+                        "owner_id",
+                        "ownerID"
+                    )
                 )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
@@ -1300,8 +1332,21 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(401, {"error": auth_error})
 
                 current_user_id = current_user["id"]
-                other_user_id = str(payload.get("other_user_id", "")).strip()
-                mode = str(payload.get("mode", "online")).strip()
+                other_user_id = payload_string(
+                    payload,
+                    "other_user_id",
+                    "otherUserID",
+                    "contact_id",
+                    "contactID",
+                    "peer_id",
+                    "peerID",
+                    "target_user_id",
+                    "targetUserID"
+                ) or ""
+                mode = (
+                    payload_string(payload, "mode", "chat_mode", "chatMode")
+                    or "online"
+                )
                 other_user = find_user(database, other_user_id)
                 if not other_user:
                     return self.respond(404, {"error": "user_not_found"})
