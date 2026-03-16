@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 import base64
+import hashlib
 import json
 import os
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -22,10 +23,27 @@ PUBLIC_BASE_URL = (
     or (f"https://{RAILWAY_PUBLIC_DOMAIN}" if RAILWAY_PUBLIC_DOMAIN else "")
 )
 LOCK = threading.Lock()
+ACCESS_TOKEN_TTL_SECONDS = 60 * 60
+REFRESH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30
+SESSION_ACTIVITY_TOUCH_INTERVAL_SECONDS = 15
+PRESENCE_ONLINE_WINDOW_SECONDS = 45
+
+
+def log_event(name, **fields):
+    payload = {
+        "timestamp": now_iso(),
+        "event": name,
+        **fields,
+    }
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def expires_at_iso(seconds):
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
 
 
 def ensure_storage():
@@ -46,7 +64,12 @@ def ensure_storage():
 def load_db():
     ensure_storage()
     with open(DATA_FILE, "r", encoding="utf-8") as file:
-        return json.load(file)
+        database = json.load(file)
+
+    if ensure_database_schema(database):
+        save_db(database)
+
+    return database
 
 
 def save_db(database):
@@ -54,14 +77,174 @@ def save_db(database):
         json.dump(database, file, indent=2, sort_keys=True)
 
 
+def ensure_database_schema(database):
+    did_update = False
+
+    for key in ("users", "chats", "messages", "sessions", "deviceTokens"):
+        if key not in database:
+            database[key] = []
+            did_update = True
+
+    return did_update
+
+
 def find_user(database, user_id):
     return next((user for user in database["users"] if user["id"] == user_id), None)
+
+
+def find_chat(database, chat_id):
+    return next((chat for chat in database["chats"] if chat["id"] == chat_id), None)
+
+
+def find_message(database, message_id):
+    return next((message for message in database["messages"] if message["id"] == message_id), None)
+
+
+def generate_token():
+    return f"{uuid.uuid4().hex}{uuid.uuid4().hex}"
+
+
+def hash_token(token):
+    return hashlib.sha256((token or "").encode("utf-8")).hexdigest()
+
+
+def parse_iso_datetime(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def issue_session(database, user_id):
+    access_token = generate_token()
+    refresh_token = generate_token()
+    session = {
+        "id": str(uuid.uuid4()),
+        "userID": user_id,
+        "accessTokenHash": hash_token(access_token),
+        "refreshTokenHash": hash_token(refresh_token),
+        "accessTokenExpiresAt": expires_at_iso(ACCESS_TOKEN_TTL_SECONDS),
+        "refreshTokenExpiresAt": expires_at_iso(REFRESH_TOKEN_TTL_SECONDS),
+        "updatedAt": now_iso(),
+    }
+    database["sessions"].append(session)
+    return session, access_token, refresh_token
+
+
+def rotate_session(session):
+    access_token = generate_token()
+    refresh_token = generate_token()
+    session["accessTokenHash"] = hash_token(access_token)
+    session["refreshTokenHash"] = hash_token(refresh_token)
+    session["accessTokenExpiresAt"] = expires_at_iso(ACCESS_TOKEN_TTL_SECONDS)
+    session["refreshTokenExpiresAt"] = expires_at_iso(REFRESH_TOKEN_TTL_SECONDS)
+    session["updatedAt"] = now_iso()
+    return access_token, refresh_token
+
+
+def session_payload(user, session, access_token, refresh_token):
+    return {
+        "user": serialize_user(user),
+        "session": {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "access_token_expires_at": session["accessTokenExpiresAt"],
+            "refresh_token_expires_at": session["refreshTokenExpiresAt"],
+        },
+    }
+
+
+def find_session_by_access_token(database, access_token):
+    token_hash = hash_token(access_token)
+    return next((session for session in database["sessions"] if session["accessTokenHash"] == token_hash), None)
+
+
+def find_session_by_refresh_token(database, refresh_token):
+    token_hash = hash_token(refresh_token)
+    return next((session for session in database["sessions"] if session["refreshTokenHash"] == token_hash), None)
+
+
+def bearer_token_from_headers(headers):
+    authorization = headers.get("Authorization", "")
+    if not authorization.lower().startswith("bearer "):
+        return None
+    return authorization[7:].strip() or None
+
+
+def authenticated_user(database, headers):
+    access_token = bearer_token_from_headers(headers)
+    if not access_token:
+        return None, None, "invalid_credentials"
+
+    session = find_session_by_access_token(database, access_token)
+    if not session:
+        return None, None, "invalid_credentials"
+
+    if (parse_iso_datetime(session.get("accessTokenExpiresAt")) or datetime.min.replace(tzinfo=timezone.utc)) <= datetime.now(timezone.utc):
+        return None, None, "invalid_credentials"
+
+    user = find_user(database, session.get("userID"))
+    if not user:
+        return None, None, "user_not_found"
+
+    current_time = datetime.now(timezone.utc)
+    updated_at = parse_iso_datetime(session.get("updatedAt"))
+    if not updated_at or (current_time - updated_at).total_seconds() >= SESSION_ACTIVITY_TOUCH_INTERVAL_SECONDS:
+        session["updatedAt"] = current_time.isoformat()
+        save_db(database)
+    return user, session, None
+
+
+def latest_user_session_activity(database, user_id):
+    latest = None
+    for session in database.get("sessions", []):
+        if session.get("userID") != user_id:
+            continue
+        updated_at = parse_iso_datetime(session.get("updatedAt"))
+        if updated_at and (latest is None or updated_at > latest):
+            latest = updated_at
+    return latest
+
+
+def user_is_online(database, user_id):
+    latest_activity = latest_user_session_activity(database, user_id)
+    if not latest_activity:
+        return False
+    return (datetime.now(timezone.utc) - latest_activity).total_seconds() <= PRESENCE_ONLINE_WINDOW_SECONDS
+
+
+def serialize_presence(viewer, target_user, database):
+    latest_activity = latest_user_session_activity(database, target_user["id"])
+    allow_last_seen = (target_user.get("privacySettings") or {}).get("allowLastSeen", True)
+
+    if user_is_online(database, target_user["id"]):
+        state = "online"
+        last_seen_at = latest_activity.isoformat() if latest_activity else now_iso()
+    elif latest_activity and allow_last_seen:
+        state = "lastSeen"
+        last_seen_at = latest_activity.isoformat()
+    else:
+        state = "recently"
+        last_seen_at = latest_activity.isoformat() if latest_activity else None
+
+    if viewer and viewer["id"] == target_user["id"] and latest_activity:
+        state = "online" if user_is_online(database, target_user["id"]) else "lastSeen"
+        last_seen_at = latest_activity.isoformat()
+
+    return {
+        "userID": target_user["id"],
+        "state": state,
+        "lastSeenAt": last_seen_at,
+        "isTyping": False,
+    }
 
 
 def serialize_user(user):
     return {
         "id": user["id"],
-        "profile": user["profile"],
+        "profile": sanitized_profile(user["profile"]),
         "identityMethods": user["identityMethods"],
         "privacySettings": user["privacySettings"],
     }
@@ -134,6 +317,46 @@ def normalized_optional_string(value):
     return cleaned or None
 
 
+def normalized_optional_url_string(value):
+    return normalized_optional_string(value)
+
+
+def sanitized_profile(profile):
+    payload = dict(profile or {})
+    payload["profilePhotoURL"] = normalized_optional_url_string(payload.get("profilePhotoURL"))
+    payload["socialLink"] = normalized_optional_url_string(payload.get("socialLink"))
+    return payload
+
+
+def sanitized_group(group):
+    if not group:
+        return None
+
+    payload = dict(group)
+    payload["photoURL"] = normalized_optional_url_string(payload.get("photoURL"))
+    return payload
+
+
+def sanitized_attachments(attachments):
+    sanitized = []
+    for attachment in attachments or []:
+        payload = dict(attachment)
+        payload["localURL"] = normalized_optional_url_string(payload.get("localURL"))
+        payload["remoteURL"] = normalized_optional_url_string(payload.get("remoteURL"))
+        sanitized.append(payload)
+    return sanitized
+
+
+def sanitized_voice_message(voice_message):
+    if not voice_message:
+        return None
+
+    payload = dict(voice_message)
+    payload["localFileURL"] = normalized_optional_url_string(payload.get("localFileURL"))
+    payload["remoteFileURL"] = normalized_optional_url_string(payload.get("remoteFileURL"))
+    return payload
+
+
 def build_identity_methods(username, email=None, phone_number=None):
     methods = [
         {
@@ -170,6 +393,143 @@ def build_identity_methods(username, email=None, phone_number=None):
         )
 
     return methods
+
+
+def resolved_user_display_name(user):
+    if not user:
+        return None
+
+    display_name = (user["profile"].get("displayName") or "").strip()
+    if display_name:
+        return display_name
+
+    username = (user["profile"].get("username") or "").strip()
+    return username or None
+
+
+def sync_user_snapshots(database, user):
+    did_update = False
+    display_name = resolved_user_display_name(user)
+    username = (user["profile"].get("username") or "").strip()
+
+    for chat in database["chats"]:
+        if chat.get("type") == "group":
+            group = chat.get("group") or {}
+            members = group.get("members") or []
+            for member in members:
+                if member.get("userID") != user["id"]:
+                    continue
+
+                if display_name and member.get("displayName") != display_name:
+                    member["displayName"] = display_name
+                    did_update = True
+
+                if username and member.get("username") != username:
+                    member["username"] = username
+                    did_update = True
+
+    return did_update
+
+
+def backfill_group_member_snapshots(chat, database):
+    if chat.get("type") != "group":
+        return False
+
+    group = chat.get("group") or {}
+    members = group.get("members") or []
+    did_update = False
+
+    for member in members:
+        user = find_user(database, member.get("userID"))
+        if not user:
+            continue
+
+        display_name = resolved_user_display_name(user)
+        username = (user["profile"].get("username") or "").strip()
+
+        if display_name and member.get("displayName") != display_name:
+            member["displayName"] = display_name
+            did_update = True
+
+        if username and member.get("username") != username:
+            member["username"] = username
+            did_update = True
+
+    return did_update
+
+
+def group_member_display_name_for(chat, user_id):
+    if not chat or chat.get("type") != "group":
+        return None
+
+    group = chat.get("group") or {}
+    for member in group.get("members") or []:
+        if member.get("userID") != user_id:
+            continue
+
+        display_name = (member.get("displayName") or "").strip()
+        if display_name:
+            return display_name
+
+        username = (member.get("username") or "").strip()
+        if username:
+            return username
+
+    return None
+
+
+def find_group_member(chat, user_id):
+    if not chat or chat.get("type") != "group":
+        return None
+
+    group = chat.get("group") or {}
+    return next(
+        (member for member in group.get("members") or [] if member.get("userID") == user_id),
+        None,
+    )
+
+
+def can_manage_group(chat, user_id):
+    member = find_group_member(chat, user_id)
+    if not member:
+        return False
+
+    return member.get("role") in ("owner", "admin")
+
+
+def group_member_payload(database, member_id, role):
+    user = find_user(database, member_id)
+    return {
+        "id": str(uuid.uuid4()),
+        "userID": member_id,
+        "displayName": resolved_user_display_name(user),
+        "username": (user or {}).get("profile", {}).get("username"),
+        "role": role,
+        "joinedAt": now_iso(),
+    }
+
+
+def chat_participant_payload(database, user_id):
+    user = find_user(database, user_id)
+    if not user:
+        return None
+
+    return {
+        "id": user_id,
+        "username": user["profile"].get("username") or "",
+        "displayName": resolved_user_display_name(user),
+    }
+
+
+def avatar_content_type(file_name):
+    lower_name = (file_name or "").lower()
+    if lower_name.endswith(".jpg") or lower_name.endswith(".jpeg"):
+        return "image/jpeg"
+    if lower_name.endswith(".heic"):
+        return "image/heic"
+    if lower_name.endswith(".webp"):
+        return "image/webp"
+    return "image/png"
 
 
 def remove_file_for_url(file_url, directory):
@@ -228,6 +588,11 @@ def sender_display_name_for(message, database):
     stored_name = (message.get("senderDisplayName") or "").strip()
     if stored_name:
         return stored_name
+
+    chat = find_chat(database, message.get("chatID"))
+    group_member_name = group_member_display_name_for(chat, message.get("senderID"))
+    if group_member_name:
+        return group_member_name
 
     sender = find_user(database, message.get("senderID"))
     if not sender:
@@ -295,6 +660,41 @@ def direct_chat_other_user(chat, current_user_id, database):
     return None
 
 
+def direct_chat_fallback_participant(chat, current_user_id, database):
+    messages = [message for message in database["messages"] if message["chatID"] == chat["id"]]
+    messages.sort(key=lambda item: item["createdAt"], reverse=True)
+    other_user_id = next(
+        (participant_id for participant_id in (chat.get("participantIDs") or []) if participant_id != current_user_id),
+        None,
+    )
+    cached_subtitle = (chat.get("cachedSubtitle") or "").strip()
+    username = cached_subtitle.removeprefix("@") if cached_subtitle.startswith("@") else ""
+
+    for message in messages:
+        sender_id = message.get("senderID")
+        if not sender_id or sender_id == current_user_id:
+            continue
+
+        display_name = (message.get("senderDisplayName") or "").strip()
+        if not display_name or display_name.lower() == "unknown user":
+            continue
+
+        return {
+            "id": sender_id or other_user_id,
+            "username": username,
+            "displayName": display_name,
+        }
+
+    if other_user_id and username:
+        return {
+            "id": other_user_id,
+            "username": username,
+            "displayName": username,
+        }
+
+    return None
+
+
 def chat_title_for(chat, current_user_id, database):
     if chat["type"] == "selfChat":
         return "Saved Messages"
@@ -309,12 +709,21 @@ def chat_title_for(chat, current_user_id, database):
             return display_name
         return other_user["profile"]["username"]
 
+    fallback_participant = direct_chat_fallback_participant(chat, current_user_id, database)
+    if fallback_participant:
+        display_name = (fallback_participant.get("displayName") or "").strip()
+        if display_name:
+            return display_name
+        username = (fallback_participant.get("username") or "").strip()
+        if username:
+            return username
+
     cached_title = chat.get("cachedTitle", "Direct Chat")
     if generic_direct_title(cached_title):
         cached_subtitle = chat.get("cachedSubtitle", "Direct conversation")
         if cached_subtitle.startswith("@"):
             return cached_subtitle.removeprefix("@")
-        return "Chat"
+        return "Missing User"
 
     return cached_title
 
@@ -338,6 +747,24 @@ def serialize_chat(chat, current_user_id, database):
     messages = [message for message in database["messages"] if message["chatID"] == chat["id"]]
     messages.sort(key=lambda item: item["createdAt"])
     last_message = messages[-1] if messages else None
+    participants = [
+        payload for payload in (
+            chat_participant_payload(database, participant_id)
+            for participant_id in chat["participantIDs"]
+        )
+        if payload is not None
+    ]
+
+    if chat["type"] == "direct":
+        other_user_id = next(
+            (participant_id for participant_id in chat["participantIDs"] if participant_id != current_user_id),
+            None,
+        )
+        has_other_participant = any(participant["id"] == other_user_id for participant in participants) if other_user_id else False
+        if not has_other_participant:
+            fallback_participant = direct_chat_fallback_participant(chat, current_user_id, database)
+            if fallback_participant:
+                participants.append(fallback_participant)
 
     return {
         "id": chat["id"],
@@ -346,7 +773,8 @@ def serialize_chat(chat, current_user_id, database):
         "title": chat_title_for(chat, current_user_id, database),
         "subtitle": chat_subtitle_for(chat, current_user_id, database),
         "participantIDs": chat["participantIDs"],
-        "group": chat.get("group"),
+        "participants": participants,
+        "group": sanitized_group(chat.get("group")),
         "lastMessagePreview": message_preview(last_message) if last_message else None,
         "lastActivityAt": last_message["createdAt"] if last_message else chat["createdAt"],
         "unreadCount": 0,
@@ -372,16 +800,118 @@ def serialize_message(message, database):
         "mode": message["mode"],
         "kind": message.get("kind", "text"),
         "text": None if is_deleted else message["text"],
-        "attachments": [] if is_deleted else message.get("attachments", []),
+        "attachments": [] if is_deleted else sanitized_attachments(message.get("attachments", [])),
         "replyToMessageID": None,
         "status": message.get("status", "sent"),
         "createdAt": message["createdAt"],
         "editedAt": message.get("editedAt"),
         "deletedForEveryoneAt": message.get("deletedForEveryoneAt"),
         "reactions": [],
-        "voiceMessage": None if is_deleted else message.get("voiceMessage"),
+        "voiceMessage": None if is_deleted else sanitized_voice_message(message.get("voiceMessage")),
         "liveLocation": None,
     }
+
+
+def mark_messages_delivered(chat, database, recipient_id):
+    if not chat or chat.get("mode") != "online" or chat.get("type") != "direct":
+        return False
+
+    did_update = False
+    for message in database["messages"]:
+        if message.get("chatID") != chat["id"]:
+            continue
+        if message.get("senderID") == recipient_id:
+            continue
+        if message.get("deletedForEveryoneAt"):
+            continue
+        if message.get("status") != "sent":
+            continue
+
+        message["status"] = "delivered"
+        did_update = True
+
+    return did_update
+
+
+def mark_chat_read(chat, database, reader_id):
+    if not chat or chat.get("mode") != "online" or chat.get("type") != "direct":
+        return False
+
+    did_update = False
+    for message in database["messages"]:
+        if message.get("chatID") != chat["id"]:
+            continue
+        if message.get("senderID") == reader_id:
+            continue
+        if message.get("deletedForEveryoneAt"):
+            continue
+        if message.get("status") == "read":
+            continue
+
+        message["status"] = "read"
+        did_update = True
+
+    return did_update
+
+
+def device_tokens_for_recipients(database, chat, excluding_user_id):
+    recipient_ids = [
+        participant_id
+        for participant_id in (chat.get("participantIDs") or [])
+        if participant_id != excluding_user_id
+    ]
+    return [
+        device_token
+        for device_token in database.get("deviceTokens", [])
+        if device_token.get("userID") in recipient_ids
+    ]
+
+
+def push_payload_for_message(chat, message, database):
+    title = (
+        (chat.get("group") or {}).get("title")
+        if chat.get("type") == "group"
+        else sender_display_name_for(message, database)
+    ) or "Prime Messaging"
+
+    return {
+        "chat_id": chat["id"],
+        "message_id": message["id"],
+        "mode": chat["mode"],
+        "chat_type": chat["type"],
+        "title": title,
+        "body": message_preview(message) or "New message",
+    }
+
+
+def log_push_dispatch_attempt(database, chat, message):
+    device_tokens = device_tokens_for_recipients(database, chat, message.get("senderID"))
+    payload = push_payload_for_message(chat, message, database)
+
+    if not device_tokens:
+        log_event(
+            "push.dispatch.skipped",
+            reason="no_device_tokens",
+            chat_id=chat["id"],
+            message_id=message["id"],
+            recipient_count=0,
+        )
+        return
+
+    token_suffixes = [
+        (entry.get("token") or "")[-8:]
+        for entry in device_tokens
+        if entry.get("token")
+    ]
+    log_event(
+        "push.dispatch.pending_provider",
+        reason="apns_provider_not_configured_in_backend",
+        chat_id=chat["id"],
+        message_id=message["id"],
+        recipient_count=len(device_tokens),
+        token_suffixes=token_suffixes,
+        payload=payload,
+    )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -400,6 +930,14 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             database = load_db()
 
+            if parsed.path == "/auth/me":
+                user, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+                return self.respond(200, serialize_user(user))
+
             if parsed.path == "/usernames/check":
                 params = parse_qs(parsed.query)
                 username = (params.get("username") or [""])[0].strip().lower()
@@ -408,44 +946,96 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, {"available": available})
 
             if parsed.path == "/users/search":
+                current_user, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
                 params = parse_qs(parsed.query)
                 query = (params.get("query") or [""])[0].strip().lower()
-                exclude_user_id = (params.get("exclude_user_id") or [""])[0].strip()
                 users = [
                     serialize_user(user)
                     for user in database["users"]
-                    if user["id"] != exclude_user_id and (
+                    if user["id"] != current_user["id"] and (
                         query in user["profile"]["username"].lower() or
-                        query in user["profile"]["displayName"].lower()
+                        query in user["profile"]["displayName"].lower() or
+                        query in (user["profile"].get("email") or "").lower() or
+                        query in (user["profile"].get("phoneNumber") or "").lower()
                     )
                 ]
                 return self.respond(200, users[:20])
 
             if parsed.path.startswith("/users/") and "/profile" not in parsed.path and "/avatar" not in parsed.path:
+                current_user, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
                 user_id = parsed.path.split("/")[2]
                 user = find_user(database, user_id)
                 if not user:
                     return self.respond(404, {"error": "user_not_found"})
                 return self.respond(200, serialize_user(user))
 
+            if parsed.path.startswith("/presence/"):
+                current_user, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                user_id = parsed.path.split("/")[2]
+                user = find_user(database, user_id)
+                if not user:
+                    return self.respond(404, {"error": "user_not_found"})
+                return self.respond(200, serialize_presence(current_user, user, database))
+
             if parsed.path == "/chats":
                 params = parse_qs(parsed.query)
-                user_id = (params.get("user_id") or [""])[0].strip()
                 mode = (params.get("mode") or ["online"])[0].strip()
+                user, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+                user_id = user["id"]
+
                 ensure_saved_messages_chat(database, user_id, mode)
-                chats = [
-                    serialize_chat(chat, user_id, database)
-                    for chat in database["chats"]
-                    if user_id in chat["participantIDs"] and chat["mode"] == mode
-                ]
+                chats = []
+                did_backfill = False
+                for chat in database["chats"]:
+                    if user_id not in chat["participantIDs"] or chat["mode"] != mode:
+                        continue
+                    did_backfill = backfill_group_member_snapshots(chat, database) or did_backfill
+                    did_backfill = mark_messages_delivered(chat, database, user_id) or did_backfill
+                    chats.append(serialize_chat(chat, user_id, database))
+
+                if did_backfill:
+                    save_db(database)
+
                 chats.sort(key=lambda item: item["lastActivityAt"], reverse=True)
                 return self.respond(200, chats)
 
             if parsed.path == "/messages":
+                current_user, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
                 params = parse_qs(parsed.query)
                 chat_id = (params.get("chat_id") or [""])[0].strip()
+                chat = find_chat(database, chat_id)
+                if not chat:
+                    return self.respond(404, {"error": "chat_not_found"})
+                if current_user["id"] not in (chat.get("participantIDs") or []):
+                    return self.respond(403, {"error": "sender_not_in_chat"})
+
                 raw_messages = [item for item in database["messages"] if item["chatID"] == chat_id]
-                did_backfill = False
+                did_backfill = backfill_group_member_snapshots(chat, database)
+                did_backfill = mark_messages_delivered(chat, database, current_user["id"]) or did_backfill
                 for message in raw_messages:
                     did_backfill = backfill_sender_display_name(message, database) or did_backfill
                 if did_backfill:
@@ -502,8 +1092,9 @@ class Handler(BaseHTTPRequestHandler):
                 database["users"].append(user)
                 ensure_saved_messages_chat(database, user_id, "online")
                 ensure_saved_messages_chat(database, user_id, "offline")
+                session, access_token, refresh_token = issue_session(database, user_id)
                 save_db(database)
-                return self.respond(200, serialize_user(user))
+                return self.respond(200, session_payload(user, session, access_token, refresh_token))
 
             if method == "POST" and parsed.path == "/auth/login":
                 identifier = str(payload.get("identifier", "")).strip().lower()
@@ -513,95 +1104,182 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(404, {"error": "user_not_found"})
                 if user.get("password") != password:
                     return self.respond(401, {"error": "invalid_credentials"})
-                return self.respond(200, serialize_user(user))
+                session, access_token, refresh_token = issue_session(database, user["id"])
+                save_db(database)
+                return self.respond(200, session_payload(user, session, access_token, refresh_token))
+
+            if method == "POST" and parsed.path == "/auth/refresh":
+                refresh_token = str(payload.get("refresh_token", "")).strip()
+                session = find_session_by_refresh_token(database, refresh_token)
+                if not session:
+                    return self.respond(401, {"error": "invalid_credentials"})
+
+                refresh_expires_at = parse_iso_datetime(session.get("refreshTokenExpiresAt"))
+                if not refresh_expires_at or refresh_expires_at <= datetime.now(timezone.utc):
+                    return self.respond(401, {"error": "invalid_credentials"})
+
+                user = find_user(database, session.get("userID"))
+                if not user:
+                    return self.respond(404, {"error": "user_not_found"})
+
+                access_token, new_refresh_token = rotate_session(session)
+                save_db(database)
+                return self.respond(200, session_payload(user, session, access_token, new_refresh_token))
 
             if method == "POST" and parsed.path == "/usernames/claim":
                 username = str(payload.get("username", "")).strip().lower()
-                user_id = str(payload.get("user_id", "")).strip()
-                user = find_user(database, user_id)
-                if not user:
+                current_user, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                user_id = current_user["id"]
                 if username_taken(database, username, user_id):
                     return self.respond(409, {"error": "username_taken"})
 
-                user["profile"]["username"] = username
-                email = user["profile"].get("email")
-                phone_number = user["profile"].get("phoneNumber")
-                user["identityMethods"] = build_identity_methods(username, email=email, phone_number=phone_number)
+                current_user["profile"]["username"] = username
+                email = current_user["profile"].get("email")
+                phone_number = current_user["profile"].get("phoneNumber")
+                current_user["identityMethods"] = build_identity_methods(username, email=email, phone_number=phone_number)
+                sync_user_snapshots(database, current_user)
                 save_db(database)
                 return self.respond(200, {"ok": True})
 
-            if method == "PATCH" and parsed.path.endswith("/profile"):
-                user_id = parsed.path.split("/")[2]
-                user = find_user(database, user_id)
-                if not user:
+            if method == "POST" and parsed.path == "/devices/register":
+                current_user, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
 
-                username = str(payload.get("username", user["profile"]["username"])).strip().lower()
+                token = normalized_optional_string(payload.get("token"))
+                platform = normalized_optional_string(payload.get("platform")) or "ios"
+                if not token:
+                    return self.respond(409, {"error": "invalid_device_token"})
+
+                database["deviceTokens"] = [
+                    entry for entry in database["deviceTokens"]
+                    if entry.get("token") != token
+                ]
+                database["deviceTokens"].append(
+                    {
+                        "id": str(uuid.uuid4()),
+                        "userID": current_user["id"],
+                        "token": token,
+                        "platform": platform,
+                        "updatedAt": now_iso(),
+                    }
+                )
+                save_db(database)
+                log_event(
+                    "push.token.registered",
+                    user_id=current_user["id"],
+                    platform=platform,
+                    token_suffix=(token[-8:] if token else None),
+                )
+                return self.respond(200, {"ok": True})
+
+            if method == "PATCH" and parsed.path.startswith("/users/") and parsed.path.endswith("/profile"):
+                user_id = parsed.path.split("/")[2]
+                current_user, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+                if current_user["id"] != user_id:
+                    return self.respond(403, {"error": "edit_not_allowed"})
+
+                username = str(payload.get("username", current_user["profile"]["username"])).strip().lower()
                 if username_taken(database, username, user_id):
                     return self.respond(409, {"error": "username_taken"})
 
                 email = normalized_optional_string(payload.get("email"))
                 phone_number = normalized_optional_string(payload.get("phone_number"))
-                user["profile"] = {
-                    "displayName": payload.get("display_name", user["profile"]["displayName"]),
+                current_user["profile"] = {
+                    "displayName": payload.get("display_name", current_user["profile"]["displayName"]),
                     "username": username,
-                    "bio": payload.get("bio", user["profile"]["bio"]),
-                    "status": payload.get("status", user["profile"]["status"]),
+                    "bio": payload.get("bio", current_user["profile"]["bio"]),
+                    "status": payload.get("status", current_user["profile"]["status"]),
                     "email": email,
                     "phoneNumber": phone_number,
-                    "profilePhotoURL": payload.get("profile_photo_url", user["profile"].get("profilePhotoURL")),
-                    "socialLink": payload.get("social_link"),
+                    "profilePhotoURL": normalized_optional_url_string(
+                        payload.get("profile_photo_url", current_user["profile"].get("profilePhotoURL"))
+                    ),
+                    "socialLink": normalized_optional_url_string(payload.get("social_link")),
                 }
-                user["identityMethods"] = build_identity_methods(username, email=email, phone_number=phone_number)
+                current_user["identityMethods"] = build_identity_methods(username, email=email, phone_number=phone_number)
+                sync_user_snapshots(database, current_user)
                 save_db(database)
-                return self.respond(200, serialize_user(user))
+                return self.respond(200, serialize_user(current_user))
 
-            if method == "PATCH" and parsed.path.endswith("/password"):
+            if method == "PATCH" and parsed.path.startswith("/users/") and parsed.path.endswith("/password"):
                 user_id = parsed.path.split("/")[2]
-                user = find_user(database, user_id)
-                if not user:
+                current_user, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+                if current_user["id"] != user_id:
+                    return self.respond(403, {"error": "edit_not_allowed"})
 
-                user["password"] = str(payload.get("password", "")).strip()
+                current_user["password"] = str(payload.get("password", "")).strip()
                 save_db(database)
                 return self.respond(200, {"ok": True})
 
-            if method == "POST" and parsed.path.endswith("/avatar"):
+            if method == "POST" and parsed.path.startswith("/users/") and parsed.path.endswith("/avatar"):
                 user_id = parsed.path.split("/")[2]
-                user = find_user(database, user_id)
-                if not user:
+                current_user, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+                if current_user["id"] != user_id:
+                    return self.respond(403, {"error": "edit_not_allowed"})
 
-                remove_file_for_url(user["profile"].get("profilePhotoURL"), AVATAR_DIR)
+                remove_file_for_url(current_user["profile"].get("profilePhotoURL"), AVATAR_DIR)
                 raw = base64.b64decode(payload.get("image_base64", ""))
                 avatar_name = f"{user_id}.png"
                 avatar_path = os.path.join(AVATAR_DIR, avatar_name)
                 with open(avatar_path, "wb") as file:
                     file.write(raw)
 
-                user["profile"]["profilePhotoURL"] = f"{self.base_url()}/avatars/{avatar_name}"
+                current_user["profile"]["profilePhotoURL"] = f"{self.base_url()}/avatars/{avatar_name}"
                 save_db(database)
-                return self.respond(200, serialize_user(user))
+                return self.respond(200, serialize_user(current_user))
 
-            if method == "DELETE" and parsed.path.endswith("/avatar"):
+            if method == "DELETE" and parsed.path.startswith("/users/") and parsed.path.endswith("/avatar"):
                 user_id = parsed.path.split("/")[2]
-                user = find_user(database, user_id)
-                if not user:
+                current_user, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+                if current_user["id"] != user_id:
+                    return self.respond(403, {"error": "delete_not_allowed"})
 
-                remove_file_for_url(user["profile"].get("profilePhotoURL"), AVATAR_DIR)
-                user["profile"]["profilePhotoURL"] = None
+                remove_file_for_url(current_user["profile"].get("profilePhotoURL"), AVATAR_DIR)
+                current_user["profile"]["profilePhotoURL"] = None
                 save_db(database)
-                return self.respond(200, serialize_user(user))
+                return self.respond(200, serialize_user(current_user))
 
             if method == "POST" and parsed.path == "/chats/direct":
-                current_user_id = str(payload.get("current_user_id", "")).strip()
+                current_user, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                current_user_id = current_user["id"]
                 other_user_id = str(payload.get("other_user_id", "")).strip()
                 mode = str(payload.get("mode", "online")).strip()
                 other_user = find_user(database, other_user_id)
-                cached_title = other_user["profile"]["displayName"] if other_user else "Direct Chat"
-                cached_subtitle = f"@{other_user['profile']['username']}" if other_user else "Direct conversation"
+                if not other_user:
+                    return self.respond(404, {"error": "user_not_found"})
+                if current_user_id == other_user_id:
+                    return self.respond(409, {"error": "invalid_direct_chat"})
+                cached_title = resolved_user_display_name(other_user) or other_user["profile"]["username"] or "Missing User"
+                cached_subtitle = f"@{other_user['profile']['username']}"
 
                 existing = next(
                     (
@@ -633,11 +1311,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, serialize_chat(existing, current_user_id, database))
 
             if method == "POST" and parsed.path == "/chats/group":
-                owner_id = str(payload.get("owner_id", "")).strip()
+                current_user, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                owner_id = current_user["id"]
                 title = str(payload.get("title", "")).strip() or "New Group"
                 member_ids = [member_id for member_id in payload.get("member_ids", []) if str(member_id).strip()]
                 mode = str(payload.get("mode", "online")).strip()
-                participant_ids = [owner_id] + [member_id for member_id in member_ids if member_id != owner_id]
+
+                participant_ids = [owner_id]
+                for member_id in member_ids:
+                    if member_id not in participant_ids:
+                        participant_ids.append(member_id)
+
+                if any(find_user(database, participant_id) is None for participant_id in participant_ids):
+                    return self.respond(404, {"error": "user_not_found"})
+
                 group_id = str(uuid.uuid4())
                 group = {
                     "id": group_id,
@@ -645,12 +1337,11 @@ class Handler(BaseHTTPRequestHandler):
                     "photoURL": None,
                     "ownerID": owner_id,
                     "members": [
-                        {
-                            "id": str(uuid.uuid4()),
-                            "userID": member_id,
-                            "role": "owner" if member_id == owner_id else "member",
-                            "joinedAt": now_iso(),
-                        }
+                        group_member_payload(
+                            database,
+                            member_id,
+                            "owner" if member_id == owner_id else "member",
+                        )
                         for member_id in participant_ids
                     ],
                 }
@@ -668,12 +1359,163 @@ class Handler(BaseHTTPRequestHandler):
                 save_db(database)
                 return self.respond(200, serialize_chat(chat, owner_id, database))
 
+            if method == "PATCH" and parsed.path.startswith("/chats/") and parsed.path.endswith("/group"):
+                chat_id = parsed.path.split("/")[2]
+                requester, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+                requester_id = requester["id"]
+                updated_title = normalized_optional_string(payload.get("title"))
+
+                chat = find_chat(database, chat_id)
+                if not chat:
+                    return self.respond(404, {"error": "chat_not_found"})
+                if chat.get("type") != "group":
+                    return self.respond(409, {"error": "invalid_group_chat"})
+                if not can_manage_group(chat, requester_id):
+                    return self.respond(403, {"error": "group_permission_denied"})
+                if not updated_title:
+                    return self.respond(409, {"error": "invalid_group_operation"})
+
+                chat["group"]["title"] = updated_title
+                chat["cachedTitle"] = updated_title
+                save_db(database)
+                return self.respond(200, serialize_chat(chat, requester_id, database))
+
+            if method == "POST" and parsed.path.startswith("/chats/") and parsed.path.endswith("/group/avatar"):
+                chat_id = parsed.path.split("/")[2]
+                requester, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+                requester_id = requester["id"]
+
+                chat = find_chat(database, chat_id)
+                if not chat:
+                    return self.respond(404, {"error": "chat_not_found"})
+                if chat.get("type") != "group":
+                    return self.respond(409, {"error": "invalid_group_chat"})
+                if not can_manage_group(chat, requester_id):
+                    return self.respond(403, {"error": "group_permission_denied"})
+
+                remove_file_for_url((chat.get("group") or {}).get("photoURL"), AVATAR_DIR)
+                raw = base64.b64decode(payload.get("image_base64", ""))
+                avatar_name = f"group-{chat_id}.jpg"
+                avatar_path = os.path.join(AVATAR_DIR, avatar_name)
+                with open(avatar_path, "wb") as file:
+                    file.write(raw)
+
+                chat["group"]["photoURL"] = f"{self.base_url()}/avatars/{avatar_name}"
+                save_db(database)
+                return self.respond(200, serialize_chat(chat, requester_id, database))
+
+            if method == "DELETE" and parsed.path.startswith("/chats/") and parsed.path.endswith("/group/avatar"):
+                chat_id = parsed.path.split("/")[2]
+                requester, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+                requester_id = requester["id"]
+
+                chat = find_chat(database, chat_id)
+                if not chat:
+                    return self.respond(404, {"error": "chat_not_found"})
+                if chat.get("type") != "group":
+                    return self.respond(409, {"error": "invalid_group_chat"})
+                if not can_manage_group(chat, requester_id):
+                    return self.respond(403, {"error": "group_permission_denied"})
+
+                remove_file_for_url((chat.get("group") or {}).get("photoURL"), AVATAR_DIR)
+                chat["group"]["photoURL"] = None
+                save_db(database)
+                return self.respond(200, serialize_chat(chat, requester_id, database))
+
+            if method == "POST" and parsed.path.startswith("/chats/") and parsed.path.endswith("/group/members"):
+                chat_id = parsed.path.split("/")[2]
+                requester, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+                requester_id = requester["id"]
+                incoming_member_ids = [
+                    str(member_id).strip()
+                    for member_id in payload.get("member_ids", [])
+                    if str(member_id).strip()
+                ]
+
+                chat = find_chat(database, chat_id)
+                if not chat:
+                    return self.respond(404, {"error": "chat_not_found"})
+                if chat.get("type") != "group":
+                    return self.respond(409, {"error": "invalid_group_chat"})
+                if not can_manage_group(chat, requester_id):
+                    return self.respond(403, {"error": "group_permission_denied"})
+
+                group = chat.get("group") or {}
+                members = group.get("members") or []
+                participant_ids = chat.get("participantIDs") or []
+
+                for member_id in incoming_member_ids:
+                    if not find_user(database, member_id):
+                        return self.respond(404, {"error": "user_not_found"})
+                    if member_id in participant_ids:
+                        continue
+
+                    participant_ids.append(member_id)
+                    members.append(group_member_payload(database, member_id, "member"))
+
+                group["members"] = members
+                chat["participantIDs"] = participant_ids
+                chat["cachedSubtitle"] = f"{len(members)} members"
+                save_db(database)
+                return self.respond(200, serialize_chat(chat, requester_id, database))
+
+            if method == "POST" and parsed.path.startswith("/chats/") and parsed.path.endswith("/read"):
+                chat_id = parsed.path.split("/")[2]
+                reader, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                chat = find_chat(database, chat_id)
+                if not chat:
+                    return self.respond(404, {"error": "chat_not_found"})
+                if reader["id"] not in (chat.get("participantIDs") or []):
+                    return self.respond(403, {"error": "sender_not_in_chat"})
+
+                did_update = mark_chat_read(chat, database, reader["id"])
+                if did_update:
+                    save_db(database)
+                return self.respond(200, {"ok": True})
+
             if method == "POST" and parsed.path == "/messages/send":
                 chat_id = str(payload.get("chat_id", "")).strip()
-                sender_id = str(payload.get("sender_id", "")).strip()
-                sender_display_name = normalized_optional_string(payload.get("sender_display_name"))
+                sender, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                sender_id = sender["id"]
+                chat = find_chat(database, chat_id)
+                if not chat:
+                    return self.respond(404, {"error": "chat_not_found"})
+
+                if sender_id not in (chat.get("participantIDs") or []):
+                    return self.respond(403, {"error": "sender_not_in_chat"})
+
+                sender_display_name = normalized_optional_string(payload.get("sender_display_name")) or resolved_user_display_name(sender)
                 text = normalized_optional_string(payload.get("text"))
                 mode = str(payload.get("mode", "online")).strip()
+                if chat.get("mode") != mode:
+                    return self.respond(409, {"error": "chat_mode_mismatch"})
+
                 kind = str(payload.get("kind", "text")).strip() or "text"
                 attachments = []
                 for attachment in payload.get("attachments", []):
@@ -731,25 +1573,31 @@ class Handler(BaseHTTPRequestHandler):
                     "editedAt": None,
                     "deletedForEveryoneAt": None,
                 }
+                backfill_group_member_snapshots(chat, database)
                 database["messages"].append(message)
                 save_db(database)
+                log_push_dispatch_attempt(database, chat, message)
                 return self.respond(200, serialize_message(message, database))
 
             if method == "PATCH" and parsed.path.startswith("/messages/"):
                 message_id = parsed.path.split("/")[2]
                 chat_id = str(payload.get("chat_id", "")).strip()
-                editor_id = str(payload.get("editor_id", "")).strip()
+                editor, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+                editor_id = editor["id"]
                 updated_text = normalized_optional_string(payload.get("text"))
 
-                message = next(
-                    (
-                        item for item in database["messages"]
-                        if item["id"] == message_id and item["chatID"] == chat_id
-                    ),
-                    None
-                )
+                message = find_message(database, message_id)
                 if not message:
                     return self.respond(404, {"error": "message_not_found"})
+                if chat_id and message["chatID"] != chat_id:
+                    return self.respond(404, {"error": "message_not_found"})
+                chat = find_chat(database, message["chatID"])
+                if not chat or editor_id not in (chat.get("participantIDs") or []):
+                    return self.respond(403, {"error": "sender_not_in_chat"})
                 if message["senderID"] != editor_id:
                     return self.respond(403, {"error": "edit_not_allowed"})
                 if message.get("deletedForEveryoneAt"):
@@ -767,17 +1615,21 @@ class Handler(BaseHTTPRequestHandler):
             if method == "DELETE" and parsed.path.startswith("/messages/"):
                 message_id = parsed.path.split("/")[2]
                 chat_id = str(payload.get("chat_id", "")).strip()
-                requester_id = str(payload.get("requester_id", "")).strip()
+                requester, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+                requester_id = requester["id"]
 
-                message = next(
-                    (
-                        item for item in database["messages"]
-                        if item["id"] == message_id and item["chatID"] == chat_id
-                    ),
-                    None
-                )
+                message = find_message(database, message_id)
                 if not message:
                     return self.respond(404, {"error": "message_not_found"})
+                if chat_id and message["chatID"] != chat_id:
+                    return self.respond(404, {"error": "message_not_found"})
+                chat = find_chat(database, message["chatID"])
+                if not chat or requester_id not in (chat.get("participantIDs") or []):
+                    return self.respond(403, {"error": "sender_not_in_chat"})
                 if message["senderID"] != requester_id:
                     return self.respond(403, {"error": "delete_not_allowed"})
 
@@ -799,7 +1651,7 @@ class Handler(BaseHTTPRequestHandler):
             body = file.read()
 
         self.send_response(200)
-        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Type", avatar_content_type(avatar_name))
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
