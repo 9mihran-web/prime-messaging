@@ -231,10 +231,28 @@ def sender_display_name_for(message, database):
 
     sender = find_user(database, message.get("senderID"))
     if not sender:
-        return "Unknown user"
+        historical_names = [
+            (item.get("senderDisplayName") or "").strip()
+            for item in database["messages"]
+            if item.get("senderID") == message.get("senderID")
+        ]
+        historical_names = [name for name in historical_names if name]
+        return historical_names[-1] if historical_names else "Unknown user"
 
     display_name = (sender["profile"].get("displayName") or "").strip()
     return display_name or sender["profile"]["username"]
+
+
+def backfill_sender_display_name(message, database):
+    if (message.get("senderDisplayName") or "").strip():
+        return False
+
+    resolved_name = sender_display_name_for(message, database)
+    if not resolved_name or resolved_name == "Unknown user":
+        return False
+
+    message["senderDisplayName"] = resolved_name
+    return True
 
 
 def generic_direct_title(value):
@@ -426,7 +444,14 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/messages":
                 params = parse_qs(parsed.query)
                 chat_id = (params.get("chat_id") or [""])[0].strip()
-                messages = [serialize_message(item, database) for item in database["messages"] if item["chatID"] == chat_id]
+                raw_messages = [item for item in database["messages"] if item["chatID"] == chat_id]
+                did_backfill = False
+                for message in raw_messages:
+                    did_backfill = backfill_sender_display_name(message, database) or did_backfill
+                if did_backfill:
+                    save_db(database)
+
+                messages = [serialize_message(item, database) for item in raw_messages]
                 messages.sort(key=lambda item: item["createdAt"])
                 return self.respond(200, messages)
 
