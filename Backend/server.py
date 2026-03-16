@@ -225,6 +225,10 @@ def message_preview(message):
 
 
 def sender_display_name_for(message, database):
+    stored_name = (message.get("senderDisplayName") or "").strip()
+    if stored_name:
+        return stored_name
+
     sender = find_user(database, message.get("senderID"))
     if not sender:
         return "Unknown user"
@@ -642,6 +646,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and parsed.path == "/messages/send":
                 chat_id = str(payload.get("chat_id", "")).strip()
                 sender_id = str(payload.get("sender_id", "")).strip()
+                sender_display_name = normalized_optional_string(payload.get("sender_display_name"))
                 text = normalized_optional_string(payload.get("text"))
                 mode = str(payload.get("mode", "online")).strip()
                 kind = str(payload.get("kind", "text")).strip() or "text"
@@ -690,6 +695,7 @@ class Handler(BaseHTTPRequestHandler):
                     "id": str(uuid.uuid4()),
                     "chatID": chat_id,
                     "senderID": sender_id,
+                    "senderDisplayName": sender_display_name,
                     "mode": mode,
                     "kind": kind,
                     "text": text,

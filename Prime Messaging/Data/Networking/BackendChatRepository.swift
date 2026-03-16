@@ -231,12 +231,27 @@ struct BackendChatRepository: ChatRepository {
         return SendMessageRequest(
             chatID: chatID.uuidString,
             senderID: senderID.uuidString,
+            senderDisplayName: resolvedCurrentSenderDisplayName(for: senderID),
             text: draft.normalizedText,
             mode: mode.rawValue,
             kind: resolvedKind(for: draft).rawValue,
             attachments: attachments,
             voiceMessage: voiceMessage
         )
+    }
+
+    private func resolvedCurrentSenderDisplayName(for senderID: UUID) -> String? {
+        let decoder = JSONDecoder()
+        guard
+            let data = UserDefaults.standard.data(forKey: "app_state.current_user"),
+            let user = try? decoder.decode(User.self, from: data),
+            user.id == senderID
+        else {
+            return nil
+        }
+
+        let trimmedDisplayName = user.profile.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedDisplayName.isEmpty ? user.profile.username : trimmedDisplayName
     }
 
     private func loadBase64(from url: URL?) throws -> String? {
@@ -324,6 +339,7 @@ struct BackendChatRepository: ChatRepository {
 private struct SendMessageRequest: Encodable {
     let chatID: String
     let senderID: String
+    let senderDisplayName: String?
     let text: String?
     let mode: String
     let kind: String
@@ -333,6 +349,7 @@ private struct SendMessageRequest: Encodable {
     enum CodingKeys: String, CodingKey {
         case chatID = "chat_id"
         case senderID = "sender_id"
+        case senderDisplayName = "sender_display_name"
         case text
         case mode
         case kind
