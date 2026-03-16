@@ -13,6 +13,7 @@ BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(BASE_DIR, "data")
 DATA_FILE = os.path.join(DATA_DIR, "database.json")
 AVATAR_DIR = os.path.join(DATA_DIR, "avatars")
+MEDIA_DIR = os.path.join(DATA_DIR, "media")
 HOST = os.environ.get("PRIME_MESSAGING_HOST", "0.0.0.0")
 PORT = int(os.environ.get("PRIME_MESSAGING_PORT") or os.environ.get("PORT", "8080"))
 RAILWAY_PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
@@ -30,6 +31,7 @@ def now_iso():
 def ensure_storage():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(AVATAR_DIR, exist_ok=True)
+    os.makedirs(MEDIA_DIR, exist_ok=True)
 
     if not os.path.exists(DATA_FILE):
         seed = {
@@ -78,14 +80,14 @@ def default_privacy_settings():
 
 
 def find_user_by_identifier(database, identifier):
-    identifier = identifier.lower()
+    identifier = identifier.lower().lstrip("@")
     for user in database["users"]:
         profile = user["profile"]
         if profile["username"].lower() == identifier:
             return user
-        if profile.get("email", "").lower() == identifier:
+        if (profile.get("email") or "").lower() == identifier:
             return user
-        if profile.get("phoneNumber", "").lower() == identifier:
+        if (profile.get("phoneNumber") or "").lower() == identifier:
             return user
     return None
 
@@ -125,29 +127,169 @@ def ensure_saved_messages_chat(database, user_id, mode):
     return chat
 
 
+def normalized_optional_string(value):
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
+def build_identity_methods(username, email=None, phone_number=None):
+    methods = [
+        {
+            "id": str(uuid.uuid4()),
+            "type": "username",
+            "value": f"@{username}",
+            "isVerified": True,
+            "isPubliclyDiscoverable": True,
+        }
+    ]
+
+    if email:
+        methods.insert(
+            0,
+            {
+                "id": str(uuid.uuid4()),
+                "type": "email",
+                "value": email,
+                "isVerified": True,
+                "isPubliclyDiscoverable": True,
+            },
+        )
+
+    if phone_number:
+        methods.insert(
+            0,
+            {
+                "id": str(uuid.uuid4()),
+                "type": "phone",
+                "value": phone_number,
+                "isVerified": True,
+                "isPubliclyDiscoverable": True,
+            },
+        )
+
+    return methods
+
+
+def remove_file_for_url(file_url, directory):
+    if not file_url:
+        return
+
+    basename = os.path.basename(urlparse(file_url).path)
+    if not basename:
+        return
+
+    target_path = os.path.join(directory, basename)
+    if os.path.exists(target_path):
+        os.remove(target_path)
+
+
+def save_base64_blob(directory, file_name, encoded_data):
+    raw = base64.b64decode(encoded_data or "")
+    stem, ext = os.path.splitext(file_name or "")
+    if not ext:
+        ext = ".bin"
+    safe_stem = "".join(ch for ch in (stem or "upload") if ch.isalnum() or ch in ("-", "_")) or "upload"
+    safe_name = f"{safe_stem}-{uuid.uuid4().hex}{ext}"
+    output_path = os.path.join(directory, safe_name)
+    with open(output_path, "wb") as file:
+        file.write(raw)
+    return safe_name, len(raw)
+
+
+def message_preview(message):
+    if message.get("text"):
+        return message["text"]
+
+    if message.get("voiceMessage"):
+        return "Voice message"
+
+    attachments = message.get("attachments") or []
+    if not attachments:
+        return None
+
+    first_type = attachments[0].get("type")
+    previews = {
+        "photo": "Photo",
+        "audio": "Audio",
+        "video": "Video",
+        "document": "Document",
+        "contact": "Contact",
+        "location": "Location",
+    }
+    return previews.get(first_type, "Attachment")
+
+
+def generic_direct_title(value):
+    trimmed = (value or "").strip().lower()
+    return trimmed in ("", "chat", "direct chat")
+
+
+def generic_direct_subtitle(value):
+    trimmed = (value or "").strip().lower()
+    return trimmed in ("", "direct conversation")
+
+
+def direct_chat_other_user(chat, current_user_id, database):
+    participant_ids = chat.get("participantIDs") or []
+
+    for user_id in participant_ids:
+        if user_id == current_user_id:
+            continue
+        user = find_user(database, user_id)
+        if user:
+            return user
+
+    messages = [message for message in database["messages"] if message["chatID"] == chat["id"]]
+    messages.sort(key=lambda item: item["createdAt"], reverse=True)
+
+    for message in messages:
+        sender_id = message.get("senderID")
+        if not sender_id or sender_id == current_user_id:
+            continue
+        user = find_user(database, sender_id)
+        if user:
+            return user
+
+    return None
+
+
 def chat_title_for(chat, current_user_id, database):
     if chat["type"] == "selfChat":
         return "Saved Messages"
 
-    other_ids = [user_id for user_id in chat["participantIDs"] if user_id != current_user_id]
-    if not other_ids:
-        return chat.get("cachedTitle", "Direct Chat")
+    if chat["type"] == "group":
+        return (chat.get("group") or {}).get("title") or chat.get("cachedTitle", "Group Chat")
 
-    other_user = find_user(database, other_ids[0])
-    if not other_user:
-        return chat.get("cachedTitle", "Direct Chat")
+    other_user = direct_chat_other_user(chat, current_user_id, database)
+    if other_user:
+        display_name = (other_user["profile"].get("displayName") or "").strip()
+        if display_name:
+            return display_name
+        return other_user["profile"]["username"]
 
-    return other_user["profile"]["displayName"]
+    cached_title = chat.get("cachedTitle", "Direct Chat")
+    if generic_direct_title(cached_title):
+        cached_subtitle = chat.get("cachedSubtitle", "Direct conversation")
+        if cached_subtitle.startswith("@"):
+            return cached_subtitle.removeprefix("@")
+        return "Chat"
+
+    return cached_title
 
 
 def chat_subtitle_for(chat, current_user_id, database):
-    other_ids = [user_id for user_id in chat["participantIDs"] if user_id != current_user_id]
-    if not other_ids:
-        return chat.get("cachedSubtitle", "Notes and drafts")
+    if chat["type"] == "group":
+        group = chat.get("group") or {}
+        members = group.get("members") or []
+        count = max(len(members), 1)
+        return f"{count} members"
 
-    other_user = find_user(database, other_ids[0])
+    other_user = direct_chat_other_user(chat, current_user_id, database)
     if not other_user:
-        return chat.get("cachedSubtitle", "Direct conversation")
+        cached_subtitle = chat.get("cachedSubtitle", "Direct conversation")
+        return "Direct conversation" if generic_direct_subtitle(cached_subtitle) else cached_subtitle
 
     return f"@{other_user['profile']['username']}"
 
@@ -164,8 +306,8 @@ def serialize_chat(chat, current_user_id, database):
         "title": chat_title_for(chat, current_user_id, database),
         "subtitle": chat_subtitle_for(chat, current_user_id, database),
         "participantIDs": chat["participantIDs"],
-        "group": None,
-        "lastMessagePreview": last_message["text"] if last_message else None,
+        "group": chat.get("group"),
+        "lastMessagePreview": message_preview(last_message) if last_message else None,
         "lastActivityAt": last_message["createdAt"] if last_message else chat["createdAt"],
         "unreadCount": 0,
         "isPinned": False,
@@ -186,16 +328,16 @@ def serialize_message(message):
         "chatID": message["chatID"],
         "senderID": message["senderID"],
         "mode": message["mode"],
-        "kind": "text",
+        "kind": message.get("kind", "text"),
         "text": message["text"],
-        "attachments": [],
+        "attachments": message.get("attachments", []),
         "replyToMessageID": None,
-        "status": "sent",
+        "status": message.get("status", "sent"),
         "createdAt": message["createdAt"],
         "editedAt": None,
         "deletedForEveryoneAt": None,
         "reactions": [],
-        "voiceMessage": None,
+        "voiceMessage": message.get("voiceMessage"),
         "liveLocation": None,
     }
 
@@ -209,6 +351,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path.startswith("/avatars/"):
             return self.serve_avatar(parsed.path.removeprefix("/avatars/"))
+
+        if parsed.path.startswith("/media/"):
+            return self.serve_media(parsed.path.removeprefix("/media/"))
 
         with LOCK:
             database = load_db()
@@ -246,11 +391,20 @@ class Handler(BaseHTTPRequestHandler):
                 user_id = (params.get("user_id") or [""])[0].strip()
                 mode = (params.get("mode") or ["online"])[0].strip()
                 ensure_saved_messages_chat(database, user_id, mode)
-                chats = [
-                    serialize_chat(chat, user_id, database)
-                    for chat in database["chats"]
-                    if user_id in chat["participantIDs"] and chat["mode"] == mode
-                ]
+                chats = []
+                for chat in database["chats"]:
+                    if user_id not in chat["participantIDs"] or chat["mode"] != mode:
+                        continue
+
+                    serialized_chat = serialize_chat(chat, user_id, database)
+                    if (
+                        serialized_chat["type"] == "direct" and
+                        generic_direct_title(serialized_chat["title"]) and
+                        generic_direct_subtitle(serialized_chat["subtitle"])
+                    ):
+                        continue
+
+                    chats.append(serialized_chat)
                 chats.sort(key=lambda item: item["lastActivityAt"], reverse=True)
                 return self.respond(200, chats)
 
@@ -264,20 +418,31 @@ class Handler(BaseHTTPRequestHandler):
         return self.respond(404, {"error": "not_found"})
 
     def do_POST(self):
+        return self.handle_mutation("POST")
+
+    def do_PATCH(self):
+        return self.handle_mutation("PATCH")
+
+    def do_DELETE(self):
+        return self.handle_mutation("DELETE")
+
+    def handle_mutation(self, method):
         parsed = urlparse(self.path)
-        payload = self.read_json()
+        payload = self.read_json() if method != "DELETE" else {}
 
         with LOCK:
             database = load_db()
 
-            if parsed.path == "/auth/signup":
+            if method == "POST" and parsed.path == "/auth/signup":
                 username = str(payload.get("username", "")).strip().lower()
                 if username_taken(database, username):
                     return self.respond(409, {"error": "username_taken"})
 
                 user_id = str(uuid.uuid4())
                 method_type = payload.get("method_type", "email")
-                contact_value = payload.get("contact_value")
+                contact_value = normalized_optional_string(payload.get("contact_value"))
+                email = contact_value if method_type == "email" else None
+                phone_number = contact_value if method_type == "phone" else None
                 user = {
                     "id": user_id,
                     "password": payload.get("password", ""),
@@ -286,27 +451,12 @@ class Handler(BaseHTTPRequestHandler):
                         "username": username,
                         "bio": "Welcome to Prime Messaging.",
                         "status": "Available",
-                        "email": contact_value if method_type == "email" else None,
-                        "phoneNumber": contact_value if method_type == "phone" else None,
+                        "email": email,
+                        "phoneNumber": phone_number,
                         "profilePhotoURL": None,
                         "socialLink": None,
                     },
-                    "identityMethods": [
-                        {
-                            "id": str(uuid.uuid4()),
-                            "type": method_type,
-                            "value": contact_value,
-                            "isVerified": True,
-                            "isPubliclyDiscoverable": True,
-                        },
-                        {
-                            "id": str(uuid.uuid4()),
-                            "type": "username",
-                            "value": f"@{username}",
-                            "isVerified": True,
-                            "isPubliclyDiscoverable": True,
-                        },
-                    ],
+                    "identityMethods": build_identity_methods(username, email=email, phone_number=phone_number),
                     "privacySettings": default_privacy_settings(),
                 }
                 database["users"].append(user)
@@ -315,7 +465,7 @@ class Handler(BaseHTTPRequestHandler):
                 save_db(database)
                 return self.respond(200, serialize_user(user))
 
-            if parsed.path == "/auth/login":
+            if method == "POST" and parsed.path == "/auth/login":
                 identifier = str(payload.get("identifier", "")).strip().lower()
                 password = str(payload.get("password", ""))
                 user = find_user_by_identifier(database, identifier)
@@ -325,7 +475,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(401, {"error": "invalid_credentials"})
                 return self.respond(200, serialize_user(user))
 
-            if parsed.path == "/usernames/claim":
+            if method == "POST" and parsed.path == "/usernames/claim":
                 username = str(payload.get("username", "")).strip().lower()
                 user_id = str(payload.get("user_id", "")).strip()
                 user = find_user(database, user_id)
@@ -335,13 +485,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(409, {"error": "username_taken"})
 
                 user["profile"]["username"] = username
-                for method in user["identityMethods"]:
-                    if method["type"] == "username":
-                        method["value"] = f"@{username}"
+                email = user["profile"].get("email")
+                phone_number = user["profile"].get("phoneNumber")
+                user["identityMethods"] = build_identity_methods(username, email=email, phone_number=phone_number)
                 save_db(database)
                 return self.respond(200, {"ok": True})
 
-            if parsed.path.endswith("/profile"):
+            if method == "PATCH" and parsed.path.endswith("/profile"):
                 user_id = parsed.path.split("/")[2]
                 user = find_user(database, user_id)
                 if not user:
@@ -351,28 +501,39 @@ class Handler(BaseHTTPRequestHandler):
                 if username_taken(database, username, user_id):
                     return self.respond(409, {"error": "username_taken"})
 
+                email = normalized_optional_string(payload.get("email"))
+                phone_number = normalized_optional_string(payload.get("phone_number"))
                 user["profile"] = {
                     "displayName": payload.get("display_name", user["profile"]["displayName"]),
                     "username": username,
                     "bio": payload.get("bio", user["profile"]["bio"]),
                     "status": payload.get("status", user["profile"]["status"]),
-                    "email": payload.get("email"),
-                    "phoneNumber": payload.get("phone_number"),
+                    "email": email,
+                    "phoneNumber": phone_number,
                     "profilePhotoURL": payload.get("profile_photo_url", user["profile"].get("profilePhotoURL")),
                     "socialLink": payload.get("social_link"),
                 }
-                for method in user["identityMethods"]:
-                    if method["type"] == "username":
-                        method["value"] = f"@{username}"
+                user["identityMethods"] = build_identity_methods(username, email=email, phone_number=phone_number)
                 save_db(database)
                 return self.respond(200, serialize_user(user))
 
-            if parsed.path.endswith("/avatar"):
+            if method == "PATCH" and parsed.path.endswith("/password"):
                 user_id = parsed.path.split("/")[2]
                 user = find_user(database, user_id)
                 if not user:
                     return self.respond(404, {"error": "user_not_found"})
 
+                user["password"] = str(payload.get("password", "")).strip()
+                save_db(database)
+                return self.respond(200, {"ok": True})
+
+            if method == "POST" and parsed.path.endswith("/avatar"):
+                user_id = parsed.path.split("/")[2]
+                user = find_user(database, user_id)
+                if not user:
+                    return self.respond(404, {"error": "user_not_found"})
+
+                remove_file_for_url(user["profile"].get("profilePhotoURL"), AVATAR_DIR)
                 raw = base64.b64decode(payload.get("image_base64", ""))
                 avatar_name = f"{user_id}.png"
                 avatar_path = os.path.join(AVATAR_DIR, avatar_name)
@@ -383,7 +544,18 @@ class Handler(BaseHTTPRequestHandler):
                 save_db(database)
                 return self.respond(200, serialize_user(user))
 
-            if parsed.path == "/chats/direct":
+            if method == "DELETE" and parsed.path.endswith("/avatar"):
+                user_id = parsed.path.split("/")[2]
+                user = find_user(database, user_id)
+                if not user:
+                    return self.respond(404, {"error": "user_not_found"})
+
+                remove_file_for_url(user["profile"].get("profilePhotoURL"), AVATAR_DIR)
+                user["profile"]["profilePhotoURL"] = None
+                save_db(database)
+                return self.respond(200, serialize_user(user))
+
+            if method == "POST" and parsed.path == "/chats/direct":
                 current_user_id = str(payload.get("current_user_id", "")).strip()
                 other_user_id = str(payload.get("other_user_id", "")).strip()
                 mode = str(payload.get("mode", "online")).strip()
@@ -420,18 +592,99 @@ class Handler(BaseHTTPRequestHandler):
 
                 return self.respond(200, serialize_chat(existing, current_user_id, database))
 
-            if parsed.path == "/messages/send":
+            if method == "POST" and parsed.path == "/chats/group":
+                owner_id = str(payload.get("owner_id", "")).strip()
+                title = str(payload.get("title", "")).strip() or "New Group"
+                member_ids = [member_id for member_id in payload.get("member_ids", []) if str(member_id).strip()]
+                mode = str(payload.get("mode", "online")).strip()
+                participant_ids = [owner_id] + [member_id for member_id in member_ids if member_id != owner_id]
+                group_id = str(uuid.uuid4())
+                group = {
+                    "id": group_id,
+                    "title": title,
+                    "photoURL": None,
+                    "ownerID": owner_id,
+                    "members": [
+                        {
+                            "id": str(uuid.uuid4()),
+                            "userID": member_id,
+                            "role": "owner" if member_id == owner_id else "member",
+                            "joinedAt": now_iso(),
+                        }
+                        for member_id in participant_ids
+                    ],
+                }
+                chat = {
+                    "id": group_id,
+                    "mode": mode,
+                    "type": "group",
+                    "participantIDs": participant_ids,
+                    "group": group,
+                    "cachedTitle": title,
+                    "cachedSubtitle": f"{len(participant_ids)} members",
+                    "createdAt": now_iso(),
+                }
+                database["chats"].append(chat)
+                save_db(database)
+                return self.respond(200, serialize_chat(chat, owner_id, database))
+
+            if method == "POST" and parsed.path == "/messages/send":
                 chat_id = str(payload.get("chat_id", "")).strip()
                 sender_id = str(payload.get("sender_id", "")).strip()
-                text = str(payload.get("text", "")).strip()
+                text = normalized_optional_string(payload.get("text"))
                 mode = str(payload.get("mode", "online")).strip()
+                kind = str(payload.get("kind", "text")).strip() or "text"
+                attachments = []
+                for attachment in payload.get("attachments", []):
+                    file_name = attachment.get("file_name") or "attachment.bin"
+                    remote_url = None
+                    byte_size = int(attachment.get("byte_size") or 0)
+                    if attachment.get("data_base64"):
+                        media_name, detected_size = save_base64_blob(MEDIA_DIR, file_name, attachment.get("data_base64"))
+                        remote_url = f"{self.base_url()}/media/{media_name}"
+                        byte_size = detected_size
+
+                    attachments.append(
+                        {
+                            "id": str(uuid.uuid4()),
+                            "type": attachment.get("type", "document"),
+                            "fileName": file_name,
+                            "mimeType": attachment.get("mime_type", "application/octet-stream"),
+                            "localURL": None,
+                            "remoteURL": remote_url,
+                            "byteSize": byte_size,
+                        }
+                    )
+
+                voice_payload = payload.get("voice_message")
+                voice_message = None
+                if voice_payload:
+                    remote_url = None
+                    if voice_payload.get("data_base64"):
+                        media_name, _ = save_base64_blob(
+                            MEDIA_DIR,
+                            voice_payload.get("file_name") or "voice.m4a",
+                            voice_payload.get("data_base64"),
+                        )
+                        remote_url = f"{self.base_url()}/media/{media_name}"
+
+                    voice_message = {
+                        "durationSeconds": int(voice_payload.get("duration_seconds") or 0),
+                        "waveformSamples": voice_payload.get("waveform_samples") or [],
+                        "localFileURL": None,
+                        "remoteFileURL": remote_url,
+                    }
 
                 message = {
                     "id": str(uuid.uuid4()),
                     "chatID": chat_id,
                     "senderID": sender_id,
                     "mode": mode,
+                    "kind": kind,
                     "text": text,
+                    "attachments": attachments,
+                    "voiceMessage": voice_message,
+                    "status": "sent",
                     "createdAt": now_iso(),
                 }
                 database["messages"].append(message)
@@ -450,6 +703,20 @@ class Handler(BaseHTTPRequestHandler):
 
         self.send_response(200)
         self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def serve_media(self, media_name):
+        media_path = os.path.join(MEDIA_DIR, os.path.basename(media_name))
+        if not os.path.exists(media_path):
+            return self.respond(404, {"error": "media_not_found"})
+
+        with open(media_path, "rb") as file:
+            body = file.read()
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

@@ -56,13 +56,22 @@ struct BackendChatRepository: ChatRepository {
     }
 
     func sendMessage(_ text: String, in chatID: UUID, mode: ChatMode, senderID: UUID) async throws -> Message {
-        let body = SendMessageRequest(chatID: chatID.uuidString, senderID: senderID.uuidString, text: text, mode: mode.rawValue)
+        try await sendMessage(
+            OutgoingMessageDraft(text: text),
+            in: chatID,
+            mode: mode,
+            senderID: senderID
+        )
+    }
+
+    func sendMessage(_ draft: OutgoingMessageDraft, in chatID: UUID, mode: ChatMode, senderID: UUID) async throws -> Message {
+        let body = try makeSendMessageRequest(from: draft, chatID: chatID, senderID: senderID, mode: mode)
         return try await request(
             path: "/messages/send",
             method: "POST",
             body: body,
             fallback: {
-                try await fallback.sendMessage(text, in: chatID, mode: mode, senderID: senderID)
+                try await fallback.sendMessage(draft, in: chatID, mode: mode, senderID: senderID)
             }
         )
     }
@@ -81,6 +90,23 @@ struct BackendChatRepository: ChatRepository {
 
     func createNearbyChat(with peer: OfflinePeer, currentUser: User) async throws -> Chat {
         throw OfflineTransportError.nearbySelectionRequired
+    }
+
+    func createGroupChat(title: String, memberIDs: [UUID], ownerID: UUID, mode: ChatMode) async throws -> Chat {
+        let body = GroupChatRequest(
+            title: title,
+            ownerID: ownerID.uuidString,
+            memberIDs: memberIDs.map(\.uuidString),
+            mode: mode.rawValue
+        )
+        return try await request(
+            path: "/chats/group",
+            method: "POST",
+            body: body,
+            fallback: {
+                try await fallback.createGroupChat(title: title, memberIDs: memberIDs, ownerID: ownerID, mode: mode)
+            }
+        )
     }
 
     func saveDraft(_ draft: Draft) async throws {
@@ -150,30 +176,126 @@ struct BackendChatRepository: ChatRepository {
         }
     }
 
+    private func makeSendMessageRequest(
+        from draft: OutgoingMessageDraft,
+        chatID: UUID,
+        senderID: UUID,
+        mode: ChatMode
+    ) throws -> SendMessageRequest {
+        let attachments = try draft.attachments.map { attachment in
+            SendAttachmentRequest(
+                type: attachment.type.rawValue,
+                fileName: attachment.fileName,
+                mimeType: attachment.mimeType,
+                byteSize: attachment.byteSize,
+                dataBase64: try loadBase64(from: attachment.localURL)
+            )
+        }
+
+        let voiceMessage = try draft.voiceMessage.map { voiceMessage in
+            SendVoiceMessageRequest(
+                durationSeconds: voiceMessage.durationSeconds,
+                waveformSamples: voiceMessage.waveformSamples,
+                fileName: voiceMessage.localFileURL?.lastPathComponent ?? "voice.m4a",
+                dataBase64: try loadBase64(from: voiceMessage.localFileURL)
+            )
+        }
+
+        return SendMessageRequest(
+            chatID: chatID.uuidString,
+            senderID: senderID.uuidString,
+            text: draft.normalizedText,
+            mode: mode.rawValue,
+            kind: resolvedKind(for: draft).rawValue,
+            attachments: attachments,
+            voiceMessage: voiceMessage
+        )
+    }
+
+    private func loadBase64(from url: URL?) throws -> String? {
+        guard let url else { return nil }
+        let data = try Data(contentsOf: url)
+        return data.base64EncodedString()
+    }
+
+    private func resolvedKind(for draft: OutgoingMessageDraft) -> MessageKind {
+        if draft.voiceMessage != nil {
+            return .voice
+        }
+
+        if let firstAttachment = draft.attachments.first {
+            switch firstAttachment.type {
+            case .photo:
+                return .photo
+            case .audio:
+                return .audio
+            case .video:
+                return .video
+            case .document:
+                return .document
+            case .contact:
+                return .contact
+            case .location:
+                return .location
+            }
+        }
+
+        return .text
+    }
+
     private func hydratingDirectChatTitles(in chats: [Chat], currentUserID: UUID, baseURL: URL) async throws -> [Chat] {
         var hydratedChats = chats
 
         for index in hydratedChats.indices {
-            guard needsHydration(hydratedChats[index]) else { continue }
-            guard let otherUserID = hydratedChats[index].participantIDs.first(where: { $0 != currentUserID }) else { continue }
+            guard hydratedChats[index].type == .direct else { continue }
+            guard let otherUserID = await resolvedOtherUserID(for: hydratedChats[index], currentUserID: currentUserID) else {
+                continue
+            }
 
             do {
                 let user = try await fetchUser(id: otherUserID, baseURL: baseURL)
-                hydratedChats[index].title = user.profile.displayName
+                let trimmedDisplayName = user.profile.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+                let displayTitle = trimmedDisplayName.isEmpty ? user.profile.username : trimmedDisplayName
+                hydratedChats[index].title = displayTitle
                 hydratedChats[index].subtitle = "@\(user.profile.username)"
             } catch { }
         }
 
-        return hydratedChats
+        return hydratedChats.filter { chat in
+            guard chat.type == .direct else { return true }
+            return isBrokenGenericDirectChat(chat) == false
+        }
     }
 
-    private func needsHydration(_ chat: Chat) -> Bool {
-        guard chat.type == .direct else {
-            return false
+    private func resolvedOtherUserID(for chat: Chat, currentUserID: UUID) async -> UUID? {
+        if let participantID = chat.participantIDs.first(where: { $0 != currentUserID }) {
+            return participantID
         }
 
+        do {
+            let messages = try await fetchMessages(chatID: chat.id, mode: chat.mode)
+            return messages
+                .reversed()
+                .map(\.senderID)
+                .first(where: { $0 != currentUserID })
+        } catch {
+            return nil
+        }
+    }
+
+    private func isBrokenGenericDirectChat(_ chat: Chat) -> Bool {
         let trimmedTitle = chat.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmedTitle.isEmpty || trimmedTitle.caseInsensitiveCompare("Direct Chat") == .orderedSame
+        let trimmedSubtitle = chat.subtitle.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let genericTitle =
+            trimmedTitle.isEmpty ||
+            trimmedTitle.caseInsensitiveCompare("Direct Chat") == .orderedSame ||
+            trimmedTitle.caseInsensitiveCompare("Chat") == .orderedSame
+        let genericSubtitle =
+            trimmedSubtitle.isEmpty ||
+            trimmedSubtitle.caseInsensitiveCompare("Direct conversation") == .orderedSame
+
+        return genericTitle && genericSubtitle
     }
 
     private func fetchUser(id: UUID, baseURL: URL) async throws -> User {
@@ -193,14 +315,50 @@ struct BackendChatRepository: ChatRepository {
 private struct SendMessageRequest: Encodable {
     let chatID: String
     let senderID: String
-    let text: String
+    let text: String?
     let mode: String
+    let kind: String
+    let attachments: [SendAttachmentRequest]
+    let voiceMessage: SendVoiceMessageRequest?
 
     enum CodingKeys: String, CodingKey {
         case chatID = "chat_id"
         case senderID = "sender_id"
         case text
         case mode
+        case kind
+        case attachments
+        case voiceMessage = "voice_message"
+    }
+}
+
+private struct SendAttachmentRequest: Encodable {
+    let type: String
+    let fileName: String
+    let mimeType: String
+    let byteSize: Int64
+    let dataBase64: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case fileName = "file_name"
+        case mimeType = "mime_type"
+        case byteSize = "byte_size"
+        case dataBase64 = "data_base64"
+    }
+}
+
+private struct SendVoiceMessageRequest: Encodable {
+    let durationSeconds: Int
+    let waveformSamples: [Float]
+    let fileName: String
+    let dataBase64: String?
+
+    enum CodingKeys: String, CodingKey {
+        case durationSeconds = "duration_seconds"
+        case waveformSamples = "waveform_samples"
+        case fileName = "file_name"
+        case dataBase64 = "data_base64"
     }
 }
 
@@ -212,6 +370,20 @@ private struct DirectChatRequest: Encodable {
     enum CodingKeys: String, CodingKey {
         case currentUserID = "current_user_id"
         case otherUserID = "other_user_id"
+        case mode
+    }
+}
+
+private struct GroupChatRequest: Encodable {
+    let title: String
+    let ownerID: String
+    let memberIDs: [String]
+    let mode: String
+
+    enum CodingKeys: String, CodingKey {
+        case title
+        case ownerID = "owner_id"
+        case memberIDs = "member_ids"
         case mode
     }
 }
