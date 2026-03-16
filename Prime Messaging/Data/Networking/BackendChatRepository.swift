@@ -261,10 +261,7 @@ struct BackendChatRepository: ChatRepository {
             } catch { }
         }
 
-        return hydratedChats.filter { chat in
-            guard chat.type == .direct else { return true }
-            return isBrokenGenericDirectChat(chat) == false
-        }
+        return hydratedChats
     }
 
     private func resolvedOtherUserID(for chat: Chat, currentUserID: UUID) async -> UUID? {
@@ -281,21 +278,6 @@ struct BackendChatRepository: ChatRepository {
         } catch {
             return nil
         }
-    }
-
-    private func isBrokenGenericDirectChat(_ chat: Chat) -> Bool {
-        let trimmedTitle = chat.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedSubtitle = chat.subtitle.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        let genericTitle =
-            trimmedTitle.isEmpty ||
-            trimmedTitle.caseInsensitiveCompare("Direct Chat") == .orderedSame ||
-            trimmedTitle.caseInsensitiveCompare("Chat") == .orderedSame
-        let genericSubtitle =
-            trimmedSubtitle.isEmpty ||
-            trimmedSubtitle.caseInsensitiveCompare("Direct conversation") == .orderedSame
-
-        return genericTitle && genericSubtitle
     }
 
     private func fetchUser(id: UUID, baseURL: URL) async throws -> User {

@@ -252,6 +252,12 @@ def direct_chat_other_user(chat, current_user_id, database):
         if user:
             return user
 
+    cached_subtitle = (chat.get("cachedSubtitle") or "").strip()
+    if cached_subtitle.startswith("@"):
+        user = find_user_by_identifier(database, cached_subtitle)
+        if user and user["id"] != current_user_id:
+            return user
+
     return None
 
 
@@ -391,20 +397,11 @@ class Handler(BaseHTTPRequestHandler):
                 user_id = (params.get("user_id") or [""])[0].strip()
                 mode = (params.get("mode") or ["online"])[0].strip()
                 ensure_saved_messages_chat(database, user_id, mode)
-                chats = []
-                for chat in database["chats"]:
-                    if user_id not in chat["participantIDs"] or chat["mode"] != mode:
-                        continue
-
-                    serialized_chat = serialize_chat(chat, user_id, database)
-                    if (
-                        serialized_chat["type"] == "direct" and
-                        generic_direct_title(serialized_chat["title"]) and
-                        generic_direct_subtitle(serialized_chat["subtitle"])
-                    ):
-                        continue
-
-                    chats.append(serialized_chat)
+                chats = [
+                    serialize_chat(chat, user_id, database)
+                    for chat in database["chats"]
+                    if user_id in chat["participantIDs"] and chat["mode"] == mode
+                ]
                 chats.sort(key=lambda item: item["lastActivityAt"], reverse=True)
                 return self.respond(200, chats)
 
