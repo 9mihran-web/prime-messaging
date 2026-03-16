@@ -1095,7 +1095,11 @@ class Handler(BaseHTTPRequestHandler):
                 if username_taken(database, username):
                     return self.respond(409, {"error": "username_taken"})
 
-                user_id = str(uuid.uuid4())
+                requested_user_id = normalized_optional_string(payload.get("user_id"))
+                if requested_user_id and find_user(database, requested_user_id):
+                    return self.respond(409, {"error": "user_id_taken"})
+
+                user_id = requested_user_id or str(uuid.uuid4())
                 method_type = payload.get("method_type", "email")
                 contact_value = normalized_optional_string(payload.get("contact_value"))
                 email = contact_value if method_type == "email" else None
