@@ -41,6 +41,7 @@ struct MainTabView: View {
 }
 
 private struct CallsPlaceholderView: View {
+    @EnvironmentObject private var appState: AppState
     @ObservedObject private var internetCallManager = InternetCallManager.shared
 
     var body: some View {
@@ -59,12 +60,17 @@ private struct CallsPlaceholderView: View {
 
             if let activeCall = internetCallManager.activeCall {
                 VStack(spacing: 10) {
-                    Text(activeCall.user.profile.displayName.isEmpty ? activeCall.user.profile.username : activeCall.user.profile.displayName)
+                    Text(activeCall.displayName(for: appState.currentUser.id))
                         .font(.headline)
                         .foregroundStyle(PrimeTheme.Colors.textPrimary)
-                    Text(activeCall.state == .active ? "calls.state.active".localized : "calls.state.calling".localized)
+                    Text(callStateText(for: activeCall))
                         .font(.subheadline)
                         .foregroundStyle(PrimeTheme.Colors.textSecondary)
+
+                    Button("calls.return".localized) {
+                        internetCallManager.presentCallUI()
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
                 .padding(.horizontal, PrimeTheme.Spacing.large)
                 .padding(.vertical, PrimeTheme.Spacing.medium)
@@ -85,5 +91,22 @@ private struct CallsPlaceholderView: View {
         }
 
         return "calls.placeholder.body.idle".localized
+    }
+
+    private func callStateText(for call: InternetCall) -> String {
+        switch call.state {
+        case .ringing:
+            return "calls.state.calling".localized
+        case .active:
+            return "calls.state.active".localized
+        case .ended:
+            return "calls.state.ended".localized
+        case .rejected:
+            return "calls.state.rejected".localized
+        case .cancelled:
+            return "calls.state.cancelled".localized
+        case .missed:
+            return "calls.state.missed".localized
+        }
     }
 }

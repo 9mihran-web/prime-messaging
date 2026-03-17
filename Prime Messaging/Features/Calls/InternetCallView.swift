@@ -2,11 +2,13 @@ import SwiftUI
 
 struct InternetCallView: View {
     @ObservedObject private var callManager = InternetCallManager.shared
-    let call: InternetCallSession
+    @EnvironmentObject private var appState: AppState
+    let call: InternetCall
 
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
+        let resolvedCall = callManager.activeCall ?? call
         ZStack {
             LinearGradient(
                 colors: [
@@ -47,50 +49,12 @@ struct InternetCallView: View {
                     Text(durationLabel)
                         .font(.title3.monospacedDigit().weight(.semibold))
                         .foregroundStyle(PrimeTheme.Colors.textPrimary.opacity(0.92))
+                        .opacity(showsDuration ? 1 : 0)
                 }
 
                 Spacer()
 
-                HStack(spacing: 18) {
-                    callControlButton(
-                        systemName: callManager.activeCall?.isVideoEnabled == true ? "video.fill" : "video.slash.fill",
-                        isActive: callManager.activeCall?.isVideoEnabled == true,
-                        action: {
-                            callManager.toggleVideo()
-                        }
-                    )
-
-                    callControlButton(
-                        systemName: callManager.activeCall?.isMuted == true ? "mic.slash.fill" : "mic.fill",
-                        isActive: callManager.activeCall?.isMuted == false,
-                        action: {
-                            callManager.toggleMute()
-                        }
-                    )
-
-                    callControlButton(
-                        systemName: callManager.activeCall?.isSpeakerEnabled == true ? "speaker.wave.3.fill" : "speaker.slash.fill",
-                        isActive: callManager.activeCall?.isSpeakerEnabled == true,
-                        action: {
-                            callManager.toggleSpeaker()
-                        }
-                    )
-
-                    Button {
-                        callManager.endCall()
-                        dismiss()
-                    } label: {
-                        Circle()
-                            .fill(PrimeTheme.Colors.warning)
-                            .frame(width: 62, height: 62)
-                            .overlay(
-                                Image(systemName: "phone.down.fill")
-                                    .font(.system(size: 22, weight: .bold))
-                                    .foregroundStyle(Color.white)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                }
+                controlRow(for: resolvedCall)
                 .padding(.bottom, 42)
             }
         }
@@ -99,6 +63,7 @@ struct InternetCallView: View {
     private var topBar: some View {
         HStack {
             Button {
+                callManager.dismissCallUI()
                 dismiss()
             } label: {
                 topCircleButton(systemName: "chevron.down")
@@ -112,8 +77,7 @@ struct InternetCallView: View {
     }
 
     private var displayName: String {
-        let trimmed = call.user.profile.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? call.user.profile.username : trimmed
+        (callManager.activeCall ?? call).displayName(for: appState.currentUser.id)
     }
 
     private var initials: String {
@@ -127,21 +91,40 @@ struct InternetCallView: View {
     }
 
     private var callStateLabel: String {
-        switch callManager.activeCall?.state ?? call.state {
-        case .calling:
-            return "calls.state.internet".localized
+        let resolvedCall = callManager.activeCall ?? call
+        switch resolvedCall.state {
+        case .ringing:
+            return resolvedCall.direction(for: appState.currentUser.id) == .incoming
+                ? "calls.state.incoming".localized
+                : "calls.state.calling".localized
         case .active:
             return "calls.state.active".localized
         case .ended:
             return "calls.state.ended".localized
+        case .rejected:
+            return "calls.state.rejected".localized
+        case .cancelled:
+            return "calls.state.cancelled".localized
+        case .missed:
+            return "calls.state.missed".localized
         }
     }
 
     private var durationLabel: String {
-        let duration = Int(callManager.activeCall?.duration ?? call.duration)
+        let duration = Int(callManager.duration)
         let minutes = duration / 60
         let seconds = duration % 60
         return String(format: "%02d:%02d", minutes, seconds)
+    }
+
+    private var showsDuration: Bool {
+        let resolvedState = (callManager.activeCall ?? call).state
+        switch resolvedState {
+        case .active, .ended, .cancelled, .rejected, .missed:
+            return true
+        case .ringing:
+            return false
+        }
     }
 
     @ViewBuilder
@@ -172,6 +155,100 @@ struct InternetCallView: View {
                     Image(systemName: systemName)
                         .font(.system(size: 20, weight: .semibold))
                         .foregroundStyle(PrimeTheme.Colors.textPrimary)
+                )
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func controlRow(for call: InternetCall) -> some View {
+        switch (call.state, call.direction(for: appState.currentUser.id)) {
+        case (.ringing, .incoming):
+            HStack(spacing: 20) {
+                Button {
+                    Task {
+                        try? await callManager.rejectCall()
+                    }
+                } label: {
+                    Circle()
+                        .fill(PrimeTheme.Colors.warning)
+                        .frame(width: 70, height: 70)
+                        .overlay(
+                            Image(systemName: "phone.down.fill")
+                                .font(.system(size: 24, weight: .bold))
+                                .foregroundStyle(Color.white)
+                        )
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    Task {
+                        try? await callManager.answerCall()
+                    }
+                } label: {
+                    Circle()
+                        .fill(PrimeTheme.Colors.success)
+                        .frame(width: 70, height: 70)
+                        .overlay(
+                            Image(systemName: "phone.fill")
+                                .font(.system(size: 24, weight: .bold))
+                                .foregroundStyle(Color.white)
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+
+        case (.active, _):
+            HStack(spacing: 18) {
+                callControlButton(
+                    systemName: callManager.isMuted ? "mic.slash.fill" : "mic.fill",
+                    isActive: !callManager.isMuted
+                ) {
+                    callManager.toggleMute()
+                }
+
+                callControlButton(
+                    systemName: callManager.isSpeakerEnabled ? "speaker.wave.3.fill" : "speaker.slash.fill",
+                    isActive: callManager.isSpeakerEnabled
+                ) {
+                    callManager.toggleSpeaker()
+                }
+
+                callControlButton(
+                    systemName: callManager.isVideoEnabled ? "video.fill" : "video.slash.fill",
+                    isActive: callManager.isVideoEnabled
+                ) {
+                    callManager.toggleVideo()
+                }
+
+                hangupButton
+            }
+
+        default:
+            HStack(spacing: 18) {
+                callControlButton(
+                    systemName: callManager.isSpeakerEnabled ? "speaker.wave.3.fill" : "speaker.slash.fill",
+                    isActive: callManager.isSpeakerEnabled
+                ) {
+                    callManager.toggleSpeaker()
+                }
+
+                hangupButton
+            }
+        }
+    }
+
+    private var hangupButton: some View {
+        Button {
+            callManager.endCall()
+        } label: {
+            Circle()
+                .fill(PrimeTheme.Colors.warning)
+                .frame(width: 62, height: 62)
+                .overlay(
+                    Image(systemName: "phone.down.fill")
+                        .font(.system(size: 22, weight: .bold))
+                        .foregroundStyle(Color.white)
                 )
         }
         .buttonStyle(.plain)

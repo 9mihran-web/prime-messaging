@@ -35,6 +35,10 @@
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Prime Messaging uses the local network to discover nearby devices.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Prime Messaging uses the microphone for audio messages and internet calls.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Prime Messaging uses your photo library to send photos and choose an avatar.</string>
 	<key>PrimeMessagingServerURL</key>
 	<string>$(PRIME_MESSAGING_SERVER_URL)</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
@@ -43,6 +47,7 @@
 	<array>
 		<string>bluetooth-central</string>
 		<string>bluetooth-peripheral</string>
+		<string>remote-notification</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict/>

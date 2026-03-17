@@ -56,6 +56,8 @@ def ensure_storage():
             "users": [],
             "chats": [],
             "messages": [],
+            "calls": [],
+            "callEvents": [],
         }
         with open(DATA_FILE, "w", encoding="utf-8") as file:
             json.dump(seed, file, indent=2)
@@ -105,7 +107,7 @@ def unique_entity_ids(values):
 def ensure_database_schema(database):
     did_update = False
 
-    for key in ("users", "chats", "messages", "sessions", "deviceTokens"):
+    for key in ("users", "chats", "messages", "sessions", "deviceTokens", "calls", "callEvents"):
         if key not in database:
             database[key] = []
             did_update = True
@@ -527,6 +529,109 @@ def normalize_database_entities(database):
             seen_tokens.add(token_value)
         normalized_device_tokens.append(entry)
     database["deviceTokens"] = normalized_device_tokens
+
+    call_id_map = {}
+    normalized_calls = []
+    grouped_calls = {}
+    for call in database.get("calls", []):
+        original_call_id = normalized_optional_string(call.get("id"))
+        canonical_call_id = normalized_entity_id(original_call_id) or str(uuid.uuid4())
+        if original_call_id:
+            call_id_map[original_call_id] = canonical_call_id
+        call_id_map[canonical_call_id] = canonical_call_id
+        if call.get("id") != canonical_call_id:
+            call["id"] = canonical_call_id
+            did_update = True
+
+        caller_id = user_id_map.get(normalized_optional_string(call.get("callerID")), normalized_entity_id(call.get("callerID")))
+        if caller_id and call.get("callerID") != caller_id:
+            call["callerID"] = caller_id
+            did_update = True
+
+        callee_id = user_id_map.get(normalized_optional_string(call.get("calleeID")), normalized_entity_id(call.get("calleeID")))
+        if callee_id and call.get("calleeID") != callee_id:
+            call["calleeID"] = callee_id
+            did_update = True
+
+        chat_id = chat_id_map.get(normalized_optional_string(call.get("chatID")), normalized_entity_id(call.get("chatID")))
+        if chat_id and call.get("chatID") != chat_id:
+            call["chatID"] = chat_id
+            did_update = True
+
+        ended_by_user_id = user_id_map.get(normalized_optional_string(call.get("endedByUserID")), normalized_entity_id(call.get("endedByUserID")))
+        if ended_by_user_id and call.get("endedByUserID") != ended_by_user_id:
+            call["endedByUserID"] = ended_by_user_id
+            did_update = True
+
+        if not normalized_optional_string(call.get("mode")):
+            call["mode"] = "online"
+            did_update = True
+
+        if not normalized_optional_string(call.get("kind")):
+            call["kind"] = "audio"
+            did_update = True
+
+        if not normalized_optional_string(call.get("state")):
+            call["state"] = "ringing"
+            did_update = True
+
+        try:
+            last_event_sequence = int(call.get("lastEventSequence") or 0)
+        except (TypeError, ValueError):
+            last_event_sequence = 0
+        if call.get("lastEventSequence") != last_event_sequence:
+            call["lastEventSequence"] = last_event_sequence
+            did_update = True
+
+        grouped_calls.setdefault(canonical_call_id, []).append(call)
+        normalized_calls.append(call)
+
+    deduplicated_calls = []
+    for canonical_call_id, records in grouped_calls.items():
+        chosen = max(
+            records,
+            key=lambda item: (
+                parse_iso_datetime(item.get("updatedAt")) or datetime.min.replace(tzinfo=timezone.utc),
+                parse_iso_datetime(item.get("answeredAt")) or datetime.min.replace(tzinfo=timezone.utc),
+            ),
+        )
+        deduplicated_calls.append(chosen)
+        if len(records) > 1:
+            did_update = True
+    database["calls"] = deduplicated_calls
+
+    normalized_call_events = []
+    seen_call_event_ids = set()
+    for event in database.get("callEvents", []):
+        canonical_event_id = normalized_entity_id(event.get("id")) or str(uuid.uuid4())
+        if canonical_event_id in seen_call_event_ids:
+            did_update = True
+            continue
+        seen_call_event_ids.add(canonical_event_id)
+        if event.get("id") != canonical_event_id:
+            event["id"] = canonical_event_id
+            did_update = True
+
+        call_id = call_id_map.get(normalized_optional_string(event.get("callID")), normalized_entity_id(event.get("callID")))
+        if call_id and event.get("callID") != call_id:
+            event["callID"] = call_id
+            did_update = True
+
+        sender_id = user_id_map.get(normalized_optional_string(event.get("senderID")), normalized_entity_id(event.get("senderID")))
+        if sender_id and event.get("senderID") != sender_id:
+            event["senderID"] = sender_id
+            did_update = True
+
+        try:
+            sequence = int(event.get("sequence") or 0)
+        except (TypeError, ValueError):
+            sequence = 0
+        if event.get("sequence") != sequence:
+            event["sequence"] = sequence
+            did_update = True
+
+        normalized_call_events.append(event)
+    database["callEvents"] = normalized_call_events
 
     return did_update
 
@@ -1577,6 +1682,183 @@ def log_push_dispatch_attempt(database, chat, message):
     )
 
 
+ACTIVE_CALL_STATES = {"ringing", "active"}
+RECENT_CALL_VISIBILITY_SECONDS = 20
+
+
+def call_involves_user(call, user_id):
+    return ids_equal(call.get("callerID"), user_id) or ids_equal(call.get("calleeID"), user_id)
+
+
+def visible_call_for_client(call):
+    state = normalized_optional_string(call.get("state")) or "ringing"
+    if state in ACTIVE_CALL_STATES:
+        return True
+
+    ended_at = parse_iso_datetime(call.get("endedAt") or call.get("updatedAt"))
+    if not ended_at:
+        return False
+    return (datetime.now(timezone.utc) - ended_at).total_seconds() <= RECENT_CALL_VISIBILITY_SECONDS
+
+
+def find_call(database, call_id):
+    call_id = normalized_entity_id(call_id)
+    if not call_id:
+        return None
+    return next((call for call in database.get("calls", []) if ids_equal(call.get("id"), call_id)), None)
+
+
+def call_participant_payload(database, user_id):
+    user = find_user(database, user_id)
+    if not user:
+        return None
+
+    return {
+        "id": user["id"],
+        "username": user["profile"]["username"],
+        "displayName": normalized_optional_string(user["profile"].get("displayName")),
+        "profilePhotoURL": normalized_optional_url_string(user["profile"].get("profilePhotoURL")),
+    }
+
+
+def serialize_call(call, viewer_id, database):
+    participants = [
+        payload for payload in (
+            call_participant_payload(database, call.get("callerID")),
+            call_participant_payload(database, call.get("calleeID")),
+        ) if payload is not None
+    ]
+
+    return {
+        "id": call["id"],
+        "mode": call.get("mode", "online"),
+        "kind": call.get("kind", "audio"),
+        "state": call.get("state", "ringing"),
+        "chatID": call.get("chatID"),
+        "callerID": call.get("callerID"),
+        "calleeID": call.get("calleeID"),
+        "participants": participants,
+        "createdAt": call.get("createdAt"),
+        "answeredAt": call.get("answeredAt"),
+        "endedAt": call.get("endedAt"),
+        "lastEventSequence": int(call.get("lastEventSequence") or 0),
+    }
+
+
+def serialize_call_event(event):
+    payload = event.get("payload") or {}
+    return {
+        "id": event["id"],
+        "callID": event["callID"],
+        "sequence": int(event.get("sequence") or 0),
+        "type": event.get("type"),
+        "senderID": event.get("senderID"),
+        "sdp": payload.get("sdp"),
+        "candidate": payload.get("candidate"),
+        "sdpMid": payload.get("sdpMid"),
+        "sdpMLineIndex": payload.get("sdpMLineIndex"),
+        "createdAt": event.get("createdAt"),
+    }
+
+
+def append_call_event(database, call, event_type, sender_id=None, payload=None):
+    next_sequence = int(call.get("lastEventSequence") or 0) + 1
+    event = {
+        "id": str(uuid.uuid4()),
+        "callID": call["id"],
+        "sequence": next_sequence,
+        "type": event_type,
+        "senderID": normalized_entity_id(sender_id),
+        "payload": payload or {},
+        "createdAt": now_iso(),
+    }
+    database["callEvents"].append(event)
+    call["lastEventSequence"] = next_sequence
+    call["updatedAt"] = event["createdAt"]
+    return event
+
+
+def call_events_for(database, call_id, since_sequence):
+    return sorted(
+        [
+            event for event in database.get("callEvents", [])
+            if ids_equal(event.get("callID"), call_id) and int(event.get("sequence") or 0) > since_sequence
+        ],
+        key=lambda item: int(item.get("sequence") or 0),
+    )
+
+
+def ensure_direct_chat_record(database, first_user_id, second_user_id, mode):
+    participant_ids = unique_entity_ids([first_user_id, second_user_id])
+    existing = next(
+        (
+            chat for chat in database["chats"]
+            if chat.get("type") == "direct"
+            and chat.get("mode") == mode
+            and set(unique_entity_ids(chat.get("participantIDs") or [])) == set(participant_ids)
+        ),
+        None,
+    )
+    if existing:
+        return existing
+
+    chat = {
+        "id": str(uuid.uuid4()),
+        "mode": mode,
+        "type": "direct",
+        "participantIDs": participant_ids,
+        "cachedTitle": "Direct Chat",
+        "cachedSubtitle": "Direct conversation",
+        "createdAt": now_iso(),
+    }
+    database["chats"].append(chat)
+    return chat
+
+
+def active_call_between(database, caller_id, callee_id, mode):
+    participant_ids = {normalized_entity_id(caller_id), normalized_entity_id(callee_id)}
+    for call in database.get("calls", []):
+        if call.get("mode") != mode:
+            continue
+        if normalized_optional_string(call.get("state")) not in ACTIVE_CALL_STATES:
+            continue
+        if {normalized_entity_id(call.get("callerID")), normalized_entity_id(call.get("calleeID"))} == participant_ids:
+            return call
+    return None
+
+
+def can_manage_call(call, user_id):
+    return call_involves_user(call, user_id)
+
+
+def log_call_dispatch_attempt(database, call):
+    recipient_id = call.get("calleeID")
+    if normalized_optional_string(call.get("state")) != "ringing":
+        return
+
+    device_tokens = [
+        token for token in database.get("deviceTokens", [])
+        if ids_equal(token.get("userID"), recipient_id)
+    ]
+
+    if not device_tokens:
+        log_event(
+            "call.dispatch.skipped",
+            reason="no_device_tokens",
+            call_id=call["id"],
+            recipient_id=recipient_id,
+        )
+        return
+
+    log_event(
+        "call.dispatch.pending_provider",
+        reason="apns_provider_not_configured_in_backend",
+        call_id=call["id"],
+        recipient_id=recipient_id,
+        token_suffixes=[(entry.get("token") or "")[-8:] for entry in device_tokens if entry.get("token")],
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -1665,6 +1947,91 @@ class Handler(BaseHTTPRequestHandler):
                 if not user:
                     return self.respond(404, {"error": "user_not_found"})
                 return self.respond(200, serialize_presence(current_user, user, database))
+
+            if parsed.path == "/calls":
+                params = parse_qs(parsed.query)
+                fallback_user_id = (
+                    (params.get("user_id") or [""])[0].strip()
+                    or (params.get("viewer_id") or [""])[0].strip()
+                    or None
+                )
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    fallback_user_id,
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                calls = [
+                    serialize_call(call, current_user["id"], database)
+                    for call in database.get("calls", [])
+                    if call_involves_user(call, current_user["id"]) and visible_call_for_client(call)
+                ]
+                calls.sort(key=lambda item: item.get("createdAt") or "", reverse=True)
+                return self.respond(200, calls)
+
+            if parsed.path.startswith("/calls/") and parsed.path.endswith("/events"):
+                params = parse_qs(parsed.query)
+                fallback_user_id = (
+                    (params.get("user_id") or [""])[0].strip()
+                    or (params.get("viewer_id") or [""])[0].strip()
+                    or None
+                )
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    fallback_user_id,
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                call_id = normalized_entity_id(parsed.path.split("/")[2])
+                call = find_call(database, call_id)
+                if not call:
+                    return self.respond(404, {"error": "call_not_found"})
+                if not can_manage_call(call, current_user["id"]):
+                    return self.respond(403, {"error": "call_permission_denied"})
+
+                try:
+                    since_sequence = int((params.get("since") or ["0"])[0])
+                except ValueError:
+                    since_sequence = 0
+                events = [serialize_call_event(event) for event in call_events_for(database, call_id, since_sequence)]
+                return self.respond(200, events)
+
+            if parsed.path.startswith("/calls/"):
+                params = parse_qs(parsed.query)
+                fallback_user_id = (
+                    (params.get("user_id") or [""])[0].strip()
+                    or (params.get("viewer_id") or [""])[0].strip()
+                    or None
+                )
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    fallback_user_id,
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                call_id = normalized_entity_id(parsed.path.split("/")[2])
+                call = find_call(database, call_id)
+                if not call:
+                    return self.respond(404, {"error": "call_not_found"})
+                if not can_manage_call(call, current_user["id"]):
+                    return self.respond(403, {"error": "call_permission_denied"})
+
+                return self.respond(200, serialize_call(call, current_user["id"], database))
 
             if parsed.path == "/chats":
                 params = parse_qs(parsed.query)
@@ -1892,6 +2259,244 @@ class Handler(BaseHTTPRequestHandler):
                     token_suffix=(token[-8:] if token else None),
                 )
                 return self.respond(200, {"ok": True})
+
+            if method == "POST" and parsed.path == "/calls":
+                caller, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload_string(payload, "caller_id", "callerID", "user_id", "userID"),
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                caller_id = caller["id"]
+                callee_id = normalized_entity_id(payload_string(payload, "callee_id", "calleeID", "other_user_id", "otherUserID"))
+                if not callee_id:
+                    return self.respond(404, {"error": "user_not_found"})
+                if ids_equal(caller_id, callee_id):
+                    return self.respond(409, {"error": "invalid_call_operation"})
+
+                callee = find_user(database, callee_id)
+                if not callee:
+                    return self.respond(404, {"error": "user_not_found"})
+
+                mode = payload_string(payload, "mode", "call_mode", "callMode") or "online"
+                existing_call = active_call_between(database, caller_id, callee_id, mode)
+                if existing_call:
+                    return self.respond(200, serialize_call(existing_call, caller_id, database))
+
+                direct_chat = ensure_direct_chat_record(database, caller_id, callee_id, mode)
+                call = {
+                    "id": str(uuid.uuid4()),
+                    "mode": mode,
+                    "kind": payload_string(payload, "kind") or "audio",
+                    "state": "ringing",
+                    "chatID": direct_chat["id"],
+                    "callerID": caller_id,
+                    "calleeID": callee_id,
+                    "createdAt": now_iso(),
+                    "updatedAt": now_iso(),
+                    "answeredAt": None,
+                    "endedAt": None,
+                    "endedByUserID": None,
+                    "lastEventSequence": 0,
+                }
+                database["calls"].append(call)
+                append_call_event(database, call, "created", sender_id=caller_id)
+                save_db(database)
+                log_call_dispatch_attempt(database, call)
+                return self.respond(200, serialize_call(call, caller_id, database))
+
+            if method == "POST" and parsed.path.startswith("/calls/") and parsed.path.endswith("/accept"):
+                call_id = normalized_entity_id(parsed.path.split("/")[2])
+                requester, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload_string(payload, "user_id", "userID", "requester_id", "requesterID"),
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                call = find_call(database, call_id)
+                if not call:
+                    return self.respond(404, {"error": "call_not_found"})
+                if not can_manage_call(call, requester["id"]):
+                    return self.respond(403, {"error": "call_permission_denied"})
+                if not ids_equal(call.get("calleeID"), requester["id"]) or normalized_optional_string(call.get("state")) != "ringing":
+                    return self.respond(409, {"error": "invalid_call_operation"})
+
+                call["state"] = "active"
+                call["answeredAt"] = now_iso()
+                call["updatedAt"] = call["answeredAt"]
+                append_call_event(database, call, "accepted", sender_id=requester["id"])
+                save_db(database)
+                return self.respond(200, serialize_call(call, requester["id"], database))
+
+            if method == "POST" and parsed.path.startswith("/calls/") and parsed.path.endswith("/reject"):
+                call_id = normalized_entity_id(parsed.path.split("/")[2])
+                requester, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload_string(payload, "user_id", "userID", "requester_id", "requesterID"),
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                call = find_call(database, call_id)
+                if not call:
+                    return self.respond(404, {"error": "call_not_found"})
+                if not can_manage_call(call, requester["id"]):
+                    return self.respond(403, {"error": "call_permission_denied"})
+                if normalized_optional_string(call.get("state")) != "ringing":
+                    return self.respond(409, {"error": "invalid_call_operation"})
+
+                call["state"] = "rejected"
+                call["endedAt"] = now_iso()
+                call["endedByUserID"] = requester["id"]
+                call["updatedAt"] = call["endedAt"]
+                append_call_event(database, call, "rejected", sender_id=requester["id"])
+                save_db(database)
+                return self.respond(200, serialize_call(call, requester["id"], database))
+
+            if method == "POST" and parsed.path.startswith("/calls/") and parsed.path.endswith("/hangup"):
+                call_id = normalized_entity_id(parsed.path.split("/")[2])
+                requester, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload_string(payload, "user_id", "userID", "requester_id", "requesterID"),
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                call = find_call(database, call_id)
+                if not call:
+                    return self.respond(404, {"error": "call_not_found"})
+                if not can_manage_call(call, requester["id"]):
+                    return self.respond(403, {"error": "call_permission_denied"})
+                if normalized_optional_string(call.get("state")) not in ACTIVE_CALL_STATES:
+                    return self.respond(409, {"error": "invalid_call_operation"})
+
+                if normalized_optional_string(call.get("state")) == "ringing" and ids_equal(call.get("callerID"), requester["id"]):
+                    call["state"] = "cancelled"
+                elif normalized_optional_string(call.get("state")) == "ringing":
+                    call["state"] = "rejected"
+                else:
+                    call["state"] = "ended"
+                call["endedAt"] = now_iso()
+                call["endedByUserID"] = requester["id"]
+                call["updatedAt"] = call["endedAt"]
+                append_call_event(database, call, "ended", sender_id=requester["id"])
+                save_db(database)
+                return self.respond(200, serialize_call(call, requester["id"], database))
+
+            if method == "POST" and parsed.path.startswith("/calls/") and parsed.path.endswith("/offer"):
+                call_id = normalized_entity_id(parsed.path.split("/")[2])
+                requester, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload_string(payload, "user_id", "userID", "requester_id", "requesterID"),
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                call = find_call(database, call_id)
+                if not call:
+                    return self.respond(404, {"error": "call_not_found"})
+                if not can_manage_call(call, requester["id"]):
+                    return self.respond(403, {"error": "call_permission_denied"})
+                if normalized_optional_string(call.get("state")) not in ACTIVE_CALL_STATES:
+                    return self.respond(409, {"error": "invalid_call_operation"})
+
+                event = append_call_event(
+                    database,
+                    call,
+                    "offer",
+                    sender_id=requester["id"],
+                    payload={"sdp": payload_string(payload, "sdp")}
+                )
+                save_db(database)
+                return self.respond(200, serialize_call_event(event))
+
+            if method == "POST" and parsed.path.startswith("/calls/") and parsed.path.endswith("/answer"):
+                call_id = normalized_entity_id(parsed.path.split("/")[2])
+                requester, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload_string(payload, "user_id", "userID", "requester_id", "requesterID"),
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                call = find_call(database, call_id)
+                if not call:
+                    return self.respond(404, {"error": "call_not_found"})
+                if not can_manage_call(call, requester["id"]):
+                    return self.respond(403, {"error": "call_permission_denied"})
+                if normalized_optional_string(call.get("state")) not in ACTIVE_CALL_STATES:
+                    return self.respond(409, {"error": "invalid_call_operation"})
+
+                event = append_call_event(
+                    database,
+                    call,
+                    "answer",
+                    sender_id=requester["id"],
+                    payload={"sdp": payload_string(payload, "sdp")}
+                )
+                save_db(database)
+                return self.respond(200, serialize_call_event(event))
+
+            if method == "POST" and parsed.path.startswith("/calls/") and parsed.path.endswith("/ice"):
+                call_id = normalized_entity_id(parsed.path.split("/")[2])
+                requester, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload_string(payload, "user_id", "userID", "requester_id", "requesterID"),
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                call = find_call(database, call_id)
+                if not call:
+                    return self.respond(404, {"error": "call_not_found"})
+                if not can_manage_call(call, requester["id"]):
+                    return self.respond(403, {"error": "call_permission_denied"})
+                if normalized_optional_string(call.get("state")) not in ACTIVE_CALL_STATES:
+                    return self.respond(409, {"error": "invalid_call_operation"})
+
+                event = append_call_event(
+                    database,
+                    call,
+                    "ice",
+                    sender_id=requester["id"],
+                    payload={
+                        "candidate": payload_string(payload, "candidate"),
+                        "sdpMid": payload_string(payload, "sdp_mid", "sdpMid"),
+                        "sdpMLineIndex": payload.get("sdp_mline_index", payload.get("sdpMLineIndex")),
+                    }
+                )
+                save_db(database)
+                return self.respond(200, serialize_call_event(event))
 
             if method == "PATCH" and parsed.path.startswith("/users/") and parsed.path.endswith("/profile"):
                 user_id = normalized_entity_id(parsed.path.split("/")[2])

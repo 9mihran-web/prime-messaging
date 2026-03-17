@@ -44,6 +44,25 @@ protocol PresenceRepository {
     func fetchPresence(for userID: UUID) async throws -> Presence
 }
 
+protocol CallRepository {
+    func fetchActiveCalls(for userID: UUID) async throws -> [InternetCall]
+    func fetchCall(_ callID: UUID, for userID: UUID) async throws -> InternetCall
+    func startAudioCall(with calleeID: UUID, from callerID: UUID) async throws -> InternetCall
+    func answerCall(_ callID: UUID, userID: UUID) async throws -> InternetCall
+    func rejectCall(_ callID: UUID, userID: UUID) async throws -> InternetCall
+    func endCall(_ callID: UUID, userID: UUID) async throws -> InternetCall
+    func fetchEvents(callID: UUID, userID: UUID, sinceSequence: Int) async throws -> [InternetCallEvent]
+    func sendOffer(_ sdp: String, in callID: UUID, userID: UUID) async throws -> InternetCallEvent
+    func sendAnswer(_ sdp: String, in callID: UUID, userID: UUID) async throws -> InternetCallEvent
+    func sendICECandidate(
+        _ candidate: String,
+        sdpMid: String?,
+        sdpMLineIndex: Int?,
+        in callID: UUID,
+        userID: UUID
+    ) async throws -> InternetCallEvent
+}
+
 protocol SettingsRepository {
     func fetchPrivacySettings() async throws -> PrivacySettings
     func updatePrivacySettings(_ settings: PrivacySettings) async throws

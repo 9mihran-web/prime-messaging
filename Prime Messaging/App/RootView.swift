@@ -68,6 +68,10 @@ struct RootView: View {
                 let isValidSession = await validateCurrentServerSessionIfNeeded()
                 guard isValidSession, appState.hasCompletedOnboarding else { return }
 
+                internetCallManager.configure(
+                    currentUserID: appState.currentUser.id,
+                    repository: environment.callRepository
+                )
                 await environment.pushNotificationService.registerForRemoteNotifications()
                 await environment.pushNotificationService.startMonitoring(
                     currentUser: appState.currentUser,
@@ -76,6 +80,7 @@ struct RootView: View {
                 await environment.offlineTransport.updateCurrentUser(appState.currentUser)
                 await environment.offlineTransport.startScanning()
             } else {
+                internetCallManager.stopMonitoring()
                 await environment.pushNotificationService.stopMonitoring()
                 await environment.offlineTransport.stopScanning()
             }
@@ -83,15 +88,19 @@ struct RootView: View {
         .task(id: appState.selectedChat?.id.uuidString ?? "no-active-chat") {
             await environment.pushNotificationService.updateActiveChat(appState.selectedChat)
         }
-        .fullScreenCover(item: Binding(
-            get: { internetCallManager.activeCall },
-            set: { newValue in
-                if newValue == nil {
-                    internetCallManager.endCall()
+        .fullScreenCover(
+            isPresented: Binding(
+                get: { internetCallManager.isPresentingCallUI && internetCallManager.activeCall != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        internetCallManager.dismissCallUI()
+                    }
                 }
+            )
+        ) {
+            if let call = internetCallManager.activeCall {
+                InternetCallView(call: call)
             }
-        )) { call in
-            InternetCallView(call: call)
         }
     }
 

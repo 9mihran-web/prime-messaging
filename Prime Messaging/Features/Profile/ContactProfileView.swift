@@ -205,7 +205,6 @@ struct ContactProfileView: View {
 
     private var canCallUser: Bool {
         guard user.id != appState.currentUser.id else { return false }
-        guard visiblePhone != nil else { return false }
         return isContactAdded || user.privacySettings.allowCallsFromNonContacts
     }
 
@@ -245,18 +244,19 @@ struct ContactProfileView: View {
     }
 
     private func startCall() {
-        guard let visiblePhone else {
-            callStatusMessage = "calls.unavailable.phone".localized
-            return
-        }
-
         guard canCallUser else {
             callStatusMessage = "calls.unavailable.privacy".localized
             return
         }
 
         callStatusMessage = ""
-        internetCallManager.startOutgoingCall(to: user)
+        Task {
+            do {
+                try await internetCallManager.startOutgoingCall(to: user)
+            } catch {
+                callStatusMessage = (error as? LocalizedError)?.errorDescription ?? "calls.unavailable.start".localized
+            }
+        }
     }
 
     @ViewBuilder

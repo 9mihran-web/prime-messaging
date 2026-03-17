@@ -5,6 +5,7 @@ struct AppEnvironment {
     let authRepository: AuthRepository
     let chatRepository: ChatRepository
     let presenceRepository: PresenceRepository
+    let callRepository: CallRepository
     let settingsRepository: SettingsRepository
     let localStore: LocalStore
     let pushNotificationService: PushNotificationService
@@ -21,6 +22,7 @@ struct AppEnvironment {
                 offlineTransport: offlineTransport
             ),
             presenceRepository: MockPresenceRepository(),
+            callRepository: MockCallRepository(),
             settingsRepository: settingsRepository,
             localStore: store,
             pushNotificationService: MockPushNotificationService(),
@@ -34,6 +36,7 @@ struct AppEnvironment {
         let mockAuth = MockAuthRepository()
         let onlineChat = BackendChatRepository(fallback: MockChatRepository(localStore: store))
         let mockSettings = MockSettingsRepository(localStore: store)
+        let mockPresence = MockPresenceRepository()
         let offlineTransport = NearbyOfflineTransport()
         return AppEnvironment(
             authRepository: BackendAuthRepository(fallback: mockAuth),
@@ -41,7 +44,8 @@ struct AppEnvironment {
                 onlineRepository: onlineChat,
                 offlineTransport: offlineTransport
             ),
-            presenceRepository: MockPresenceRepository(),
+            presenceRepository: BackendPresenceRepository(fallback: mockPresence),
+            callRepository: BackendCallRepository(fallback: MockCallRepository()),
             settingsRepository: BackendSettingsRepository(
                 fallback: mockSettings
             ),
