@@ -12,6 +12,19 @@ actor LocalAccountStore {
         var password: String
     }
 
+    struct StoredCredentials: Hashable {
+        let identifier: String
+        let password: String
+    }
+
+    struct RemoteRecoveryAccount: Hashable {
+        let user: User
+        let password: String
+        let loginIdentifiers: [String]
+        let contactValue: String
+        let methodType: IdentityMethodType
+    }
+
     private let defaults: UserDefaults
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
@@ -141,6 +154,124 @@ actor LocalAccountStore {
         return records[recordIndex].user
     }
 
+    func removeAvatar(for userID: UUID) throws -> User {
+        var records = loadRecords()
+        guard let recordIndex = records.firstIndex(where: { $0.user.id == userID }) else {
+            throw LocalAuthError.accountNotFound
+        }
+
+        records[recordIndex].user.profile.profilePhotoURL = nil
+        saveRecords(records)
+        return records[recordIndex].user
+    }
+
+    func updatePassword(_ password: String, for userID: UUID) throws {
+        let trimmedPassword = password.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedPassword.isEmpty == false else {
+            throw LocalAuthError.invalidForm
+        }
+
+        var records = loadRecords()
+        guard let recordIndex = records.firstIndex(where: { $0.user.id == userID }) else {
+            throw LocalAuthError.accountNotFound
+        }
+
+        records[recordIndex].password = trimmedPassword
+        saveRecords(records)
+    }
+
+    func deleteAccount(userID: UUID) throws {
+        var records = loadRecords()
+        guard let recordIndex = records.firstIndex(where: { $0.user.id == userID }) else {
+            throw LocalAuthError.accountNotFound
+        }
+
+        if let avatarURL = records[recordIndex].user.profile.profilePhotoURL {
+            try? FileManager.default.removeItem(at: avatarURL)
+        }
+
+        records.remove(at: recordIndex)
+        saveRecords(records)
+    }
+
+    func upsertRemoteAccount(_ user: User, password: String) {
+        let trimmedPassword = password.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedPassword.isEmpty == false else { return }
+
+        var records = loadRecords()
+        if let index = records.firstIndex(where: { $0.user.id == user.id }) {
+            records[index].user = user
+            records[index].password = trimmedPassword
+        } else {
+            records.append(AccountRecord(user: user, password: trimmedPassword))
+        }
+        saveRecords(records)
+    }
+
+    func upsertRemoteUser(_ user: User) {
+        var records = loadRecords()
+        if let index = records.firstIndex(where: { $0.user.id == user.id }) {
+            records[index].user = user
+            saveRecords(records)
+        }
+    }
+
+    func credentials(for userID: UUID) -> StoredCredentials? {
+        guard let record = loadRecords().first(where: { $0.user.id == userID }) else {
+            return nil
+        }
+
+        let identifier = bestLoginIdentifier(for: record.user)
+        guard identifier.isEmpty == false, record.password.isEmpty == false else {
+            return nil
+        }
+
+        return StoredCredentials(identifier: identifier, password: record.password)
+    }
+
+    func remoteRecoveryAccount(for userID: UUID) -> RemoteRecoveryAccount? {
+        guard let record = loadRecords().first(where: { $0.user.id == userID }) else {
+            return nil
+        }
+
+        let password = record.password.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard password.isEmpty == false else {
+            return nil
+        }
+
+        let email = record.user.profile.email?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let phone = record.user.profile.phoneNumber?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let methodType: IdentityMethodType
+        let contactValue: String
+
+        if let email, email.isEmpty == false {
+            methodType = .email
+            contactValue = email
+        } else if let phone, phone.isEmpty == false {
+            methodType = .phone
+            contactValue = phone
+        } else {
+            return nil
+        }
+
+        let loginIdentifiers = [
+            email,
+            phone,
+            record.user.profile.username,
+            "@\(record.user.profile.username)"
+        ]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        return RemoteRecoveryAccount(
+            user: record.user,
+            password: password,
+            loginIdentifiers: Array(NSOrderedSet(array: loginIdentifiers)) as? [String] ?? loginIdentifiers,
+            contactValue: contactValue,
+            methodType: methodType
+        )
+    }
+
     func searchUsers(query: String, excluding userID: UUID) -> [User] {
         let normalizedQuery = normalizeIdentifier(query)
         guard !normalizedQuery.isEmpty else { return [] }
@@ -263,6 +394,18 @@ actor LocalAccountStore {
     private func saveRecords(_ records: [AccountRecord]) {
         guard let data = try? encoder.encode(records) else { return }
         defaults.set(data, forKey: StorageKeys.records)
+    }
+
+    private func bestLoginIdentifier(for user: User) -> String {
+        if let email = user.profile.email?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !email.isEmpty {
+            return email
+        }
+
+        if let phoneNumber = user.profile.phoneNumber?.trimmingCharacters(in: .whitespacesAndNewlines), !phoneNumber.isEmpty {
+            return phoneNumber
+        }
+
+        return user.profile.username
     }
 }
 

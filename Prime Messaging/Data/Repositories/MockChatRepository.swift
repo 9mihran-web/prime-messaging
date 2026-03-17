@@ -24,6 +24,9 @@ struct MockChatRepository: ChatRepository {
         return Message.mock(chatID: chatID, mode: mode, currentUserID: User.mockCurrentUser.id)
     }
 
+    func markChatRead(chatID: UUID, mode: ChatMode, readerID: UUID) async throws {
+    }
+
     func sendMessage(_ text: String, in chatID: UUID, mode: ChatMode, senderID: UUID) async throws -> Message {
         try await sendMessage(OutgoingMessageDraft(text: text), in: chatID, mode: mode, senderID: senderID)
     }
@@ -128,6 +131,8 @@ struct MockChatRepository: ChatRepository {
                     GroupMember(
                         id: UUID(),
                         userID: memberID,
+                        displayName: memberID == ownerID ? "Prime User" : "Prime Contact",
+                        username: memberID == ownerID ? "primeuser" : "primecontact",
                         role: memberID == ownerID ? .owner : .member,
                         joinedAt: .now
                     )
@@ -141,6 +146,68 @@ struct MockChatRepository: ChatRepository {
             disappearingPolicy: nil,
             notificationPreferences: NotificationPreferences(muteState: .active, previewEnabled: true, customSoundName: nil, badgeEnabled: true)
         )
+    }
+
+    func updateGroup(_ chat: Chat, title: String, requesterID: UUID) async throws -> Chat {
+        var updatedChat = chat
+        let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        updatedChat.title = normalizedTitle.isEmpty ? chat.title : normalizedTitle
+        updatedChat.group?.title = updatedChat.title
+        updatedChat.subtitle = "\(updatedChat.group?.members.count ?? updatedChat.participantIDs.count) members"
+        return updatedChat
+    }
+
+    func uploadGroupAvatar(imageData: Data, for chat: Chat, requesterID: UUID) async throws -> Chat {
+        var updatedChat = chat
+        let directoryURL = FileManager.default.temporaryDirectory.appendingPathComponent("PrimeMessagingGroupAvatars", isDirectory: true)
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true, attributes: nil)
+        let avatarURL = directoryURL.appendingPathComponent("\(chat.id.uuidString).jpg")
+        try imageData.write(to: avatarURL, options: .atomic)
+        updatedChat.group?.photoURL = avatarURL
+        return updatedChat
+    }
+
+    func removeGroupAvatar(for chat: Chat, requesterID: UUID) async throws -> Chat {
+        var updatedChat = chat
+        updatedChat.group?.photoURL = nil
+        return updatedChat
+    }
+
+    func addMembers(_ memberIDs: [UUID], to chat: Chat, requesterID: UUID) async throws -> Chat {
+        var updatedChat = chat
+        guard var group = updatedChat.group else { return updatedChat }
+
+        for memberID in memberIDs where updatedChat.participantIDs.contains(memberID) == false {
+            updatedChat.participantIDs.append(memberID)
+            group.members.append(
+                GroupMember(
+                    id: UUID(),
+                    userID: memberID,
+                    displayName: "Prime Contact",
+                    username: "primecontact",
+                    role: .member,
+                    joinedAt: .now
+                )
+            )
+        }
+
+        updatedChat.group = group
+        updatedChat.subtitle = "\(group.members.count) members"
+        return updatedChat
+    }
+
+    func removeMember(_ memberID: UUID, from chat: Chat, requesterID: UUID) async throws -> Chat {
+        var updatedChat = chat
+        guard var group = updatedChat.group else { return updatedChat }
+        guard group.ownerID != memberID else {
+            throw ChatRepositoryError.invalidGroupOperation
+        }
+
+        updatedChat.participantIDs.removeAll { $0 == memberID }
+        group.members.removeAll { $0.userID == memberID }
+        updatedChat.group = group
+        updatedChat.subtitle = "\(group.members.count) members"
+        return updatedChat
     }
 
     func createNearbyChat(with peer: OfflinePeer, currentUser: User) async throws -> Chat {

@@ -1,7 +1,10 @@
 import SwiftUI
 
 struct AccountsView: View {
+    @Environment(\.appEnvironment) private var environment
     @EnvironmentObject private var appState: AppState
+    @State private var statusMessage = ""
+    @State private var deletingAccountIDs = Set<UUID>()
 
     var body: some View {
         List {
@@ -19,7 +22,9 @@ struct AccountsView: View {
 
                         Spacer()
 
-                        if account.id == appState.currentUser.id {
+                        if deletingAccountIDs.contains(account.id) {
+                            ProgressView()
+                        } else if account.id == appState.currentUser.id {
                             Text("settings.accounts.current".localized)
                                 .font(.caption)
                                 .foregroundStyle(PrimeTheme.Colors.success)
@@ -35,8 +40,18 @@ struct AccountsView: View {
                 .onDelete { offsets in
                     for offset in offsets {
                         let account = appState.accounts[offset]
-                        appState.removeAccount(account.id)
+                        Task {
+                            await deleteAccount(account.id)
+                        }
                     }
+                }
+            }
+
+            if !statusMessage.isEmpty {
+                Section {
+                    Text(statusMessage)
+                        .font(.footnote)
+                        .foregroundStyle(PrimeTheme.Colors.textSecondary)
                 }
             }
 
@@ -47,5 +62,19 @@ struct AccountsView: View {
             }
         }
         .navigationTitle("settings.accounts".localized)
+    }
+
+    @MainActor
+    private func deleteAccount(_ accountID: UUID) async {
+        deletingAccountIDs.insert(accountID)
+        defer { deletingAccountIDs.remove(accountID) }
+
+        do {
+            try await environment.authRepository.deleteAccount(userID: accountID)
+            appState.removeAccount(accountID)
+            statusMessage = "Account deleted."
+        } catch {
+            statusMessage = error.localizedDescription.isEmpty ? "Could not delete account." : error.localizedDescription
+        }
     }
 }

@@ -1006,6 +1006,107 @@ def can_manage_group(chat, user_id):
     return member.get("role") in ("owner", "admin")
 
 
+def remove_group_member(chat, member_user_id):
+    if not chat or chat.get("type") != "group":
+        return False
+
+    group = chat.get("group") or {}
+    owner_id = normalized_entity_id(group.get("ownerID"))
+    member_user_id = normalized_entity_id(member_user_id)
+    if not member_user_id or ids_equal(owner_id, member_user_id):
+        return False
+
+    previous_member_count = len(group.get("members") or [])
+    previous_participant_count = len(chat.get("participantIDs") or [])
+
+    group["members"] = [
+        member for member in (group.get("members") or [])
+        if not ids_equal(member.get("userID"), member_user_id)
+    ]
+    chat["participantIDs"] = [
+        participant_id
+        for participant_id in (chat.get("participantIDs") or [])
+        if not ids_equal(participant_id, member_user_id)
+    ]
+    chat["cachedSubtitle"] = f"{len(group['members'])} members"
+    return previous_member_count != len(group["members"]) or previous_participant_count != len(chat["participantIDs"])
+
+
+def delete_user_account(database, user_id):
+    user = find_user(database, user_id)
+    if not user:
+        return False
+
+    remove_file_for_url((user.get("profile") or {}).get("profilePhotoURL"), AVATAR_DIR)
+
+    database["users"] = [
+        candidate
+        for candidate in database.get("users", [])
+        if not ids_equal(candidate.get("id"), user_id)
+    ]
+    database["sessions"] = [
+        session
+        for session in database.get("sessions", [])
+        if not ids_equal(session.get("userID"), user_id)
+    ]
+    database["deviceTokens"] = [
+        token
+        for token in database.get("deviceTokens", [])
+        if not ids_equal(token.get("userID"), user_id)
+    ]
+
+    deleted_chat_ids = set()
+    for chat in list(database.get("chats", [])):
+        if not any(ids_equal(participant_id, user_id) for participant_id in (chat.get("participantIDs") or [])):
+            continue
+
+        if chat.get("type") in ("selfChat", "direct"):
+            deleted_chat_ids.add(normalized_entity_id(chat.get("id")))
+            continue
+
+        if chat.get("type") == "group":
+            group = chat.get("group") or {}
+            if ids_equal(group.get("ownerID"), user_id):
+                remaining_members = [
+                    member
+                    for member in (group.get("members") or [])
+                    if not ids_equal(member.get("userID"), user_id)
+                ]
+                if not remaining_members:
+                    deleted_chat_ids.add(normalized_entity_id(chat.get("id")))
+                    continue
+
+                new_owner_id = normalized_entity_id(remaining_members[0].get("userID"))
+                group["ownerID"] = new_owner_id
+                for member in remaining_members:
+                    member["role"] = "owner" if ids_equal(member.get("userID"), new_owner_id) else (
+                        "admin" if member.get("role") == "admin" else "member"
+                    )
+                group["members"] = remaining_members
+                chat["participantIDs"] = unique_entity_ids(
+                    participant_id
+                    for participant_id in (chat.get("participantIDs") or [])
+                    if not ids_equal(participant_id, user_id)
+                )
+                chat["cachedSubtitle"] = f"{len(group['members'])} members"
+                continue
+
+            remove_group_member(chat, user_id)
+
+    database["chats"] = [
+        chat
+        for chat in database.get("chats", [])
+        if normalized_entity_id(chat.get("id")) not in deleted_chat_ids
+    ]
+    database["messages"] = [
+        message
+        for message in database.get("messages", [])
+        if normalized_entity_id(message.get("chatID")) not in deleted_chat_ids
+    ]
+
+    return True
+
+
 def group_member_payload(database, member_id, role):
     user = find_user(database, member_id)
     return {
@@ -1842,6 +1943,27 @@ class Handler(BaseHTTPRequestHandler):
                 save_db(database)
                 return self.respond(200, serialize_user(current_user))
 
+            if method == "DELETE" and parsed.path.startswith("/users/") and "/avatar" not in parsed.path and "/profile" not in parsed.path and "/password" not in parsed.path:
+                user_id = normalized_entity_id(parsed.path.split("/")[2])
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID") or user_id,
+                    create_if_missing=False
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+                if not ids_equal(current_user["id"], user_id):
+                    return self.respond(403, {"error": "delete_not_allowed"})
+
+                if delete_user_account(database, user_id) is False:
+                    return self.respond(404, {"error": "user_not_found"})
+
+                save_db(database)
+                return self.respond(200, {"ok": True})
+
             if method == "POST" and parsed.path == "/chats/direct":
                 current_user, _, auth_error = request_user_with_fallback(
                     database,
@@ -2108,6 +2230,45 @@ class Handler(BaseHTTPRequestHandler):
                 group["members"] = members
                 chat["participantIDs"] = participant_ids
                 chat["cachedSubtitle"] = f"{len(members)} members"
+                save_db(database)
+                return self.respond(200, serialize_chat(chat, requester_id, database))
+
+            if method == "DELETE" and parsed.path.startswith("/chats/") and "/group/members/" in parsed.path:
+                path_components = parsed.path.strip("/").split("/")
+                if len(path_components) < 5:
+                    return self.respond(404, {"error": "not_found"})
+
+                chat_id = normalized_entity_id(path_components[1])
+                member_user_id = normalized_entity_id(path_components[4])
+                requester, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload.get("requester_id"),
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+                requester_id = requester["id"]
+
+                chat = find_chat(database, chat_id)
+                if not chat:
+                    return self.respond(404, {"error": "chat_not_found"})
+                if chat.get("type") != "group":
+                    return self.respond(409, {"error": "invalid_group_chat"})
+                if not can_manage_group(chat, requester_id):
+                    return self.respond(403, {"error": "group_permission_denied"})
+                if not member_user_id or not any(ids_equal(member_user_id, participant_id) for participant_id in (chat.get("participantIDs") or [])):
+                    return self.respond(404, {"error": "user_not_found"})
+                if ids_equal(member_user_id, requester_id):
+                    return self.respond(409, {"error": "invalid_group_operation"})
+                if ids_equal((chat.get("group") or {}).get("ownerID"), member_user_id):
+                    return self.respond(409, {"error": "invalid_group_operation"})
+
+                if remove_group_member(chat, member_user_id) is False:
+                    return self.respond(409, {"error": "invalid_group_operation"})
+
                 save_db(database)
                 return self.respond(200, serialize_chat(chat, requester_id, database))
 

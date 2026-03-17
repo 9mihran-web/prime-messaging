@@ -266,6 +266,39 @@ struct BackendAuthRepository: AuthRepository {
         }
     }
 
+    func deleteAccount(userID: UUID) async throws {
+        guard let baseURL = BackendConfiguration.currentBaseURL else {
+            try await fallback.deleteAccount(userID: userID)
+            return
+        }
+
+        do {
+            let (data, response) = try await BackendRequestTransport.authorizedRequest(
+                baseURL: baseURL,
+                path: "/users/\(userID.uuidString)",
+                method: "DELETE",
+                userID: userID
+            )
+            try validate(response: response)
+            _ = try decoder.decode(BackendOKResponse.self, from: data)
+            await BackendRequestTransport.removeSession(for: userID)
+            try? await LocalAccountStore.shared.deleteAccount(userID: userID)
+        } catch {
+            let body = AccountDeleteRequest(userID: userID.uuidString)
+            let bodyData = try JSONEncoder().encode(body)
+            let (data, response) = try await legacyRequest(
+                baseURL: baseURL,
+                path: "/users/\(userID.uuidString)",
+                method: "DELETE",
+                body: bodyData
+            )
+            try validate(response: response)
+            _ = try decoder.decode(BackendOKResponse.self, from: data)
+            await BackendRequestTransport.removeSession(for: userID)
+            try? await LocalAccountStore.shared.deleteAccount(userID: userID)
+        }
+    }
+
     func searchUsers(query: String, excluding userID: UUID) async throws -> [User] {
         guard let baseURL = BackendConfiguration.currentBaseURL else {
             return try await fallback.searchUsers(query: query, excluding: userID)
@@ -498,6 +531,14 @@ private struct PasswordUpdateRequest: Encodable {
     enum CodingKeys: String, CodingKey {
         case userID = "user_id"
         case password
+    }
+}
+
+private struct AccountDeleteRequest: Encodable {
+    let userID: String
+
+    enum CodingKeys: String, CodingKey {
+        case userID = "user_id"
     }
 }
 
