@@ -1683,7 +1683,6 @@ def log_push_dispatch_attempt(database, chat, message):
 
 
 ACTIVE_CALL_STATES = {"ringing", "active"}
-RECENT_CALL_VISIBILITY_SECONDS = 20
 
 
 def call_involves_user(call, user_id):
@@ -1692,13 +1691,7 @@ def call_involves_user(call, user_id):
 
 def visible_call_for_client(call):
     state = normalized_optional_string(call.get("state")) or "ringing"
-    if state in ACTIVE_CALL_STATES:
-        return True
-
-    ended_at = parse_iso_datetime(call.get("endedAt") or call.get("updatedAt"))
-    if not ended_at:
-        return False
-    return (datetime.now(timezone.utc) - ended_at).total_seconds() <= RECENT_CALL_VISIBILITY_SECONDS
+    return state in ACTIVE_CALL_STATES
 
 
 def find_call(database, call_id):
