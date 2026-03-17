@@ -1782,19 +1782,11 @@ def call_events_for(database, call_id, since_sequence):
 
 
 def ensure_direct_chat_record(database, first_user_id, second_user_id, mode):
-    participant_ids = unique_entity_ids([first_user_id, second_user_id])
-    existing = next(
-        (
-            chat for chat in database["chats"]
-            if chat.get("type") == "direct"
-            and chat.get("mode") == mode
-            and set(unique_entity_ids(chat.get("participantIDs") or [])) == set(participant_ids)
-        ),
-        None,
-    )
+    existing = existing_direct_chat_record(database, first_user_id, second_user_id, mode)
     if existing:
         return existing
 
+    participant_ids = unique_entity_ids([first_user_id, second_user_id])
     chat = {
         "id": str(uuid.uuid4()),
         "mode": mode,
@@ -1806,6 +1798,27 @@ def ensure_direct_chat_record(database, first_user_id, second_user_id, mode):
     }
     database["chats"].append(chat)
     return chat
+
+
+def existing_direct_chat_record(database, first_user_id, second_user_id, mode):
+    participant_ids = unique_entity_ids([first_user_id, second_user_id])
+    return next(
+        (
+            chat for chat in database["chats"]
+            if chat.get("type") == "direct"
+            and chat.get("mode") == mode
+            and set(unique_entity_ids(chat.get("participantIDs") or [])) == set(participant_ids)
+        ),
+        None,
+    )
+
+
+def call_requires_saved_contact(database, caller, callee, mode):
+    privacy_settings = callee.get("privacySettings") or default_privacy_settings()
+    if privacy_settings.get("allowCallsFromNonContacts", False):
+        return False
+
+    return existing_direct_chat_record(database, caller["id"], callee["id"], mode) is None
 
 
 def active_call_between(database, caller_id, callee_id, mode):
@@ -1910,7 +1923,29 @@ class Handler(BaseHTTPRequestHandler):
                 ]
                 return self.respond(200, users[:20])
 
-            if parsed.path.startswith("/users/") and "/profile" not in parsed.path and "/avatar" not in parsed.path:
+            if parsed.path.startswith("/users/") and parsed.path.endswith("/privacy"):
+                user_id = normalized_entity_id(parsed.path.split("/")[2])
+                params = parse_qs(parsed.query)
+                fallback_user_id = (
+                    (params.get("user_id") or [""])[0].strip()
+                    or (params.get("viewer_id") or [""])[0].strip()
+                    or user_id
+                )
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    fallback_user_id,
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+                if not ids_equal(current_user["id"], user_id):
+                    return self.respond(403, {"error": "edit_not_allowed"})
+                return self.respond(200, current_user.get("privacySettings") or default_privacy_settings())
+
+            if parsed.path.startswith("/users/") and "/profile" not in parsed.path and "/avatar" not in parsed.path and "/privacy" not in parsed.path:
                 user_id = normalized_entity_id(parsed.path.split("/")[2])
                 user = find_user(database, user_id)
                 if not user:
@@ -2277,6 +2312,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(404, {"error": "user_not_found"})
 
                 mode = payload_string(payload, "mode", "call_mode", "callMode") or "online"
+                if call_requires_saved_contact(database, caller, callee, mode):
+                    return self.respond(403, {"error": "call_requires_saved_contact"})
                 existing_call = active_call_between(database, caller_id, callee_id, mode)
                 if existing_call:
                     return self.respond(200, serialize_call(existing_call, caller_id, database))
@@ -2528,6 +2565,35 @@ class Handler(BaseHTTPRequestHandler):
                 sync_user_snapshots(database, current_user)
                 save_db(database)
                 return self.respond(200, serialize_user(current_user))
+
+            if method == "PATCH" and parsed.path.startswith("/users/") and parsed.path.endswith("/privacy"):
+                user_id = normalized_entity_id(parsed.path.split("/")[2])
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID") or user_id,
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+                if not ids_equal(current_user["id"], user_id):
+                    return self.respond(403, {"error": "edit_not_allowed"})
+
+                incoming = payload.get("privacy_settings")
+                if not isinstance(incoming, dict):
+                    incoming = payload
+
+                updated_settings = default_privacy_settings()
+                updated_settings.update(current_user.get("privacySettings") or {})
+                for key in default_privacy_settings().keys():
+                    if key in incoming:
+                        updated_settings[key] = bool(incoming.get(key))
+
+                current_user["privacySettings"] = updated_settings
+                save_db(database)
+                return self.respond(200, updated_settings)
 
             if method == "PATCH" and parsed.path.startswith("/users/") and parsed.path.endswith("/password"):
                 user_id = normalized_entity_id(parsed.path.split("/")[2])
