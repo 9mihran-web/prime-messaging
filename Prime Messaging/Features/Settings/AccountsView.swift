@@ -5,6 +5,7 @@ struct AccountsView: View {
     @EnvironmentObject private var appState: AppState
     @State private var statusMessage = ""
     @State private var deletingAccountIDs = Set<UUID>()
+    @State private var pendingDeletionAccount: User?
 
     var body: some View {
         List {
@@ -39,10 +40,7 @@ struct AccountsView: View {
                 }
                 .onDelete { offsets in
                     for offset in offsets {
-                        let account = appState.accounts[offset]
-                        Task {
-                            await deleteAccount(account.id)
-                        }
+                        pendingDeletionAccount = appState.accounts[offset]
                     }
                 }
             }
@@ -62,6 +60,30 @@ struct AccountsView: View {
             }
         }
         .navigationTitle("settings.accounts".localized)
+        .alert(
+            "Delete account everywhere?",
+            isPresented: Binding(
+                get: { pendingDeletionAccount != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        pendingDeletionAccount = nil
+                    }
+                }
+            ),
+            presenting: pendingDeletionAccount
+        ) { account in
+            Button("Delete", role: .destructive) {
+                Task {
+                    await deleteAccount(account.id)
+                    pendingDeletionAccount = nil
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                pendingDeletionAccount = nil
+            }
+        } message: { account in
+            Text("This will fully delete @\(account.profile.username) from Prime Messaging, remove its sessions, and erase its direct chats from the server.")
+        }
     }
 
     @MainActor
