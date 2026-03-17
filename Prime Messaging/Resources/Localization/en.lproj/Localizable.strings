@@ -6,8 +6,14 @@
 "tab.settings" = "Settings";
 "home.online.subtitle" = "Internet chats, media, presence";
 "home.offline.subtitle" = "Nearby Bluetooth-only space";
-"calls.placeholder.title" = "Calls will live here.";
-"calls.placeholder.body" = "Chats and settings are ready now. Call history and calling controls can be added next.";
+"calls.placeholder.title" = "Calls";
+"calls.placeholder.body" = "Open a direct contact profile and tap Call to start a phone call.";
+"calls.unavailable.phone" = "Phone number is not available for this user.";
+"calls.unavailable.privacy" = "This user allows calls only from saved contacts.";
+"calls.unavailable.start" = "Could not start the call.";
+"group.role.owner" = "Owner";
+"group.role.admin" = "Admin";
+"group.role.member" = "Member";
 "mode.online" = "Online";
 "mode.online.subtitle" = "Internet chats, media, presence";
 "mode.offline" = "Offline";

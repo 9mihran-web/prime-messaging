@@ -6,8 +6,14 @@
 "tab.settings" = "Կարգավորումներ";
 "home.online.subtitle" = "Ինտերնետ զրույցներ, մեդիա, ներկայություն";
 "home.offline.subtitle" = "Մոտակա Bluetooth-only տարածք";
-"calls.placeholder.title" = "Զանգերը կլինեն այստեղ։";
-"calls.placeholder.body" = "Չաթերն ու կարգավորումները արդեն պատրաստ են։ Զանգերի պատմությունն ու կառավարման տարրերը կարող ենք ավելացնել հաջորդ քայլով։";
+"calls.placeholder.title" = "Զանգեր";
+"calls.placeholder.body" = "Բացիր կոնտակտի պրոֆիլը և սեղմիր Call, որպեսզի սկսես հեռախոսային զանգ։";
+"calls.unavailable.phone" = "Այս օգտատիրոջ հեռախոսահամարը հասանելի չէ։";
+"calls.unavailable.privacy" = "Այս օգտատերը զանգերը թույլ է տալիս միայն պահպանված կոնտակտներից։";
+"calls.unavailable.start" = "Չհաջողվեց սկսել զանգը։";
+"group.role.owner" = "Սեփականատեր";
+"group.role.admin" = "Ադմին";
+"group.role.member" = "Մասնակից";
 "mode.online" = "Առցանց";
 "mode.online.subtitle" = "Ինտերնետ զրույցներ, մեդիա, ներկայություն";
 "mode.offline" = "Անցանց";

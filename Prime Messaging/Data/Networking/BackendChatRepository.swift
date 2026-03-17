@@ -271,6 +271,20 @@ struct BackendChatRepository: ChatRepository {
         )
     }
 
+    func updateMemberRole(_ role: GroupMemberRole, for memberID: UUID, in chat: Chat, requesterID: UUID) async throws -> Chat {
+        let body = GroupMemberRoleRequest(
+            requesterID: requesterID.uuidString,
+            role: role.rawValue
+        )
+        return try await request(
+            path: "/chats/\(chat.id.uuidString)/group/members/\(memberID.uuidString)/role",
+            method: "PATCH",
+            body: body,
+            userID: requesterID,
+            fallback: nil
+        )
+    }
+
     func saveDraft(_ draft: Draft) async throws {
         try await fallback.saveDraft(draft)
     }
@@ -1018,6 +1032,16 @@ private struct GroupMemberRemoveRequest: Encodable {
 
     enum CodingKeys: String, CodingKey {
         case requesterID = "requester_id"
+    }
+}
+
+private struct GroupMemberRoleRequest: Encodable {
+    let requesterID: String
+    let role: String
+
+    enum CodingKeys: String, CodingKey {
+        case requesterID = "requester_id"
+        case role
     }
 }
 

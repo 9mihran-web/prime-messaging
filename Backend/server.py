@@ -1006,6 +1006,59 @@ def can_manage_group(chat, user_id):
     return member.get("role") in ("owner", "admin")
 
 
+def can_update_group_member_role(chat, requester_id, member_user_id, new_role):
+    member_role = (find_group_member(chat, requester_id) or {}).get("role")
+    if member_role != "owner":
+        return False
+    if new_role not in ("admin", "member"):
+        return False
+    if ids_equal(member_user_id, requester_id):
+        return False
+    if ids_equal((chat.get("group") or {}).get("ownerID"), member_user_id):
+        return False
+    return find_group_member(chat, member_user_id) is not None
+
+
+def can_remove_group_member(chat, requester_id, member_user_id):
+    requester_member = find_group_member(chat, requester_id)
+    target_member = find_group_member(chat, member_user_id)
+    if not requester_member or not target_member:
+        return False
+    if ids_equal(member_user_id, requester_id):
+        return False
+    if ids_equal((chat.get("group") or {}).get("ownerID"), member_user_id):
+        return False
+
+    requester_role = requester_member.get("role")
+    target_role = target_member.get("role")
+    if requester_role == "owner":
+        return True
+    if requester_role == "admin":
+        return target_role == "member"
+    return False
+
+
+def update_group_member_role(chat, member_user_id, new_role):
+    if not chat or chat.get("type") != "group":
+        return False
+
+    group = chat.get("group") or {}
+    if new_role not in ("admin", "member"):
+        return False
+
+    did_update = False
+    for member in group.get("members") or []:
+        if not ids_equal(member.get("userID"), member_user_id):
+            continue
+        if member.get("role") == new_role:
+            return False
+        member["role"] = new_role
+        did_update = True
+        break
+
+    return did_update
+
+
 def remove_group_member(chat, member_user_id):
     if not chat or chat.get("type") != "group":
         return False
@@ -2261,12 +2314,45 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(403, {"error": "group_permission_denied"})
                 if not member_user_id or not any(ids_equal(member_user_id, participant_id) for participant_id in (chat.get("participantIDs") or [])):
                     return self.respond(404, {"error": "user_not_found"})
-                if ids_equal(member_user_id, requester_id):
-                    return self.respond(409, {"error": "invalid_group_operation"})
-                if ids_equal((chat.get("group") or {}).get("ownerID"), member_user_id):
+                if not can_remove_group_member(chat, requester_id, member_user_id):
                     return self.respond(409, {"error": "invalid_group_operation"})
 
                 if remove_group_member(chat, member_user_id) is False:
+                    return self.respond(409, {"error": "invalid_group_operation"})
+
+                save_db(database)
+                return self.respond(200, serialize_chat(chat, requester_id, database))
+
+            if method == "PATCH" and parsed.path.startswith("/chats/") and "/group/members/" in parsed.path and parsed.path.endswith("/role"):
+                path_components = parsed.path.strip("/").split("/")
+                if len(path_components) < 6:
+                    return self.respond(404, {"error": "not_found"})
+
+                chat_id = normalized_entity_id(path_components[1])
+                member_user_id = normalized_entity_id(path_components[4])
+                requester, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload.get("requester_id"),
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+                requester_id = requester["id"]
+
+                chat = find_chat(database, chat_id)
+                if not chat:
+                    return self.respond(404, {"error": "chat_not_found"})
+                if chat.get("type") != "group":
+                    return self.respond(409, {"error": "invalid_group_chat"})
+
+                new_role = normalized_optional_string(payload.get("role"))
+                if not can_update_group_member_role(chat, requester_id, member_user_id, new_role):
+                    return self.respond(403, {"error": "group_permission_denied"})
+
+                if update_group_member_role(chat, member_user_id, new_role) is False:
                     return self.respond(409, {"error": "invalid_group_operation"})
 
                 save_db(database)

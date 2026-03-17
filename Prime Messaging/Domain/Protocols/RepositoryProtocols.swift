@@ -35,6 +35,7 @@ protocol ChatRepository {
     func removeGroupAvatar(for chat: Chat, requesterID: UUID) async throws -> Chat
     func addMembers(_ memberIDs: [UUID], to chat: Chat, requesterID: UUID) async throws -> Chat
     func removeMember(_ memberID: UUID, from chat: Chat, requesterID: UUID) async throws -> Chat
+    func updateMemberRole(_ role: GroupMemberRole, for memberID: UUID, in chat: Chat, requesterID: UUID) async throws -> Chat
     func createNearbyChat(with peer: OfflinePeer, currentUser: User) async throws -> Chat
     func saveDraft(_ draft: Draft) async throws
 }

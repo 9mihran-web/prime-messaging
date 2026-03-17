@@ -6,8 +6,14 @@
 "tab.settings" = "Настройки";
 "home.online.subtitle" = "Интернет-чаты, медиа, присутствие";
 "home.offline.subtitle" = "Пространство рядом по Bluetooth";
-"calls.placeholder.title" = "Здесь будут звонки.";
-"calls.placeholder.body" = "Чаты и настройки уже готовы. Историю звонков и элементы звонков можно добавить следующим шагом.";
+"calls.placeholder.title" = "Звонки";
+"calls.placeholder.body" = "Открой профиль контакта и нажми Call, чтобы начать телефонный звонок.";
+"calls.unavailable.phone" = "Номер телефона недоступен для этого пользователя.";
+"calls.unavailable.privacy" = "Этот пользователь разрешает звонки только от сохранённых контактов.";
+"calls.unavailable.start" = "Не удалось начать звонок.";
+"group.role.owner" = "Владелец";
+"group.role.admin" = "Админ";
+"group.role.member" = "Участник";
 "mode.online" = "Онлайн";
 "mode.online.subtitle" = "Интернет-чаты, медиа, присутствие";
 "mode.offline" = "Оффлайн";

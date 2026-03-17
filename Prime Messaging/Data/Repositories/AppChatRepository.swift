@@ -140,6 +140,15 @@ struct AppChatRepository: ChatRepository {
         }
     }
 
+    func updateMemberRole(_ role: GroupMemberRole, for memberID: UUID, in chat: Chat, requesterID: UUID) async throws -> Chat {
+        switch chat.mode {
+        case .online:
+            return try await onlineRepository.updateMemberRole(role, for: memberID, in: chat, requesterID: requesterID)
+        case .offline:
+            throw ChatRepositoryError.unsupportedOfflineAction
+        }
+    }
+
     func saveDraft(_ draft: Draft) async throws {
         try await onlineRepository.saveDraft(draft)
     }

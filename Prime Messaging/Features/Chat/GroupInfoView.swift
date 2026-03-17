@@ -17,7 +17,9 @@ struct GroupInfoView: View {
     @State private var isSavingTitle = false
     @State private var isAddingMembers = false
     @State private var removingMemberIDs = Set<UUID>()
+    @State private var changingRoleMemberIDs = Set<UUID>()
     @State private var selectedSection = "Users"
+    @State private var selectedMemberProfile: User?
 
     init(chat: Binding<Chat>) {
         _chat = chat
@@ -81,6 +83,12 @@ struct GroupInfoView: View {
         .onChange(of: chat.group?.title ?? chat.title) { _, newValue in
             title = newValue
         }
+        .sheet(item: $selectedMemberProfile) { user in
+            NavigationStack {
+                ContactProfileView(user: user)
+            }
+            .presentationDetents([.large])
+        }
     }
 
     private var headerBar: some View {
@@ -112,7 +120,9 @@ struct GroupInfoView: View {
 
     private var groupActionRow: some View {
         HStack(spacing: 10) {
-            actionButton(title: "Call", systemName: "phone.fill")
+            actionButton(title: "Call", systemName: "phone.fill") {
+                statusMessage = "Direct calls are available from a member profile."
+            }
             actionButton(title: "Sound", systemName: "bell.fill")
             actionButton(title: "Search", systemName: "magnifyingglass")
             actionButton(title: "More", systemName: "ellipsis")
@@ -294,36 +304,55 @@ struct GroupInfoView: View {
             VStack(spacing: 0) {
                 ForEach(Array((chat.group?.members ?? []).enumerated()), id: \.element.id) { index, member in
                     HStack(spacing: 12) {
-                        AvatarBadgeView(profile: memberProfile(member), size: 36)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(memberDisplayName(member))
-                                .font(.system(.body, design: .rounded).weight(.medium))
-                                .foregroundStyle(PrimeTheme.Colors.textPrimary)
-                            if let username = member.username, !username.isEmpty {
-                                Text("@\(username)")
-                                    .font(.caption)
-                                    .foregroundStyle(PrimeTheme.Colors.textSecondary)
+                        Button {
+                            Task {
+                                await openMemberProfile(member)
+                            }
+                        } label: {
+                            HStack(spacing: 12) {
+                                AvatarBadgeView(profile: memberProfile(member), size: 36)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(memberDisplayName(member))
+                                        .font(.system(.body, design: .rounded).weight(.medium))
+                                        .foregroundStyle(PrimeTheme.Colors.textPrimary)
+                                    if let username = member.username, !username.isEmpty {
+                                        Text("@\(username)")
+                                            .font(.caption)
+                                            .foregroundStyle(PrimeTheme.Colors.textSecondary)
+                                    }
+                                }
                             }
                         }
+                        .buttonStyle(.plain)
                         Spacer()
-                        if canRemove(member) {
-                            if removingMemberIDs.contains(member.userID) {
-                                ProgressView()
-                                    .controlSize(.small)
-                            } else {
-                                Button {
-                                    Task {
-                                        await removeMember(member)
+                        if removingMemberIDs.contains(member.userID) || changingRoleMemberIDs.contains(member.userID) {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else if canManageRoles(for: member) || canRemove(member) {
+                            Menu {
+                                if canManageRoles(for: member) {
+                                    Button(member.role == .admin ? "Remove admin" : "Make admin") {
+                                        Task {
+                                            await updateRole(member.role == .admin ? .member : .admin, for: member)
+                                        }
                                     }
-                                } label: {
-                                    Text("Remove")
-                                        .font(.caption.weight(.medium))
-                                        .foregroundStyle(PrimeTheme.Colors.warning)
                                 }
-                                .buttonStyle(.plain)
+
+                                if canRemove(member) {
+                                    Button("Remove from group", role: .destructive) {
+                                        Task {
+                                            await removeMember(member)
+                                        }
+                                    }
+                                }
+                            } label: {
+                                Image(systemName: "ellipsis.circle")
+                                    .font(.system(size: 18, weight: .semibold))
+                                    .foregroundStyle(PrimeTheme.Colors.textSecondary)
                             }
+                            .buttonStyle(.plain)
                         } else {
-                            Text(member.role.rawValue.capitalized)
+                            Text(member.role.localizationKey.localized)
                                 .font(.caption.weight(.medium))
                                 .foregroundStyle(PrimeTheme.Colors.textSecondary)
                         }
@@ -377,19 +406,42 @@ struct GroupInfoView: View {
             PrimeTheme.Colors.success
     }
 
+    private var currentGroupRole: GroupMemberRole? {
+        chat.group?.members.first(where: { $0.userID == appState.currentUser.id })?.role
+    }
+
     private var canManageGroup: Bool {
-        guard let member = chat.group?.members.first(where: { $0.userID == appState.currentUser.id }) else {
+        guard let currentGroupRole else {
             return false
         }
 
-        return member.role == .owner || member.role == .admin
+        return currentGroupRole == .owner || currentGroupRole == .admin
+    }
+
+    private var isOwner: Bool {
+        currentGroupRole == .owner
     }
 
     private func canRemove(_ member: GroupMember) -> Bool {
-        guard canManageGroup else { return false }
+        guard let currentGroupRole else { return false }
         guard member.userID != appState.currentUser.id else { return false }
         guard member.userID != chat.group?.ownerID else { return false }
-        return true
+
+        switch currentGroupRole {
+        case .owner:
+            return true
+        case .admin:
+            return member.role == .member
+        case .member:
+            return false
+        }
+    }
+
+    private func canManageRoles(for member: GroupMember) -> Bool {
+        guard isOwner else { return false }
+        guard member.userID != appState.currentUser.id else { return false }
+        guard member.userID != chat.group?.ownerID else { return false }
+        return member.role == .admin || member.role == .member
     }
 
     private func memberDisplayName(_ member: GroupMember) -> String {
@@ -529,6 +581,33 @@ struct GroupInfoView: View {
         }
     }
 
+    @MainActor
+    private func updateRole(_ role: GroupMemberRole, for member: GroupMember) async {
+        changingRoleMemberIDs.insert(member.userID)
+        defer { changingRoleMemberIDs.remove(member.userID) }
+
+        do {
+            chat = try await environment.chatRepository.updateMemberRole(
+                role,
+                for: member.userID,
+                in: chat,
+                requesterID: appState.currentUser.id
+            )
+            statusMessage = "Group updated."
+        } catch {
+            statusMessage = error.localizedDescription.isEmpty ? "Could not update the group." : error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func openMemberProfile(_ member: GroupMember) async {
+        do {
+            selectedMemberProfile = try await environment.authRepository.userProfile(userID: member.userID)
+        } catch {
+            statusMessage = error.localizedDescription.isEmpty ? "Could not open the profile." : error.localizedDescription
+        }
+    }
+
     private func toggle(_ user: User) {
         if let existingIndex = selectedUsers.firstIndex(of: user) {
             selectedUsers.remove(at: existingIndex)
@@ -538,9 +617,8 @@ struct GroupInfoView: View {
     }
 
     @ViewBuilder
-    private func actionButton(title: String, systemName: String) -> some View {
-        Button {
-        } label: {
+    private func actionButton(title: String, systemName: String, action: @escaping () -> Void = {}) -> some View {
+        Button(action: action) {
             VStack(spacing: 6) {
                 Image(systemName: systemName)
                     .font(.system(size: 16, weight: .semibold))

@@ -18,6 +18,17 @@ enum GroupMemberRole: String, Codable, CaseIterable {
     case owner
     case admin
     case member
+
+    var localizationKey: String {
+        switch self {
+        case .owner:
+            return "group.role.owner"
+        case .admin:
+            return "group.role.admin"
+        case .member:
+            return "group.role.member"
+        }
+    }
 }
 
 enum MessageKind: String, Codable {

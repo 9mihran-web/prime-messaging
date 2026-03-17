@@ -210,6 +210,24 @@ struct MockChatRepository: ChatRepository {
         return updatedChat
     }
 
+    func updateMemberRole(_ role: GroupMemberRole, for memberID: UUID, in chat: Chat, requesterID: UUID) async throws -> Chat {
+        var updatedChat = chat
+        guard var group = updatedChat.group else { return updatedChat }
+        guard group.ownerID == requesterID else {
+            throw ChatRepositoryError.groupPermissionDenied
+        }
+        guard let index = group.members.firstIndex(where: { $0.userID == memberID }) else {
+            throw ChatRepositoryError.userNotFound
+        }
+        guard group.members[index].userID != group.ownerID else {
+            throw ChatRepositoryError.invalidGroupOperation
+        }
+
+        group.members[index].role = role
+        updatedChat.group = group
+        return updatedChat
+    }
+
     func createNearbyChat(with peer: OfflinePeer, currentUser: User) async throws -> Chat {
         Chat(
             id: UUID(),
