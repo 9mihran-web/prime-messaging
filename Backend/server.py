@@ -77,6 +77,31 @@ def save_db(database):
         json.dump(database, file, indent=2, sort_keys=True)
 
 
+def normalized_entity_id(value):
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned.lower() if cleaned else None
+
+
+def ids_equal(lhs, rhs):
+    left_id = normalized_entity_id(lhs)
+    right_id = normalized_entity_id(rhs)
+    return left_id is not None and right_id is not None and left_id == right_id
+
+
+def unique_entity_ids(values):
+    normalized_values = []
+    seen = set()
+    for value in values or []:
+        normalized_value = normalized_entity_id(value)
+        if not normalized_value or normalized_value in seen:
+            continue
+        seen.add(normalized_value)
+        normalized_values.append(normalized_value)
+    return normalized_values
+
+
 def ensure_database_schema(database):
     did_update = False
 
@@ -85,19 +110,425 @@ def ensure_database_schema(database):
             database[key] = []
             did_update = True
 
+    if normalize_database_entities(database):
+        did_update = True
+
     return did_update
 
 
 def find_user(database, user_id):
-    return next((user for user in database["users"] if user["id"] == user_id), None)
+    user_id = normalized_entity_id(user_id)
+    if not user_id:
+        return None
+    return next((user for user in database["users"] if ids_equal(user.get("id"), user_id)), None)
 
 
 def find_chat(database, chat_id):
-    return next((chat for chat in database["chats"] if chat["id"] == chat_id), None)
+    chat_id = normalized_entity_id(chat_id)
+    if not chat_id:
+        return None
+    return next((chat for chat in database["chats"] if ids_equal(chat.get("id"), chat_id)), None)
 
 
 def find_message(database, message_id):
-    return next((message for message in database["messages"] if message["id"] == message_id), None)
+    message_id = normalized_entity_id(message_id)
+    if not message_id:
+        return None
+    return next((message for message in database["messages"] if ids_equal(message.get("id"), message_id)), None)
+
+
+def prefer_first_timestamp(lhs, rhs):
+    if not lhs:
+        return rhs
+    if not rhs:
+        return lhs
+    return min(lhs, rhs)
+
+
+def message_status_rank(value):
+    ranking = {"sent": 1, "delivered": 2, "read": 3}
+    return ranking.get((value or "").strip().lower(), 0)
+
+
+def user_merge_score(user):
+    profile = user.get("profile") or {}
+    username = (profile.get("username") or "").strip().lower()
+    score = 0
+    if not is_legacy_placeholder_user(user):
+        score += 100
+    if (user.get("password") or "").strip():
+        score += 40
+    if (profile.get("email") or "").strip():
+        score += 20
+    if (profile.get("phoneNumber") or "").strip():
+        score += 20
+    if (profile.get("displayName") or "").strip():
+        score += 10
+    if username and not username.startswith("legacy_"):
+        score += 10
+    if (profile.get("profilePhotoURL") or "").strip():
+        score += 5
+    return score
+
+
+def merge_user_records(primary, secondary):
+    did_update = False
+    primary_profile = primary.setdefault("profile", {})
+    secondary_profile = secondary.get("profile") or {}
+
+    if not (primary.get("password") or "").strip() and (secondary.get("password") or "").strip():
+        primary["password"] = secondary.get("password", "")
+        did_update = True
+
+    field_names = ("displayName", "bio", "status", "email", "phoneNumber", "profilePhotoURL", "socialLink")
+    for field_name in field_names:
+        if (primary_profile.get(field_name) or "").strip():
+            continue
+        secondary_value = secondary_profile.get(field_name)
+        if secondary_value is None or not str(secondary_value).strip():
+            continue
+        primary_profile[field_name] = secondary_value
+        did_update = True
+
+    primary_username = (primary_profile.get("username") or "").strip().lower()
+    secondary_username = (secondary_profile.get("username") or "").strip().lower()
+    if secondary_username and (
+        not primary_username
+        or primary_username.startswith("legacy_")
+        and not secondary_username.startswith("legacy_")
+    ):
+        primary_profile["username"] = secondary_username
+        did_update = True
+
+    identity_methods = primary.setdefault("identityMethods", [])
+    seen_methods = {
+        (
+            (item.get("type") or "").strip().lower(),
+            (item.get("value") or "").strip().lower(),
+        )
+        for item in identity_methods
+    }
+    for item in secondary.get("identityMethods") or []:
+        signature = (
+            (item.get("type") or "").strip().lower(),
+            (item.get("value") or "").strip().lower(),
+        )
+        if signature in seen_methods:
+            continue
+        identity_methods.append(item)
+        seen_methods.add(signature)
+        did_update = True
+
+    privacy_settings = primary.setdefault("privacySettings", {})
+    for key, value in (secondary.get("privacySettings") or {}).items():
+        if key in privacy_settings:
+            continue
+        privacy_settings[key] = value
+        did_update = True
+
+    return did_update
+
+
+def chat_merge_score(chat):
+    score = 0
+    if chat.get("type") == "group":
+        score += 20
+    if chat.get("group"):
+        score += 10
+    score += len(unique_entity_ids(chat.get("participantIDs") or []))
+    if (chat.get("cachedTitle") or "").strip():
+        score += 3
+    if (chat.get("cachedSubtitle") or "").strip():
+        score += 2
+    if chat.get("createdAt"):
+        score += 1
+    return score
+
+
+def merge_group_records(primary_group, secondary_group):
+    did_update = False
+    if not secondary_group:
+        return did_update
+
+    if not primary_group:
+        return True
+
+    if not (primary_group.get("title") or "").strip() and (secondary_group.get("title") or "").strip():
+        primary_group["title"] = secondary_group.get("title")
+        did_update = True
+
+    if not (primary_group.get("photoURL") or "").strip() and (secondary_group.get("photoURL") or "").strip():
+        primary_group["photoURL"] = secondary_group.get("photoURL")
+        did_update = True
+
+    secondary_owner_id = normalized_entity_id(secondary_group.get("ownerID"))
+    if not normalized_entity_id(primary_group.get("ownerID")) and secondary_owner_id:
+        primary_group["ownerID"] = secondary_owner_id
+        did_update = True
+
+    seen_members = {
+        normalized_entity_id(member.get("userID"))
+        for member in primary_group.get("members") or []
+        if normalized_entity_id(member.get("userID"))
+    }
+    for member in secondary_group.get("members") or []:
+        member_user_id = normalized_entity_id(member.get("userID"))
+        if not member_user_id or member_user_id in seen_members:
+            continue
+        member["userID"] = member_user_id
+        (primary_group.setdefault("members", [])).append(member)
+        seen_members.add(member_user_id)
+        did_update = True
+
+    return did_update
+
+
+def merge_chat_records(primary, secondary):
+    did_update = False
+    if not (primary.get("mode") or "").strip() and (secondary.get("mode") or "").strip():
+        primary["mode"] = secondary.get("mode")
+        did_update = True
+
+    if not (primary.get("type") or "").strip() and (secondary.get("type") or "").strip():
+        primary["type"] = secondary.get("type")
+        did_update = True
+
+    merged_participants = unique_entity_ids((primary.get("participantIDs") or []) + (secondary.get("participantIDs") or []))
+    if merged_participants != unique_entity_ids(primary.get("participantIDs") or []):
+        primary["participantIDs"] = merged_participants
+        did_update = True
+
+    if (
+        generic_direct_title(primary.get("cachedTitle"))
+        and not generic_direct_title(secondary.get("cachedTitle"))
+    ) or (not (primary.get("cachedTitle") or "").strip() and (secondary.get("cachedTitle") or "").strip()):
+        primary["cachedTitle"] = secondary.get("cachedTitle")
+        did_update = True
+
+    if (
+        generic_direct_subtitle(primary.get("cachedSubtitle"))
+        and not generic_direct_subtitle(secondary.get("cachedSubtitle"))
+    ) or (not (primary.get("cachedSubtitle") or "").strip() and (secondary.get("cachedSubtitle") or "").strip()):
+        primary["cachedSubtitle"] = secondary.get("cachedSubtitle")
+        did_update = True
+
+    primary["createdAt"] = prefer_first_timestamp(primary.get("createdAt"), secondary.get("createdAt"))
+    if merge_group_records(primary.get("group"), secondary.get("group")):
+        if not primary.get("group") and secondary.get("group"):
+            primary["group"] = secondary.get("group")
+        did_update = True
+
+    return did_update
+
+
+def message_merge_score(message):
+    score = 0
+    if not message.get("deletedForEveryoneAt"):
+        score += 10
+    if message.get("text"):
+        score += 5
+    if message.get("attachments"):
+        score += 4
+    if message.get("voiceMessage"):
+        score += 4
+    score += message_status_rank(message.get("status"))
+    if message.get("senderDisplayName"):
+        score += 2
+    return score
+
+
+def merge_message_records(primary, secondary):
+    did_update = False
+    preferred_status = primary.get("status")
+    if message_status_rank(secondary.get("status")) > message_status_rank(preferred_status):
+        preferred_status = secondary.get("status")
+    if preferred_status != primary.get("status"):
+        primary["status"] = preferred_status
+        did_update = True
+
+    if not primary.get("text") and secondary.get("text"):
+        primary["text"] = secondary.get("text")
+        did_update = True
+
+    if not primary.get("attachments") and secondary.get("attachments"):
+        primary["attachments"] = secondary.get("attachments")
+        did_update = True
+
+    if not primary.get("voiceMessage") and secondary.get("voiceMessage"):
+        primary["voiceMessage"] = secondary.get("voiceMessage")
+        did_update = True
+
+    if not primary.get("senderDisplayName") and secondary.get("senderDisplayName"):
+        primary["senderDisplayName"] = secondary.get("senderDisplayName")
+        did_update = True
+
+    if not primary.get("editedAt") and secondary.get("editedAt"):
+        primary["editedAt"] = secondary.get("editedAt")
+        did_update = True
+
+    if not primary.get("deletedForEveryoneAt") and secondary.get("deletedForEveryoneAt"):
+        primary["deletedForEveryoneAt"] = secondary.get("deletedForEveryoneAt")
+        did_update = True
+
+    primary["createdAt"] = prefer_first_timestamp(primary.get("createdAt"), secondary.get("createdAt"))
+    return did_update
+
+
+def normalize_database_entities(database):
+    did_update = False
+
+    user_id_map = {}
+    grouped_users = {}
+    for user in database.get("users", []):
+        original_user_id = normalized_optional_string(user.get("id"))
+        canonical_user_id = normalized_entity_id(original_user_id) or str(uuid.uuid4())
+        grouped_users.setdefault(canonical_user_id, []).append(user)
+        if original_user_id:
+            user_id_map[original_user_id] = canonical_user_id
+        user_id_map[canonical_user_id] = canonical_user_id
+
+    normalized_users = []
+    for canonical_user_id, records in grouped_users.items():
+        chosen = max(records, key=user_merge_score)
+        for record in records:
+            if record is chosen:
+                continue
+            if merge_user_records(chosen, record):
+                did_update = True
+        if chosen.get("id") != canonical_user_id:
+            chosen["id"] = canonical_user_id
+            did_update = True
+        profile = chosen.setdefault("profile", {})
+        username = normalized_optional_string(profile.get("username"))
+        if username and profile.get("username") != username.lower():
+            profile["username"] = username.lower()
+            did_update = True
+        normalized_users.append(chosen)
+    database["users"] = normalized_users
+
+    chat_id_map = {}
+    normalized_chat_records = []
+    for chat in database.get("chats", []):
+        original_chat_id = normalized_optional_string(chat.get("id"))
+        participant_ids = [
+            user_id_map.get(normalized_optional_string(participant_id), normalized_entity_id(participant_id))
+            for participant_id in chat.get("participantIDs") or []
+        ]
+        participant_ids = unique_entity_ids(participant_ids)
+        if participant_ids != (chat.get("participantIDs") or []):
+            chat["participantIDs"] = participant_ids
+            did_update = True
+
+        if chat.get("type") == "selfChat" and participant_ids:
+            canonical_chat_id = participant_ids[0]
+        else:
+            canonical_chat_id = normalized_entity_id(original_chat_id) or str(uuid.uuid4())
+        if original_chat_id:
+            chat_id_map[original_chat_id] = canonical_chat_id
+        chat_id_map[canonical_chat_id] = canonical_chat_id
+        if chat.get("id") != canonical_chat_id:
+            chat["id"] = canonical_chat_id
+            did_update = True
+
+        group = chat.get("group")
+        if group:
+            if group.get("id") != canonical_chat_id:
+                group["id"] = canonical_chat_id
+                did_update = True
+            owner_id = user_id_map.get(normalized_optional_string(group.get("ownerID")), normalized_entity_id(group.get("ownerID")))
+            if owner_id and group.get("ownerID") != owner_id:
+                group["ownerID"] = owner_id
+                did_update = True
+            for member in group.get("members") or []:
+                member_user_id = user_id_map.get(normalized_optional_string(member.get("userID")), normalized_entity_id(member.get("userID")))
+                if member_user_id and member.get("userID") != member_user_id:
+                    member["userID"] = member_user_id
+                    did_update = True
+
+        normalized_chat_records.append(chat)
+
+    grouped_chats = {}
+    for chat in normalized_chat_records:
+        grouped_chats.setdefault(chat["id"], []).append(chat)
+
+    normalized_chats = []
+    for canonical_chat_id, records in grouped_chats.items():
+        chosen = max(records, key=chat_merge_score)
+        for record in records:
+            if record is chosen:
+                continue
+            if merge_chat_records(chosen, record):
+                did_update = True
+        normalized_chats.append(chosen)
+    database["chats"] = normalized_chats
+
+    normalized_messages = []
+    grouped_messages = {}
+    for message in database.get("messages", []):
+        original_message_id = normalized_optional_string(message.get("id"))
+        canonical_message_id = normalized_entity_id(original_message_id) or str(uuid.uuid4())
+        if message.get("id") != canonical_message_id:
+            message["id"] = canonical_message_id
+            did_update = True
+
+        canonical_chat_id = chat_id_map.get(normalized_optional_string(message.get("chatID")), normalized_entity_id(message.get("chatID")))
+        if canonical_chat_id and message.get("chatID") != canonical_chat_id:
+            message["chatID"] = canonical_chat_id
+            did_update = True
+
+        canonical_sender_id = user_id_map.get(normalized_optional_string(message.get("senderID")), normalized_entity_id(message.get("senderID")))
+        if canonical_sender_id and message.get("senderID") != canonical_sender_id:
+            message["senderID"] = canonical_sender_id
+            did_update = True
+
+        grouped_messages.setdefault(canonical_message_id, []).append(message)
+        normalized_messages.append(message)
+
+    deduplicated_messages = []
+    for canonical_message_id, records in grouped_messages.items():
+        chosen = max(records, key=message_merge_score)
+        for record in records:
+            if record is chosen:
+                continue
+            if merge_message_records(chosen, record):
+                did_update = True
+        deduplicated_messages.append(chosen)
+    database["messages"] = deduplicated_messages
+
+    normalized_sessions = []
+    for session in database.get("sessions", []):
+        canonical_session_id = normalized_entity_id(session.get("id")) or str(uuid.uuid4())
+        if session.get("id") != canonical_session_id:
+            session["id"] = canonical_session_id
+            did_update = True
+        canonical_user_id = user_id_map.get(normalized_optional_string(session.get("userID")), normalized_entity_id(session.get("userID")))
+        if canonical_user_id and session.get("userID") != canonical_user_id:
+            session["userID"] = canonical_user_id
+            did_update = True
+        normalized_sessions.append(session)
+    database["sessions"] = normalized_sessions
+
+    normalized_device_tokens = []
+    seen_tokens = set()
+    for entry in database.get("deviceTokens", []):
+        canonical_entry_id = normalized_entity_id(entry.get("id")) or str(uuid.uuid4())
+        if entry.get("id") != canonical_entry_id:
+            entry["id"] = canonical_entry_id
+            did_update = True
+        canonical_user_id = user_id_map.get(normalized_optional_string(entry.get("userID")), normalized_entity_id(entry.get("userID")))
+        if canonical_user_id and entry.get("userID") != canonical_user_id:
+            entry["userID"] = canonical_user_id
+            did_update = True
+        token_value = normalized_optional_string(entry.get("token"))
+        if token_value and token_value in seen_tokens:
+            did_update = True
+            continue
+        if token_value:
+            seen_tokens.add(token_value)
+        normalized_device_tokens.append(entry)
+    database["deviceTokens"] = normalized_device_tokens
+
+    return did_update
 
 
 def generate_token():
@@ -118,6 +549,7 @@ def parse_iso_datetime(value):
 
 
 def issue_session(database, user_id):
+    user_id = normalized_entity_id(user_id)
     access_token = generate_token()
     refresh_token = generate_token()
     session = {
@@ -202,7 +634,7 @@ def request_user_with_fallback(database, headers, fallback_user_id=None, create_
     if not auth_error:
         return user, session, None
 
-    fallback_user_id = normalized_optional_string(fallback_user_id)
+    fallback_user_id = normalized_entity_id(fallback_user_id)
     if not fallback_user_id:
         return None, None, auth_error
 
@@ -276,7 +708,7 @@ def payload_string(payload, *keys):
 def latest_user_session_activity(database, user_id):
     latest = None
     for session in database.get("sessions", []):
-        if session.get("userID") != user_id:
+        if not ids_equal(session.get("userID"), user_id):
             continue
         updated_at = parse_iso_datetime(session.get("updatedAt"))
         if updated_at and (latest is None or updated_at > latest):
@@ -305,7 +737,7 @@ def serialize_presence(viewer, target_user, database):
         state = "recently"
         last_seen_at = latest_activity.isoformat() if latest_activity else None
 
-    if viewer and viewer["id"] == target_user["id"] and latest_activity:
+    if viewer and ids_equal(viewer["id"], target_user["id"]) and latest_activity:
         state = "online" if user_is_online(database, target_user["id"]) else "lastSeen"
         last_seen_at = latest_activity.isoformat()
 
@@ -354,7 +786,7 @@ def find_user_by_identifier(database, identifier):
 def username_taken(database, username, excluding_user_id=None):
     username = username.lower()
     for user in database["users"]:
-        if excluding_user_id and user["id"] == excluding_user_id:
+        if excluding_user_id and ids_equal(user["id"], excluding_user_id):
             continue
         if user["profile"]["username"].lower() == username:
             return True
@@ -362,12 +794,13 @@ def username_taken(database, username, excluding_user_id=None):
 
 
 def ensure_saved_messages_chat(database, user_id, mode):
+    user_id = normalized_entity_id(user_id)
     existing = next(
         (
             chat for chat in database["chats"]
             if chat["type"] == "selfChat"
             and chat["mode"] == mode
-            and chat["participantIDs"] == [user_id]
+            and unique_entity_ids(chat.get("participantIDs")) == [user_id]
         ),
         None
     )
@@ -493,7 +926,7 @@ def sync_user_snapshots(database, user):
             group = chat.get("group") or {}
             members = group.get("members") or []
             for member in members:
-                if member.get("userID") != user["id"]:
+                if not ids_equal(member.get("userID"), user["id"]):
                     continue
 
                 if display_name and member.get("displayName") != display_name:
@@ -540,7 +973,7 @@ def group_member_display_name_for(chat, user_id):
 
     group = chat.get("group") or {}
     for member in group.get("members") or []:
-        if member.get("userID") != user_id:
+        if not ids_equal(member.get("userID"), user_id):
             continue
 
         display_name = (member.get("displayName") or "").strip()
@@ -560,7 +993,7 @@ def find_group_member(chat, user_id):
 
     group = chat.get("group") or {}
     return next(
-        (member for member in group.get("members") or [] if member.get("userID") == user_id),
+        (member for member in group.get("members") or [] if ids_equal(member.get("userID"), user_id)),
         None,
     )
 
@@ -710,18 +1143,18 @@ def direct_chat_other_user(chat, current_user_id, database):
     participant_ids = chat.get("participantIDs") or []
 
     for user_id in participant_ids:
-        if user_id == current_user_id:
+        if ids_equal(user_id, current_user_id):
             continue
         user = find_user(database, user_id)
         if user:
             return user
 
-    messages = [message for message in database["messages"] if message["chatID"] == chat["id"]]
+    messages = [message for message in database["messages"] if ids_equal(message.get("chatID"), chat.get("id"))]
     messages.sort(key=lambda item: item["createdAt"], reverse=True)
 
     for message in messages:
         sender_id = message.get("senderID")
-        if not sender_id or sender_id == current_user_id:
+        if not sender_id or ids_equal(sender_id, current_user_id):
             continue
         user = find_user(database, sender_id)
         if user:
@@ -730,17 +1163,17 @@ def direct_chat_other_user(chat, current_user_id, database):
     cached_subtitle = (chat.get("cachedSubtitle") or "").strip()
     if cached_subtitle.startswith("@"):
         user = find_user_by_identifier(database, cached_subtitle)
-        if user and user["id"] != current_user_id:
+        if user and not ids_equal(user["id"], current_user_id):
             return user
 
     return None
 
 
 def direct_chat_fallback_participant(chat, current_user_id, database):
-    messages = [message for message in database["messages"] if message["chatID"] == chat["id"]]
+    messages = [message for message in database["messages"] if ids_equal(message.get("chatID"), chat.get("id"))]
     messages.sort(key=lambda item: item["createdAt"], reverse=True)
     other_user_id = next(
-        (participant_id for participant_id in (chat.get("participantIDs") or []) if participant_id != current_user_id),
+        (participant_id for participant_id in (chat.get("participantIDs") or []) if not ids_equal(participant_id, current_user_id)),
         None,
     )
     cached_subtitle = (chat.get("cachedSubtitle") or "").strip()
@@ -748,7 +1181,7 @@ def direct_chat_fallback_participant(chat, current_user_id, database):
 
     for message in messages:
         sender_id = message.get("senderID")
-        if not sender_id or sender_id == current_user_id:
+        if not sender_id or ids_equal(sender_id, current_user_id):
             continue
 
         display_name = (message.get("senderDisplayName") or "").strip()
@@ -820,7 +1253,7 @@ def chat_subtitle_for(chat, current_user_id, database):
 
 
 def serialize_chat(chat, current_user_id, database):
-    messages = [message for message in database["messages"] if message["chatID"] == chat["id"]]
+    messages = [message for message in database["messages"] if ids_equal(message.get("chatID"), chat.get("id"))]
     messages.sort(key=lambda item: item["createdAt"])
     last_message = messages[-1] if messages else None
     participants = [
@@ -833,10 +1266,10 @@ def serialize_chat(chat, current_user_id, database):
 
     if chat["type"] == "direct":
         other_user_id = next(
-            (participant_id for participant_id in chat["participantIDs"] if participant_id != current_user_id),
+            (participant_id for participant_id in chat["participantIDs"] if not ids_equal(participant_id, current_user_id)),
             None,
         )
-        has_other_participant = any(participant["id"] == other_user_id for participant in participants) if other_user_id else False
+        has_other_participant = any(ids_equal(participant["id"], other_user_id) for participant in participants) if other_user_id else False
         if not has_other_participant:
             fallback_participant = direct_chat_fallback_participant(chat, current_user_id, database)
             if fallback_participant:
@@ -894,9 +1327,9 @@ def mark_messages_delivered(chat, database, recipient_id):
 
     did_update = False
     for message in database["messages"]:
-        if message.get("chatID") != chat["id"]:
+        if not ids_equal(message.get("chatID"), chat.get("id")):
             continue
-        if message.get("senderID") == recipient_id:
+        if ids_equal(message.get("senderID"), recipient_id):
             continue
         if message.get("deletedForEveryoneAt"):
             continue
@@ -915,9 +1348,9 @@ def mark_chat_read(chat, database, reader_id):
 
     did_update = False
     for message in database["messages"]:
-        if message.get("chatID") != chat["id"]:
+        if not ids_equal(message.get("chatID"), chat.get("id")):
             continue
-        if message.get("senderID") == reader_id:
+        if ids_equal(message.get("senderID"), reader_id):
             continue
         if message.get("deletedForEveryoneAt"):
             continue
@@ -934,12 +1367,12 @@ def device_tokens_for_recipients(database, chat, excluding_user_id):
     recipient_ids = [
         participant_id
         for participant_id in (chat.get("participantIDs") or [])
-        if participant_id != excluding_user_id
+        if not ids_equal(participant_id, excluding_user_id)
     ]
     return [
         device_token
         for device_token in database.get("deviceTokens", [])
-        if device_token.get("userID") in recipient_ids
+        if any(ids_equal(device_token.get("userID"), recipient_id) for recipient_id in recipient_ids)
     ]
 
 
@@ -1017,7 +1450,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/usernames/check":
                 params = parse_qs(parsed.query)
                 username = (params.get("username") or [""])[0].strip().lower()
-                user_id = (params.get("user_id") or [""])[0].strip() or None
+                user_id = normalized_entity_id((params.get("user_id") or [""])[0].strip() or None)
                 available = bool(username) and not username_taken(database, username, user_id)
                 return self.respond(200, {"available": available})
 
@@ -1039,7 +1472,7 @@ class Handler(BaseHTTPRequestHandler):
                 users = [
                     serialize_user(user)
                     for user in database["users"]
-                    if user["id"] != current_user["id"] and (
+                    if not ids_equal(user["id"], current_user["id"]) and (
                         query in user["profile"]["username"].lower() or
                         query in user["profile"]["displayName"].lower() or
                         query in (user["profile"].get("email") or "").lower() or
@@ -1049,7 +1482,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, users[:20])
 
             if parsed.path.startswith("/users/") and "/profile" not in parsed.path and "/avatar" not in parsed.path:
-                user_id = parsed.path.split("/")[2]
+                user_id = normalized_entity_id(parsed.path.split("/")[2])
                 user = find_user(database, user_id)
                 if not user:
                     return self.respond(404, {"error": "user_not_found"})
@@ -1073,7 +1506,7 @@ class Handler(BaseHTTPRequestHandler):
                 if auth_error:
                     return self.respond(401, {"error": auth_error})
 
-                user_id = parsed.path.split("/")[2]
+                user_id = normalized_entity_id(parsed.path.split("/")[2])
                 user = find_user(database, user_id)
                 if not user:
                     return self.respond(404, {"error": "user_not_found"})
@@ -1099,7 +1532,7 @@ class Handler(BaseHTTPRequestHandler):
                 chats = []
                 did_backfill = False
                 for chat in database["chats"]:
-                    if user_id not in chat["participantIDs"] or chat["mode"] != mode:
+                    if not any(ids_equal(user_id, participant_id) for participant_id in (chat.get("participantIDs") or [])) or chat["mode"] != mode:
                         continue
                     did_backfill = backfill_group_member_snapshots(chat, database) or did_backfill
                     did_backfill = mark_messages_delivered(chat, database, user_id) or did_backfill
@@ -1125,14 +1558,14 @@ class Handler(BaseHTTPRequestHandler):
                 if auth_error:
                     return self.respond(401, {"error": auth_error})
 
-                chat_id = (params.get("chat_id") or [""])[0].strip()
+                chat_id = normalized_entity_id((params.get("chat_id") or [""])[0].strip())
                 chat = find_chat(database, chat_id)
                 if not chat:
                     return self.respond(404, {"error": "chat_not_found"})
-                if current_user["id"] not in (chat.get("participantIDs") or []):
+                if not any(ids_equal(current_user["id"], participant_id) for participant_id in (chat.get("participantIDs") or [])):
                     return self.respond(403, {"error": "sender_not_in_chat"})
 
-                raw_messages = [item for item in database["messages"] if item["chatID"] == chat_id]
+                raw_messages = [item for item in database["messages"] if ids_equal(item.get("chatID"), chat["id"])]
                 did_backfill = backfill_group_member_snapshots(chat, database)
                 did_backfill = mark_messages_delivered(chat, database, current_user["id"]) or did_backfill
                 for message in raw_messages:
@@ -1164,7 +1597,7 @@ class Handler(BaseHTTPRequestHandler):
 
             if method == "POST" and parsed.path == "/auth/signup":
                 username = str(payload.get("username", "")).strip().lower()
-                requested_user_id = normalized_optional_string(payload.get("user_id"))
+                requested_user_id = normalized_entity_id(payload.get("user_id"))
                 existing_requested_user = find_user(database, requested_user_id) if requested_user_id else None
                 if username_taken(database, username, requested_user_id):
                     return self.respond(409, {"error": "username_taken"})
@@ -1307,7 +1740,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, {"ok": True})
 
             if method == "PATCH" and parsed.path.startswith("/users/") and parsed.path.endswith("/profile"):
-                user_id = parsed.path.split("/")[2]
+                user_id = normalized_entity_id(parsed.path.split("/")[2])
                 current_user, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
@@ -1318,7 +1751,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
                     return self.respond(401, {"error": auth_error})
-                if current_user["id"] != user_id:
+                if not ids_equal(current_user["id"], user_id):
                     return self.respond(403, {"error": "edit_not_allowed"})
 
                 username = str(payload.get("username", current_user["profile"]["username"])).strip().lower()
@@ -1345,7 +1778,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, serialize_user(current_user))
 
             if method == "PATCH" and parsed.path.startswith("/users/") and parsed.path.endswith("/password"):
-                user_id = parsed.path.split("/")[2]
+                user_id = normalized_entity_id(parsed.path.split("/")[2])
                 current_user, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
@@ -1356,7 +1789,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
                     return self.respond(401, {"error": auth_error})
-                if current_user["id"] != user_id:
+                if not ids_equal(current_user["id"], user_id):
                     return self.respond(403, {"error": "edit_not_allowed"})
 
                 current_user["password"] = str(payload.get("password", "")).strip()
@@ -1364,7 +1797,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, {"ok": True})
 
             if method == "POST" and parsed.path.startswith("/users/") and parsed.path.endswith("/avatar"):
-                user_id = parsed.path.split("/")[2]
+                user_id = normalized_entity_id(parsed.path.split("/")[2])
                 current_user, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
@@ -1375,7 +1808,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
                     return self.respond(401, {"error": auth_error})
-                if current_user["id"] != user_id:
+                if not ids_equal(current_user["id"], user_id):
                     return self.respond(403, {"error": "edit_not_allowed"})
 
                 remove_file_for_url(current_user["profile"].get("profilePhotoURL"), AVATAR_DIR)
@@ -1390,7 +1823,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, serialize_user(current_user))
 
             if method == "DELETE" and parsed.path.startswith("/users/") and parsed.path.endswith("/avatar"):
-                user_id = parsed.path.split("/")[2]
+                user_id = normalized_entity_id(parsed.path.split("/")[2])
                 current_user, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
@@ -1401,7 +1834,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
                     return self.respond(401, {"error": auth_error})
-                if current_user["id"] != user_id:
+                if not ids_equal(current_user["id"], user_id):
                     return self.respond(403, {"error": "delete_not_allowed"})
 
                 remove_file_for_url(current_user["profile"].get("profilePhotoURL"), AVATAR_DIR)
@@ -1432,7 +1865,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(401, {"error": auth_error})
 
                 current_user_id = current_user["id"]
-                other_user_id = payload_string(
+                other_user_id = normalized_entity_id(payload_string(
                     payload,
                     "other_user_id",
                     "otherUserID",
@@ -1442,7 +1875,7 @@ class Handler(BaseHTTPRequestHandler):
                     "peerID",
                     "target_user_id",
                     "targetUserID"
-                ) or ""
+                ) or "")
                 mode = (
                     payload_string(payload, "mode", "chat_mode", "chatMode")
                     or "online"
@@ -1450,7 +1883,7 @@ class Handler(BaseHTTPRequestHandler):
                 other_user = find_user(database, other_user_id)
                 if not other_user:
                     return self.respond(404, {"error": "user_not_found"})
-                if current_user_id == other_user_id:
+                if ids_equal(current_user_id, other_user_id):
                     return self.respond(409, {"error": "invalid_direct_chat"})
                 cached_title = resolved_user_display_name(other_user) or other_user["profile"]["username"] or "Missing User"
                 cached_subtitle = f"@{other_user['profile']['username']}"
@@ -1459,7 +1892,7 @@ class Handler(BaseHTTPRequestHandler):
                     (
                         chat for chat in database["chats"]
                         if chat["type"] == "direct"
-                        and set(chat["participantIDs"]) == {current_user_id, other_user_id}
+                        and set(unique_entity_ids(chat.get("participantIDs") or [])) == {current_user_id, other_user_id}
                         and chat["mode"] == mode
                     ),
                     None
@@ -1498,7 +1931,11 @@ class Handler(BaseHTTPRequestHandler):
 
                 owner_id = current_user["id"]
                 title = str(payload.get("title", "")).strip() or "New Group"
-                member_ids = [member_id for member_id in payload.get("member_ids", []) if str(member_id).strip()]
+                member_ids = [
+                    normalized_entity_id(member_id)
+                    for member_id in payload.get("member_ids", [])
+                    if normalized_entity_id(member_id)
+                ]
                 mode = str(payload.get("mode", "online")).strip()
 
                 participant_ids = [owner_id]
@@ -1539,7 +1976,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, serialize_chat(chat, owner_id, database))
 
             if method == "PATCH" and parsed.path.startswith("/chats/") and parsed.path.endswith("/group"):
-                chat_id = parsed.path.split("/")[2]
+                chat_id = normalized_entity_id(parsed.path.split("/")[2])
                 requester, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
@@ -1569,7 +2006,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, serialize_chat(chat, requester_id, database))
 
             if method == "POST" and parsed.path.startswith("/chats/") and parsed.path.endswith("/group/avatar"):
-                chat_id = parsed.path.split("/")[2]
+                chat_id = normalized_entity_id(parsed.path.split("/")[2])
                 requester, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
@@ -1602,7 +2039,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, serialize_chat(chat, requester_id, database))
 
             if method == "DELETE" and parsed.path.startswith("/chats/") and parsed.path.endswith("/group/avatar"):
-                chat_id = parsed.path.split("/")[2]
+                chat_id = normalized_entity_id(parsed.path.split("/")[2])
                 requester, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
@@ -1629,7 +2066,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, serialize_chat(chat, requester_id, database))
 
             if method == "POST" and parsed.path.startswith("/chats/") and parsed.path.endswith("/group/members"):
-                chat_id = parsed.path.split("/")[2]
+                chat_id = normalized_entity_id(parsed.path.split("/")[2])
                 requester, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
@@ -1642,9 +2079,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(401, {"error": auth_error})
                 requester_id = requester["id"]
                 incoming_member_ids = [
-                    str(member_id).strip()
+                    normalized_entity_id(member_id)
                     for member_id in payload.get("member_ids", [])
-                    if str(member_id).strip()
+                    if normalized_entity_id(member_id)
                 ]
 
                 chat = find_chat(database, chat_id)
@@ -1675,7 +2112,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, serialize_chat(chat, requester_id, database))
 
             if method == "POST" and parsed.path.startswith("/chats/") and parsed.path.endswith("/read"):
-                chat_id = parsed.path.split("/")[2]
+                chat_id = normalized_entity_id(parsed.path.split("/")[2])
                 reader, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
@@ -1690,7 +2127,7 @@ class Handler(BaseHTTPRequestHandler):
                 chat = find_chat(database, chat_id)
                 if not chat:
                     return self.respond(404, {"error": "chat_not_found"})
-                if reader["id"] not in (chat.get("participantIDs") or []):
+                if not any(ids_equal(reader["id"], participant_id) for participant_id in (chat.get("participantIDs") or [])):
                     return self.respond(403, {"error": "sender_not_in_chat"})
 
                 did_update = mark_chat_read(chat, database, reader["id"])
@@ -1699,7 +2136,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, {"ok": True})
 
             if method == "POST" and parsed.path == "/messages/send":
-                chat_id = str(payload.get("chat_id", "")).strip()
+                chat_id = normalized_entity_id(payload.get("chat_id"))
                 sender, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
@@ -1716,7 +2153,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not chat:
                     return self.respond(404, {"error": "chat_not_found"})
 
-                if sender_id not in (chat.get("participantIDs") or []):
+                if not any(ids_equal(sender_id, participant_id) for participant_id in (chat.get("participantIDs") or [])):
                     return self.respond(403, {"error": "sender_not_in_chat"})
 
                 sender_display_name = normalized_optional_string(payload.get("sender_display_name")) or resolved_user_display_name(sender)
@@ -1769,7 +2206,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 message = {
                     "id": str(uuid.uuid4()),
-                    "chatID": chat_id,
+                    "chatID": chat["id"],
                     "senderID": sender_id,
                     "senderDisplayName": sender_display_name,
                     "mode": mode,
@@ -1789,8 +2226,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, serialize_message(message, database))
 
             if method == "PATCH" and parsed.path.startswith("/messages/"):
-                message_id = parsed.path.split("/")[2]
-                chat_id = str(payload.get("chat_id", "")).strip()
+                message_id = normalized_entity_id(parsed.path.split("/")[2])
+                chat_id = normalized_entity_id(payload.get("chat_id"))
                 editor, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
@@ -1807,12 +2244,12 @@ class Handler(BaseHTTPRequestHandler):
                 message = find_message(database, message_id)
                 if not message:
                     return self.respond(404, {"error": "message_not_found"})
-                if chat_id and message["chatID"] != chat_id:
+                if chat_id and not ids_equal(message["chatID"], chat_id):
                     return self.respond(404, {"error": "message_not_found"})
                 chat = find_chat(database, message["chatID"])
-                if not chat or editor_id not in (chat.get("participantIDs") or []):
+                if not chat or not any(ids_equal(editor_id, participant_id) for participant_id in (chat.get("participantIDs") or [])):
                     return self.respond(403, {"error": "sender_not_in_chat"})
-                if message["senderID"] != editor_id:
+                if not ids_equal(message["senderID"], editor_id):
                     return self.respond(403, {"error": "edit_not_allowed"})
                 if message.get("deletedForEveryoneAt"):
                     return self.respond(409, {"error": "message_deleted"})
@@ -1827,8 +2264,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, serialize_message(message, database))
 
             if method == "DELETE" and parsed.path.startswith("/messages/"):
-                message_id = parsed.path.split("/")[2]
-                chat_id = str(payload.get("chat_id", "")).strip()
+                message_id = normalized_entity_id(parsed.path.split("/")[2])
+                chat_id = normalized_entity_id(payload.get("chat_id"))
                 requester, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
@@ -1844,12 +2281,12 @@ class Handler(BaseHTTPRequestHandler):
                 message = find_message(database, message_id)
                 if not message:
                     return self.respond(404, {"error": "message_not_found"})
-                if chat_id and message["chatID"] != chat_id:
+                if chat_id and not ids_equal(message["chatID"], chat_id):
                     return self.respond(404, {"error": "message_not_found"})
                 chat = find_chat(database, message["chatID"])
-                if not chat or requester_id not in (chat.get("participantIDs") or []):
+                if not chat or not any(ids_equal(requester_id, participant_id) for participant_id in (chat.get("participantIDs") or [])):
                     return self.respond(403, {"error": "sender_not_in_chat"})
-                if message["senderID"] != requester_id:
+                if not ids_equal(message["senderID"], requester_id):
                     return self.respond(403, {"error": "delete_not_allowed"})
 
                 message["text"] = None
