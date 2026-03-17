@@ -5,6 +5,7 @@ struct AccountsView: View {
     @EnvironmentObject private var appState: AppState
     @State private var statusMessage = ""
     @State private var deletingAccountIDs = Set<UUID>()
+    @State private var pendingAccountAction: User?
     @State private var pendingDeletionAccount: User?
 
     var body: some View {
@@ -40,7 +41,7 @@ struct AccountsView: View {
                 }
                 .onDelete { offsets in
                     for offset in offsets {
-                        pendingDeletionAccount = appState.accounts[offset]
+                        pendingAccountAction = appState.accounts[offset]
                     }
                 }
             }
@@ -60,8 +61,38 @@ struct AccountsView: View {
             }
         }
         .navigationTitle("settings.accounts".localized)
+        .confirmationDialog(
+            "settings.accounts.actions.title".localized,
+            isPresented: Binding(
+                get: { pendingAccountAction != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        pendingAccountAction = nil
+                    }
+                }
+            ),
+            titleVisibility: .visible,
+            presenting: pendingAccountAction
+        ) { account in
+            Button("settings.account.logout".localized, role: .destructive) {
+                appState.removeAccount(account.id)
+                statusMessage = "settings.accounts.logged_out".localized
+                pendingAccountAction = nil
+            }
+
+            Button("settings.accounts.delete_everywhere".localized, role: .destructive) {
+                pendingDeletionAccount = account
+                pendingAccountAction = nil
+            }
+
+            Button("common.cancel".localized, role: .cancel) {
+                pendingAccountAction = nil
+            }
+        } message: { account in
+            Text(String(format: "settings.accounts.actions.message".localized, "@\(account.profile.username)"))
+        }
         .alert(
-            "Delete account everywhere?",
+            "settings.accounts.delete_everywhere".localized,
             isPresented: Binding(
                 get: { pendingDeletionAccount != nil },
                 set: { isPresented in
@@ -72,17 +103,17 @@ struct AccountsView: View {
             ),
             presenting: pendingDeletionAccount
         ) { account in
-            Button("Delete", role: .destructive) {
+            Button("settings.accounts.delete_confirm".localized, role: .destructive) {
                 Task {
                     await deleteAccount(account.id)
                     pendingDeletionAccount = nil
                 }
             }
-            Button("Cancel", role: .cancel) {
+            Button("common.cancel".localized, role: .cancel) {
                 pendingDeletionAccount = nil
             }
         } message: { account in
-            Text("This will fully delete @\(account.profile.username) from Prime Messaging, remove its sessions, and erase its direct chats from the server.")
+            Text(String(format: "settings.accounts.delete_everywhere.message".localized, "@\(account.profile.username)"))
         }
     }
 
@@ -94,9 +125,9 @@ struct AccountsView: View {
         do {
             try await environment.authRepository.deleteAccount(userID: accountID)
             appState.removeAccount(accountID)
-            statusMessage = "Account deleted."
+            statusMessage = "settings.accounts.deleted".localized
         } catch {
-            statusMessage = error.localizedDescription.isEmpty ? "Could not delete account." : error.localizedDescription
+            statusMessage = error.localizedDescription.isEmpty ? "settings.accounts.delete_failed".localized : error.localizedDescription
         }
     }
 }
