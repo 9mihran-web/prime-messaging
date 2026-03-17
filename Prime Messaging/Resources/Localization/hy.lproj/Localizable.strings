@@ -7,7 +7,13 @@
 "home.online.subtitle" = "Ինտերնետ զրույցներ, մեդիա, ներկայություն";
 "home.offline.subtitle" = "Մոտակա Bluetooth-only տարածք";
 "calls.placeholder.title" = "Զանգեր";
-"calls.placeholder.body" = "Բացիր կոնտակտի պրոֆիլը և սեղմիր Call, որպեսզի սկսես հեռախոսային զանգ։";
+"calls.placeholder.body" = "Բացիր կոնտակտի պրոֆիլը և սեղմիր Call։";
+"calls.placeholder.body.idle" = "Սեղմիր Call կոնտակտի պրոֆիլում, որպեսզի բացվի հավելվածի ներսի ինտերնետ-զանգի էկրանը։";
+"calls.placeholder.body.active" = "Վերադարձիր ակտիվ ինտերնետ-զանգին հավելվածի ներսում։";
+"calls.state.calling" = "Զանգը կատարվում է...";
+"calls.state.active" = "Ակտիվ զանգ";
+"calls.state.internet" = "Ինտերնետ-զանգ";
+"calls.state.ended" = "Զանգը ավարտվել է";
 "calls.unavailable.phone" = "Այս օգտատիրոջ հեռախոսահամարը հասանելի չէ։";
 "calls.unavailable.privacy" = "Այս օգտատերը զանգերը թույլ է տալիս միայն պահպանված կոնտակտներից։";
 "calls.unavailable.start" = "Չհաջողվեց սկսել զանգը։";

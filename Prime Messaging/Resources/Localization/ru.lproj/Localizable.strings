@@ -7,7 +7,13 @@
 "home.online.subtitle" = "Интернет-чаты, медиа, присутствие";
 "home.offline.subtitle" = "Пространство рядом по Bluetooth";
 "calls.placeholder.title" = "Звонки";
-"calls.placeholder.body" = "Открой профиль контакта и нажми Call, чтобы начать телефонный звонок.";
+"calls.placeholder.body" = "Открой профиль контакта и нажми Call.";
+"calls.placeholder.body.idle" = "Нажми Call в профиле контакта, чтобы открыть экран интернет-звонка внутри приложения.";
+"calls.placeholder.body.active" = "Вернись к активному интернет-звонку внутри приложения.";
+"calls.state.calling" = "Идёт вызов...";
+"calls.state.active" = "Активный звонок";
+"calls.state.internet" = "Интернет-звонок";
+"calls.state.ended" = "Звонок завершён";
 "calls.unavailable.phone" = "Номер телефона недоступен для этого пользователя.";
 "calls.unavailable.privacy" = "Этот пользователь разрешает звонки только от сохранённых контактов.";
 "calls.unavailable.start" = "Не удалось начать звонок.";

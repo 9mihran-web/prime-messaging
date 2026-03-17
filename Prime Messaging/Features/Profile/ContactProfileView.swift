@@ -4,8 +4,8 @@ struct ContactProfileView: View {
     let user: User
 
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.openURL) private var openURL
     @EnvironmentObject private var appState: AppState
+    @ObservedObject private var internetCallManager = InternetCallManager.shared
     @State private var localContactName = ""
     @State private var isContactAdded = false
     @State private var isSavingContact = false
@@ -255,13 +255,8 @@ struct ContactProfileView: View {
             return
         }
 
-        guard let url = PhoneCallURLBuilder.makeURL(from: visiblePhone) else {
-            callStatusMessage = "calls.unavailable.start".localized
-            return
-        }
-
         callStatusMessage = ""
-        openURL(url)
+        internetCallManager.startOutgoingCall(to: user)
     }
 
     @ViewBuilder

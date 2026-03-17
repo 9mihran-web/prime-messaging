@@ -7,7 +7,13 @@
 "home.online.subtitle" = "Internet chats, media, presence";
 "home.offline.subtitle" = "Nearby Bluetooth-only space";
 "calls.placeholder.title" = "Calls";
-"calls.placeholder.body" = "Open a direct contact profile and tap Call to start a phone call.";
+"calls.placeholder.body" = "Open a direct contact profile and tap Call.";
+"calls.placeholder.body.idle" = "Tap Call inside a contact profile to start an in-app internet call screen.";
+"calls.placeholder.body.active" = "Return to the active in-app internet call.";
+"calls.state.calling" = "Calling...";
+"calls.state.active" = "Active call";
+"calls.state.internet" = "Internet call";
+"calls.state.ended" = "Call ended";
 "calls.unavailable.phone" = "Phone number is not available for this user.";
 "calls.unavailable.privacy" = "This user allows calls only from saved contacts.";
 "calls.unavailable.start" = "Could not start the call.";
