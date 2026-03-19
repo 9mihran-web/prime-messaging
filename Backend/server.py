@@ -1569,7 +1569,8 @@ def serialize_message(message, database):
         "kind": message.get("kind", "text"),
         "text": None if is_deleted else message["text"],
         "attachments": [] if is_deleted else sanitized_attachments(message.get("attachments", [])),
-        "replyToMessageID": None,
+        "replyToMessageID": message.get("replyToMessageID"),
+        "replyPreview": None if is_deleted else sanitized_reply_preview(message.get("replyPreview")),
         "status": message.get("status", "sent"),
         "createdAt": message["createdAt"],
         "editedAt": message.get("editedAt"),
@@ -1599,6 +1600,21 @@ def mark_messages_delivered(chat, database, recipient_id):
         did_update = True
 
     return did_update
+
+
+def sanitized_reply_preview(reply_preview):
+    if not isinstance(reply_preview, dict):
+        return None
+
+    preview_text = normalized_optional_string(reply_preview.get("previewText"))
+    if not preview_text:
+        return None
+
+    return {
+        "senderID": normalized_entity_id(reply_preview.get("senderID")),
+        "senderDisplayName": normalized_optional_string(reply_preview.get("senderDisplayName")),
+        "previewText": preview_text,
+    }
 
 
 def mark_chat_read(chat, database, reader_id):
@@ -3074,6 +3090,17 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(409, {"error": "chat_mode_mismatch"})
 
                 kind = str(payload.get("kind", "text")).strip() or "text"
+                reply_to_message_id = normalized_entity_id(payload.get("reply_to_message_id"))
+                reply_target_message = find_message(database, reply_to_message_id) if reply_to_message_id else None
+                if reply_to_message_id and not reply_target_message:
+                    reply_to_message_id = None
+                reply_preview = sanitized_reply_preview(payload.get("reply_preview"))
+                if reply_to_message_id and not reply_preview and reply_target_message:
+                    reply_preview = {
+                        "senderID": reply_target_message.get("senderID"),
+                        "senderDisplayName": sender_display_name_for(reply_target_message, database),
+                        "previewText": message_preview(reply_target_message),
+                    }
                 attachments = []
                 for attachment in payload.get("attachments", []):
                     file_name = attachment.get("file_name") or "attachment.bin"
@@ -3124,6 +3151,8 @@ class Handler(BaseHTTPRequestHandler):
                     "kind": kind,
                     "text": text,
                     "attachments": attachments,
+                    "replyToMessageID": reply_to_message_id,
+                    "replyPreview": reply_preview,
                     "voiceMessage": voice_message,
                     "status": "sent",
                     "createdAt": now_iso(),
