@@ -1575,7 +1575,7 @@ def serialize_message(message, database):
         "createdAt": message["createdAt"],
         "editedAt": message.get("editedAt"),
         "deletedForEveryoneAt": message.get("deletedForEveryoneAt"),
-        "reactions": [],
+        "reactions": [] if is_deleted else sanitized_reactions(message.get("reactions")),
         "voiceMessage": None if is_deleted else sanitized_voice_message(message.get("voiceMessage")),
         "liveLocation": None,
     }
@@ -1615,6 +1615,33 @@ def sanitized_reply_preview(reply_preview):
         "senderDisplayName": normalized_optional_string(reply_preview.get("senderDisplayName")),
         "previewText": preview_text,
     }
+
+
+def sanitized_reactions(reactions):
+    if not isinstance(reactions, list):
+        return []
+
+    sanitized = []
+    for reaction in reactions:
+        if not isinstance(reaction, dict):
+            continue
+        emoji = normalized_optional_string(reaction.get("emoji"))
+        if not emoji:
+            continue
+
+        user_ids = unique_entity_ids(reaction.get("userIDs") or [])
+        if not user_ids:
+            continue
+
+        sanitized.append(
+            {
+                "id": normalized_entity_id(reaction.get("id")) or str(uuid.uuid4()),
+                "emoji": emoji,
+                "userIDs": user_ids,
+            }
+        )
+
+    return sanitized
 
 
 def mark_chat_read(chat, database, reader_id):
@@ -3158,11 +3185,76 @@ class Handler(BaseHTTPRequestHandler):
                     "createdAt": now_iso(),
                     "editedAt": None,
                     "deletedForEveryoneAt": None,
+                    "reactions": [],
                 }
                 backfill_group_member_snapshots(chat, database)
                 database["messages"].append(message)
                 save_db(database)
                 log_push_dispatch_attempt(database, chat, message)
+                return self.respond(200, serialize_message(message, database))
+
+            if method == "POST" and parsed.path.startswith("/messages/") and parsed.path.endswith("/reactions"):
+                message_id = normalized_entity_id(parsed.path.split("/")[2])
+                chat_id = normalized_entity_id(payload.get("chat_id"))
+                requester, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload.get("user_id"),
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+                requester_id = requester["id"]
+                emoji = normalized_optional_string(payload.get("emoji"))
+
+                if not emoji:
+                    return self.respond(409, {"error": "empty_message"})
+
+                message = find_message(database, message_id)
+                if not message:
+                    return self.respond(404, {"error": "message_not_found"})
+                if chat_id and not ids_equal(message["chatID"], chat_id):
+                    return self.respond(404, {"error": "message_not_found"})
+                chat = find_chat(database, message["chatID"])
+                if not chat or not any(ids_equal(requester_id, participant_id) for participant_id in (chat.get("participantIDs") or [])):
+                    return self.respond(403, {"error": "sender_not_in_chat"})
+                if message.get("deletedForEveryoneAt"):
+                    return self.respond(409, {"error": "message_deleted"})
+
+                reactions = message.setdefault("reactions", [])
+                target_reaction = next(
+                    (reaction for reaction in reactions if normalized_optional_string(reaction.get("emoji")) == emoji),
+                    None,
+                )
+
+                if target_reaction:
+                    existing_user_ids = unique_entity_ids(target_reaction.get("userIDs") or [])
+                    user_ids = [
+                        reaction_user_id
+                        for reaction_user_id in existing_user_ids
+                        if not ids_equal(reaction_user_id, requester_id)
+                    ]
+                    if len(user_ids) == len(existing_user_ids):
+                        user_ids.append(requester_id)
+                    target_reaction["userIDs"] = user_ids
+                    if not user_ids:
+                        reactions[:] = [
+                            reaction
+                            for reaction in reactions
+                            if normalized_optional_string(reaction.get("emoji")) != emoji
+                        ]
+                else:
+                    reactions.append(
+                        {
+                            "id": str(uuid.uuid4()),
+                            "emoji": emoji,
+                            "userIDs": [requester_id],
+                        }
+                    )
+
+                save_db(database)
                 return self.respond(200, serialize_message(message, database))
 
             if method == "PATCH" and parsed.path.startswith("/messages/"):
