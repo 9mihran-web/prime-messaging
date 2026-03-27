@@ -1258,6 +1258,7 @@ def leave_group(chat, requester_id):
 
 
 def delete_user_account(database, user_id):
+    user_id = normalized_entity_id(user_id)
     user = find_user(database, user_id)
     if not user:
         return False
@@ -1282,51 +1283,143 @@ def delete_user_account(database, user_id):
 
     deleted_chat_ids = set()
     for chat in list(database.get("chats", [])):
-        if not any(ids_equal(participant_id, user_id) for participant_id in (chat.get("participantIDs") or [])):
-            continue
+        chat_id = normalized_entity_id(chat.get("id"))
+        participant_ids = unique_entity_ids(chat.get("participantIDs") or [])
+        is_participant = any(ids_equal(participant_id, user_id) for participant_id in participant_ids)
 
-        if chat.get("type") in ("selfChat", "direct"):
-            deleted_chat_ids.add(normalized_entity_id(chat.get("id")))
-            continue
+        guest_request = chat.get("guestRequest")
+        if isinstance(guest_request, dict) and (
+            ids_equal(guest_request.get("requesterUserID"), user_id)
+            or ids_equal(guest_request.get("recipientUserID"), user_id)
+        ):
+            chat["guestRequest"] = None
 
-        if chat.get("type") == "group":
-            group = chat.get("group") or {}
-            if ids_equal(group.get("ownerID"), user_id):
-                remaining_members = [
+        if not is_participant:
+            if chat.get("type") == "group":
+                group = chat.get("group") or {}
+                filtered_members = [
                     member
                     for member in (group.get("members") or [])
                     if not ids_equal(member.get("userID"), user_id)
                 ]
-                if not remaining_members:
-                    deleted_chat_ids.add(normalized_entity_id(chat.get("id")))
-                    continue
+                if len(filtered_members) != len(group.get("members") or []):
+                    group["members"] = filtered_members
+                    chat["cachedSubtitle"] = f"{len(filtered_members)} members"
+            continue
 
-                new_owner_id = normalized_entity_id(remaining_members[0].get("userID"))
-                group["ownerID"] = new_owner_id
-                for member in remaining_members:
-                    member["role"] = "owner" if ids_equal(member.get("userID"), new_owner_id) else (
-                        "admin" if member.get("role") == "admin" else "member"
-                    )
-                group["members"] = remaining_members
-                chat["participantIDs"] = unique_entity_ids(
-                    participant_id
-                    for participant_id in (chat.get("participantIDs") or [])
-                    if not ids_equal(participant_id, user_id)
-                )
-                chat["cachedSubtitle"] = f"{len(group['members'])} members"
+        if chat.get("type") in ("selfChat", "direct"):
+            if chat_id:
+                deleted_chat_ids.add(chat_id)
+            continue
+
+        if chat.get("type") == "group":
+            group = chat.get("group") or {}
+            remaining_members = [
+                member
+                for member in (group.get("members") or [])
+                if not ids_equal(member.get("userID"), user_id)
+            ]
+
+            if not remaining_members:
+                if chat_id:
+                    deleted_chat_ids.add(chat_id)
                 continue
 
-            remove_group_member(chat, user_id)
+            if ids_equal(group.get("ownerID"), user_id):
+                new_owner_id = normalized_entity_id(remaining_members[0].get("userID"))
+                group["ownerID"] = new_owner_id
+            else:
+                new_owner_id = normalized_entity_id(group.get("ownerID"))
+
+            for member in remaining_members:
+                member_user_id = normalized_entity_id(member.get("userID"))
+                member["role"] = "owner" if ids_equal(member_user_id, new_owner_id) else (
+                    "admin" if member.get("role") == "admin" else "member"
+                )
+
+            group["members"] = remaining_members
+            chat["participantIDs"] = unique_entity_ids(
+                participant_id
+                for participant_id in participant_ids
+                if not ids_equal(participant_id, user_id)
+            )
+
+            if len(chat["participantIDs"]) == 0:
+                if chat_id:
+                    deleted_chat_ids.add(chat_id)
+                continue
+
+            chat["cachedSubtitle"] = f"{len(group['members'])} members"
+
+    removed_message_ids = set()
+    retained_messages = []
+    for message in database.get("messages", []):
+        message_id = normalized_entity_id(message.get("id"))
+        chat_id = normalized_entity_id(message.get("chatID"))
+        sender_id = normalized_entity_id(message.get("senderID"))
+
+        if chat_id in deleted_chat_ids or ids_equal(sender_id, user_id):
+            if message_id:
+                removed_message_ids.add(message_id)
+            remove_message_media_files(message)
+            continue
+
+        sanitized_reaction_entries = []
+        for reaction in message.get("reactions") or []:
+            if not isinstance(reaction, dict):
+                continue
+            remaining_user_ids = [
+                reaction_user_id
+                for reaction_user_id in unique_entity_ids(reaction.get("userIDs") or [])
+                if not ids_equal(reaction_user_id, user_id)
+            ]
+            if not remaining_user_ids:
+                continue
+            updated_reaction = dict(reaction)
+            updated_reaction["userIDs"] = remaining_user_ids
+            sanitized_reaction_entries.append(updated_reaction)
+        message["reactions"] = sanitized_reaction_entries
+
+        retained_messages.append(message)
+
+    for message in retained_messages:
+        if normalized_entity_id(message.get("replyToMessageID")) in removed_message_ids:
+            message["replyToMessageID"] = None
+            message["replyPreview"] = None
+            continue
+
+        reply_preview = message.get("replyPreview")
+        if isinstance(reply_preview, dict) and ids_equal(reply_preview.get("senderID"), user_id):
+            message["replyPreview"] = None
 
     database["chats"] = [
         chat
         for chat in database.get("chats", [])
         if normalized_entity_id(chat.get("id")) not in deleted_chat_ids
     ]
-    database["messages"] = [
-        message
-        for message in database.get("messages", [])
-        if normalized_entity_id(message.get("chatID")) not in deleted_chat_ids
+    database["messages"] = retained_messages
+
+    deleted_call_ids = set()
+    retained_calls = []
+    for call in database.get("calls", []):
+        call_id = normalized_entity_id(call.get("id"))
+        call_chat_id = normalized_entity_id(call.get("chatID"))
+        if (
+            ids_equal(call.get("callerID"), user_id)
+            or ids_equal(call.get("calleeID"), user_id)
+            or call_chat_id in deleted_chat_ids
+        ):
+            if call_id:
+                deleted_call_ids.add(call_id)
+            continue
+        retained_calls.append(call)
+    database["calls"] = retained_calls
+
+    database["callEvents"] = [
+        event
+        for event in database.get("callEvents", [])
+        if not ids_equal(event.get("senderID"), user_id)
+        and normalized_entity_id(event.get("callID")) not in deleted_call_ids
     ]
 
     return True
@@ -1460,6 +1553,17 @@ def remove_file_for_url(file_url, directory):
     target_path = os.path.join(directory, basename)
     if os.path.exists(target_path):
         os.remove(target_path)
+
+
+def remove_message_media_files(message):
+    for attachment in message.get("attachments") or []:
+        if not isinstance(attachment, dict):
+            continue
+        remove_file_for_url(attachment.get("remoteURL"), MEDIA_DIR)
+
+    voice_message = message.get("voiceMessage")
+    if isinstance(voice_message, dict):
+        remove_file_for_url(voice_message.get("remoteFileURL"), MEDIA_DIR)
 
 
 def save_base64_blob(directory, file_name, encoded_data):
