@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import base64
 import hashlib
+import hmac
 import json
 import os
 import threading
@@ -27,6 +28,10 @@ ACCESS_TOKEN_TTL_SECONDS = 60 * 60
 REFRESH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30
 SESSION_ACTIVITY_TOUCH_INTERVAL_SECONDS = 15
 PRESENCE_ONLINE_WINDOW_SECONDS = 45
+ADMIN_LOGIN = (os.environ.get("PRIME_MESSAGING_ADMIN_LOGIN", "admin") or "admin").strip().lower()
+ADMIN_PASSWORD = os.environ.get("PRIME_MESSAGING_ADMIN_PASSWORD", "Prime-admin-very-secret-2026").strip()
+ADMIN_TOKEN = os.environ.get("PRIME_MESSAGING_ADMIN_TOKEN", "").strip()
+ADMIN_USERNAME = (os.environ.get("PRIME_MESSAGING_ADMIN_USERNAME", "mihran") or "mihran").strip().lower()
 
 
 def log_event(name, **fields):
@@ -44,6 +49,17 @@ def now_iso():
 
 def expires_at_iso(seconds):
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+
+
+def normalize_username(value):
+    lowered = (value or "").strip().lower()
+    if lowered.startswith("@"):
+        lowered = lowered[1:]
+    return "".join(
+        character
+        for character in lowered
+        if character.isascii() and (character.isalnum() or character == "_")
+    )[:32]
 
 
 def ensure_storage():
@@ -802,6 +818,46 @@ def is_legacy_placeholder_user(user):
     )
 
 
+def is_admin_account(user):
+    profile = (user or {}).get("profile") or {}
+    return normalize_username(profile.get("username")) == normalize_username(ADMIN_USERNAME)
+
+
+def admin_request_error(database, headers):
+    provided_login = normalized_optional_string(headers.get("X-Prime-Admin-Login")) or ""
+    provided_password = (headers.get("X-Prime-Admin-Password") or "").strip()
+    provided_token = (headers.get("X-Prime-Admin-Token") or "").strip()
+
+    if ADMIN_LOGIN and ADMIN_PASSWORD:
+        if not provided_login or not provided_password:
+            if ADMIN_TOKEN and provided_token:
+                if not hmac.compare_digest(provided_token, ADMIN_TOKEN):
+                    return "admin_forbidden"
+            else:
+                return "admin_credentials_required"
+        else:
+            if provided_login.lower() != ADMIN_LOGIN:
+                return "admin_forbidden"
+            if not hmac.compare_digest(provided_password, ADMIN_PASSWORD):
+                return "admin_forbidden"
+    elif ADMIN_TOKEN:
+        if not provided_token:
+            return "admin_token_required"
+        if not hmac.compare_digest(provided_token, ADMIN_TOKEN):
+            return "admin_forbidden"
+    else:
+        return "admin_not_configured"
+
+    admin_user, _, auth_error = authenticated_user(database, headers)
+    if auth_error:
+        return "admin_auth_required"
+
+    if not is_admin_account(admin_user):
+        return "admin_account_required"
+
+    return None
+
+
 def payload_string(payload, *keys):
     for key in keys:
         value = normalized_optional_string(payload.get(key))
@@ -1274,6 +1330,88 @@ def delete_user_account(database, user_id):
     ]
 
     return True
+
+
+def ban_user_account(database, user_id, duration_days):
+    user = find_user(database, user_id)
+    if not user:
+        return False
+
+    user["bannedUntil"] = expires_at_iso(max(duration_days, 1) * 24 * 60 * 60)
+    database["sessions"] = [
+        session
+        for session in database.get("sessions", [])
+        if not ids_equal(session.get("userID"), user_id)
+    ]
+    return True
+
+
+def bulk_delete_users(database, user_ids):
+    removed_count = 0
+    skipped_count = 0
+
+    for user_id in unique_entity_ids(user_ids):
+        target_user = find_user(database, user_id)
+        if not target_user:
+            skipped_count += 1
+            continue
+        if is_admin_account(target_user):
+            skipped_count += 1
+            continue
+        if delete_user_account(database, user_id):
+            removed_count += 1
+        else:
+            skipped_count += 1
+
+    return removed_count, skipped_count
+
+
+def admin_summary_payload(database):
+    legacy_user_count = sum(1 for user in database.get("users", []) if is_legacy_placeholder_user(user))
+    return {
+        "users": len(database.get("users", [])),
+        "legacyUsers": legacy_user_count,
+        "chats": len(database.get("chats", [])),
+        "messages": len(database.get("messages", [])),
+        "sessions": len(database.get("sessions", [])),
+        "deviceTokens": len(database.get("deviceTokens", [])),
+    }
+
+
+def admin_user_payload(database, user):
+    profile = user.get("profile") or {}
+    user_id = normalized_entity_id(user.get("id"))
+    chat_count = sum(
+        1
+        for chat in database.get("chats", [])
+        if any(ids_equal(participant_id, user_id) for participant_id in (chat.get("participantIDs") or []))
+    )
+    sent_message_count = sum(
+        1
+        for message in database.get("messages", [])
+        if ids_equal(message.get("senderID"), user_id)
+    )
+    session_count = sum(
+        1
+        for session in database.get("sessions", [])
+        if ids_equal(session.get("userID"), user_id)
+    )
+
+    return {
+        "id": user.get("id"),
+        "displayName": profile.get("displayName") or "",
+        "username": profile.get("username") or "",
+        "email": profile.get("email"),
+        "phoneNumber": profile.get("phoneNumber"),
+        "accountKind": user.get("accountKind") or "standard",
+        "createdAt": user.get("createdAt") or now_iso(),
+        "guestExpiresAt": user.get("guestExpiresAt"),
+        "bannedUntil": user.get("bannedUntil"),
+        "isLegacyPlaceholder": is_legacy_placeholder_user(user),
+        "chatCount": chat_count,
+        "sentMessageCount": sent_message_count,
+        "sessionCount": session_count,
+    }
 
 
 def group_member_payload(database, member_id, role):
@@ -1935,6 +2073,84 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             database = load_db()
 
+            if parsed.path == "/admin/summary":
+                admin_error = admin_request_error(database, self.headers)
+                if admin_error:
+                    return self.respond(401 if admin_error in {"admin_not_configured", "admin_token_required", "admin_credentials_required", "admin_auth_required"} else 403, {"error": admin_error})
+                return self.respond(200, admin_summary_payload(database))
+
+            if parsed.path == "/admin/users":
+                admin_error = admin_request_error(database, self.headers)
+                if admin_error:
+                    return self.respond(401 if admin_error in {"admin_not_configured", "admin_token_required", "admin_credentials_required", "admin_auth_required"} else 403, {"error": admin_error})
+
+                params = parse_qs(parsed.query)
+                query = (params.get("query") or [""])[0].strip().lower()
+                placeholders_only = (params.get("placeholders_only") or ["0"])[0].strip().lower() in {"1", "true", "yes"}
+
+                users = []
+                for user in database.get("users", []):
+                    if placeholders_only and not is_legacy_placeholder_user(user):
+                        continue
+
+                    profile = user.get("profile") or {}
+                    if query and not (
+                        query in (profile.get("username") or "").lower()
+                        or query in (profile.get("displayName") or "").lower()
+                        or query in (profile.get("email") or "").lower()
+                        or query in (profile.get("phoneNumber") or "").lower()
+                    ):
+                        continue
+
+                    users.append(admin_user_payload(database, user))
+
+                users.sort(key=lambda item: ((not item["isLegacyPlaceholder"]), item["createdAt"], item["username"]))
+                return self.respond(200, users)
+
+            if parsed.path == "/admin/chats":
+                admin_error = admin_request_error(database, self.headers)
+                if admin_error:
+                    return self.respond(401 if admin_error in {"admin_not_configured", "admin_token_required", "admin_credentials_required", "admin_auth_required"} else 403, {"error": admin_error})
+
+                params = parse_qs(parsed.query)
+                user_id = normalized_entity_id((params.get("user_id") or [""])[0].strip())
+                user = find_user(database, user_id)
+                if not user:
+                    return self.respond(404, {"error": "user_not_found"})
+
+                chats = []
+                for chat in database.get("chats", []):
+                    if any(ids_equal(participant_id, user_id) for participant_id in (chat.get("participantIDs") or [])):
+                        chats.append(serialize_chat(chat, user_id, database))
+
+                chats.sort(key=lambda item: item.get("lastActivityAt") or "", reverse=True)
+                return self.respond(200, chats)
+
+            if parsed.path == "/admin/messages":
+                admin_error = admin_request_error(database, self.headers)
+                if admin_error:
+                    return self.respond(401 if admin_error in {"admin_not_configured", "admin_token_required", "admin_credentials_required", "admin_auth_required"} else 403, {"error": admin_error})
+
+                params = parse_qs(parsed.query)
+                chat_id = normalized_entity_id((params.get("chat_id") or [""])[0].strip())
+                chat = find_chat(database, chat_id)
+                if not chat:
+                    return self.respond(404, {"error": "chat_not_found"})
+
+                messages = [
+                    serialize_message(message, database)
+                    for message in database.get("messages", [])
+                    if ids_equal(message.get("chatID"), chat_id)
+                ]
+                messages.sort(key=lambda item: item.get("createdAt") or "")
+
+                participant_ids = unique_entity_ids(chat.get("participantIDs") or [])
+                viewer_id = participant_ids[0] if participant_ids else None
+                return self.respond(200, {
+                    "chat": serialize_chat(chat, viewer_id, database) if viewer_id else None,
+                    "messages": messages,
+                })
+
             if parsed.path == "/auth/me":
                 user, _, auth_error = authenticated_user(database, self.headers)
                 if auth_error == "user_not_found":
@@ -2197,6 +2413,65 @@ class Handler(BaseHTTPRequestHandler):
 
         with LOCK:
             database = load_db()
+
+            if method == "POST" and parsed.path == "/admin/users/bulk-delete":
+                admin_error = admin_request_error(database, self.headers)
+                if admin_error:
+                    return self.respond(401 if admin_error in {"admin_not_configured", "admin_token_required", "admin_credentials_required", "admin_auth_required"} else 403, {"error": admin_error})
+
+                user_ids = payload.get("user_ids") or payload.get("userIDs") or []
+                if not isinstance(user_ids, list):
+                    user_ids = []
+
+                removed_count, skipped_count = bulk_delete_users(database, user_ids)
+                save_db(database)
+                return self.respond(200, {"ok": True, "removed": removed_count, "skipped": skipped_count})
+
+            if method == "POST" and parsed.path.startswith("/admin/users/") and parsed.path.endswith("/ban"):
+                admin_error = admin_request_error(database, self.headers)
+                if admin_error:
+                    return self.respond(401 if admin_error in {"admin_not_configured", "admin_token_required", "admin_credentials_required", "admin_auth_required"} else 403, {"error": admin_error})
+
+                path_parts = parsed.path.split("/")
+                user_id = normalized_entity_id(path_parts[3] if len(path_parts) > 3 else None)
+                if not user_id:
+                    return self.respond(404, {"error": "user_not_found"})
+
+                target_user = find_user(database, user_id)
+                if not target_user:
+                    return self.respond(404, {"error": "user_not_found"})
+                if is_admin_account(target_user):
+                    return self.respond(403, {"error": "admin_account_protected"})
+
+                try:
+                    duration_days = int(payload.get("duration_days") or payload.get("durationDays") or 0)
+                except (TypeError, ValueError):
+                    duration_days = 0
+                if duration_days <= 0:
+                    return self.respond(409, {"error": "invalid_ban_duration"})
+
+                ban_user_account(database, user_id, duration_days)
+                save_db(database)
+                return self.respond(200, {"ok": True, "bannedUntil": target_user.get("bannedUntil")})
+
+            if method == "DELETE" and parsed.path.startswith("/admin/users/"):
+                admin_error = admin_request_error(database, self.headers)
+                if admin_error:
+                    return self.respond(401 if admin_error in {"admin_not_configured", "admin_token_required", "admin_credentials_required", "admin_auth_required"} else 403, {"error": admin_error})
+
+                user_id = normalized_entity_id(parsed.path.split("/")[3] if len(parsed.path.split("/")) > 3 else None)
+                if not user_id:
+                    return self.respond(404, {"error": "user_not_found"})
+
+                target_user = find_user(database, user_id)
+                if target_user and is_admin_account(target_user):
+                    return self.respond(403, {"error": "admin_account_protected"})
+
+                if delete_user_account(database, user_id) is False:
+                    return self.respond(404, {"error": "user_not_found"})
+
+                save_db(database)
+                return self.respond(200, {"ok": True})
 
             if method == "POST" and parsed.path == "/auth/signup":
                 username = str(payload.get("username", "")).strip().lower()
