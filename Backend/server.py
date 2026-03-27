@@ -1190,6 +1190,17 @@ def remove_group_member(chat, member_user_id):
     return previous_member_count != len(group["members"]) or previous_participant_count != len(chat["participantIDs"])
 
 
+def leave_group(chat, requester_id):
+    if not chat or chat.get("type") != "group":
+        return False
+
+    group = chat.get("group") or {}
+    if ids_equal(group.get("ownerID"), requester_id):
+        return False
+
+    return remove_group_member(chat, requester_id)
+
+
 def delete_user_account(database, user_id):
     user = find_user(database, user_id)
     if not user:
@@ -3064,6 +3075,33 @@ class Handler(BaseHTTPRequestHandler):
 
                 save_db(database)
                 return self.respond(200, serialize_chat(chat, requester_id, database))
+
+            if method == "POST" and parsed.path.startswith("/chats/") and parsed.path.endswith("/group/leave"):
+                chat_id = normalized_entity_id(parsed.path.split("/")[2])
+                requester, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload.get("requester_id"),
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+                requester_id = requester["id"]
+
+                chat = find_chat(database, chat_id)
+                if not chat:
+                    return self.respond(404, {"error": "chat_not_found"})
+                if chat.get("type") != "group":
+                    return self.respond(409, {"error": "invalid_group_chat"})
+                if find_group_member(chat, requester_id) is None:
+                    return self.respond(403, {"error": "sender_not_in_chat"})
+                if leave_group(chat, requester_id) is False:
+                    return self.respond(409, {"error": "invalid_group_operation"})
+
+                save_db(database)
+                return self.respond(200, {"ok": True})
 
             if method == "POST" and parsed.path.startswith("/chats/") and parsed.path.endswith("/read"):
                 chat_id = normalized_entity_id(parsed.path.split("/")[2])
