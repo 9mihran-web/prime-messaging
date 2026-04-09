@@ -74,7 +74,13 @@ def log_event(name, **fields):
 
 
 class APNsProvider:
-    INVALID_TOKEN_REASONS = {"BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic"}
+    INVALID_TOKEN_REASONS = {
+        "BadDeviceToken",
+        "Unregistered",
+        "DeviceTokenNotForTopic",
+        "BadEnvironmentKeyInToken",
+        "BadCertificateEnvironment",
+    }
 
     def __init__(
         self,
@@ -3614,6 +3620,7 @@ def dispatch_apns_notifications(dispatch_kind, device_tokens, payload, context):
     token_suffixes = []
     used_environments = set()
     attempt_details = []
+    reason_counts = {}
 
     for entry in device_tokens:
         if not is_ios_apns_target(entry):
@@ -3648,6 +3655,7 @@ def dispatch_apns_notifications(dispatch_kind, device_tokens, payload, context):
 
         failure_count += 1
         reason = result.get("reason") or "unknown"
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
         if reason in APNS_PROVIDER.INVALID_TOKEN_REASONS:
             invalid_tokens.append(token)
         log_event(
@@ -3688,6 +3696,7 @@ def dispatch_apns_notifications(dispatch_kind, device_tokens, payload, context):
         target_count=len(token_suffixes),
         success_count=success_count,
         failure_count=failure_count,
+        reason_counts=reason_counts,
         attempts=attempt_details,
         token_suffixes=token_suffixes,
         **context,
