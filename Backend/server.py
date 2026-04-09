@@ -75,7 +75,12 @@ def log_event(name, **fields):
 
 class APNsProvider:
     INVALID_TOKEN_REASONS = {"BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic"}
-    RETRYABLE_ENVIRONMENT_REASONS = {"BadDeviceToken", "DeviceTokenNotForTopic"}
+    RETRYABLE_ENVIRONMENT_REASONS = {
+        "BadDeviceToken",
+        "DeviceTokenNotForTopic",
+        "BadEnvironmentKeyInToken",
+        "BadCertificateEnvironment",
+    }
 
     def __init__(
         self,
