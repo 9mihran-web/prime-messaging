@@ -75,12 +75,6 @@ def log_event(name, **fields):
 
 class APNsProvider:
     INVALID_TOKEN_REASONS = {"BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic"}
-    RETRYABLE_ENVIRONMENT_REASONS = {
-        "BadDeviceToken",
-        "DeviceTokenNotForTopic",
-        "BadEnvironmentKeyInToken",
-        "BadCertificateEnvironment",
-    }
 
     def __init__(
         self,
@@ -193,6 +187,7 @@ class APNsProvider:
             "reason": "unknown",
             "apns_id": None,
             "environment": None,
+            "attempts": [],
         }
 
         for index, environment in enumerate(self.environments_to_try()):
@@ -207,6 +202,13 @@ class APNsProvider:
                     "reason": f"transport_error:{type(error).__name__}",
                     "apns_id": None,
                     "environment": environment,
+                    "attempts": [
+                        {
+                            "environment": environment,
+                            "status": None,
+                            "reason": f"transport_error:{type(error).__name__}",
+                        }
+                    ],
                 }
 
             response_reason = f"http_{response.status_code}"
@@ -224,20 +226,32 @@ class APNsProvider:
                     "reason": None,
                     "apns_id": response.headers.get("apns-id"),
                     "environment": environment,
+                    "attempts": last_result.get("attempts", [])
+                    + [
+                        {
+                            "environment": environment,
+                            "status": 200,
+                            "reason": None,
+                        }
+                    ],
                 }
 
+            attempt_entry = {
+                "environment": environment,
+                "status": response.status_code,
+                "reason": response_reason,
+            }
+            attempts = last_result.get("attempts", []) + [attempt_entry]
             last_result = {
                 "ok": False,
                 "status": response.status_code,
                 "reason": response_reason,
                 "apns_id": response.headers.get("apns-id"),
                 "environment": environment,
+                "attempts": attempts,
             }
 
-            should_retry_other_environment = (
-                index == 0
-                and response_reason in self.RETRYABLE_ENVIRONMENT_REASONS
-            )
+            should_retry_other_environment = index == 0
             if not should_retry_other_environment:
                 break
 
@@ -3599,6 +3613,7 @@ def dispatch_apns_notifications(dispatch_kind, device_tokens, payload, context):
     invalid_tokens = []
     token_suffixes = []
     used_environments = set()
+    attempt_details = []
 
     for entry in device_tokens:
         if not is_ios_apns_target(entry):
@@ -3617,6 +3632,13 @@ def dispatch_apns_notifications(dispatch_kind, device_tokens, payload, context):
             else apns_payload_for_call(payload)
         )
         result = APNS_PROVIDER.send_notification(token, apns_payload, push_type="alert")
+        attempt_details.append(
+            {
+                "token_suffix": token_suffix,
+                "attempts": result.get("attempts"),
+                "ok": result.get("ok"),
+            }
+        )
         environment_used = result.get("environment")
         if environment_used:
             used_environments.add(environment_used)
@@ -3634,6 +3656,7 @@ def dispatch_apns_notifications(dispatch_kind, device_tokens, payload, context):
             status=result.get("status"),
             apns_id=result.get("apns_id"),
             environment=environment_used,
+            attempts=result.get("attempts"),
             token_suffix=token_suffix,
             **context,
         )
@@ -3665,6 +3688,7 @@ def dispatch_apns_notifications(dispatch_kind, device_tokens, payload, context):
         target_count=len(token_suffixes),
         success_count=success_count,
         failure_count=failure_count,
+        attempts=attempt_details,
         token_suffixes=token_suffixes,
         **context,
     )
