@@ -6,7 +6,6 @@ COPY Backend/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY Backend/server.py /app/server.py
-
 RUN mkdir -p /app/data/avatars
 
 ENV PRIME_MESSAGING_HOST=0.0.0.0
