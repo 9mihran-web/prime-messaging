@@ -78,8 +78,6 @@ class APNsProvider:
         "BadDeviceToken",
         "Unregistered",
         "DeviceTokenNotForTopic",
-        "BadEnvironmentKeyInToken",
-        "BadCertificateEnvironment",
     }
 
     def __init__(
@@ -3621,6 +3619,7 @@ def dispatch_apns_notifications(dispatch_kind, device_tokens, payload, context):
     used_environments = set()
     attempt_details = []
     reason_counts = {}
+    environment_mismatch_reasons = {"BadEnvironmentKeyInToken", "BadCertificateEnvironment"}
 
     for entry in device_tokens:
         if not is_ios_apns_target(entry):
@@ -3701,6 +3700,17 @@ def dispatch_apns_notifications(dispatch_kind, device_tokens, payload, context):
         token_suffixes=token_suffixes,
         **context,
     )
+
+    if failure_count > 0 and reason_counts and all(
+        reason in environment_mismatch_reasons for reason in reason_counts
+    ):
+        log_event(
+            f"{dispatch_kind}.dispatch.environment_mismatch",
+            configured_environment=APNS_PROVIDER.environment,
+            topic=APNS_PROVIDER.topic,
+            reason_counts=reason_counts,
+            **context,
+        )
 
 
 def schedule_apns_dispatch(dispatch_kind, device_tokens, payload, context):
