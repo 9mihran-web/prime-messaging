@@ -135,6 +135,26 @@ def parse_call_ice_servers(raw_value):
 CALL_ICE_SERVERS = parse_call_ice_servers(CALL_ICE_SERVERS_RAW)
 
 
+def call_ice_capabilities(ice_servers):
+    has_turn = False
+    has_turns = False
+    for server in ice_servers:
+        urls = server.get("urls") if isinstance(server, dict) else None
+        if not isinstance(urls, list):
+            continue
+        for raw_url in urls:
+            value = (str(raw_url).strip().lower() if raw_url is not None else "")
+            if value.startswith("turn:"):
+                has_turn = True
+            if value.startswith("turns:"):
+                has_turns = True
+    return {
+        "count": len(ice_servers),
+        "hasTurn": has_turn,
+        "hasTurns": has_turns,
+    }
+
+
 def log_event(name, **fields):
     payload = {
         "timestamp": now_iso(),
@@ -4815,6 +4835,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
 
         if parsed.path == "/health":
+            ice_capabilities = call_ice_capabilities(CALL_ICE_SERVERS)
             return self.respond(200, {
                 "status": "ok",
                 "serverBuildID": SERVER_BUILD_ID,
@@ -4826,6 +4847,7 @@ class Handler(BaseHTTPRequestHandler):
                     "push_payload_for_call": callable(globals().get("push_payload_for_call")),
                     "log_call_dispatch_attempt": callable(globals().get("log_call_dispatch_attempt")),
                 },
+                "callIce": ice_capabilities,
                 "mediaStorage": MEDIA_OBJECT_STORAGE.status_payload(),
             })
 
@@ -8159,6 +8181,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     ensure_storage()
+    ice_capabilities = call_ice_capabilities(CALL_ICE_SERVERS)
     log_event(
         "server.startup",
         build_id=SERVER_BUILD_ID,
@@ -8166,6 +8189,9 @@ if __name__ == "__main__":
         code_mtime=SERVER_CODE_MTIME,
         python_version=os.sys.version.split()[0],
         backend_file=os.path.basename(__file__),
+        call_ice_count=ice_capabilities["count"],
+        call_ice_has_turn=ice_capabilities["hasTurn"],
+        call_ice_has_turns=ice_capabilities["hasTurns"],
     )
     key_source = "inline_env" if APNS_KEY_P8 else "path"
     if APNS_PROVIDER.is_configured:
