@@ -24,6 +24,15 @@ try:
 except Exception:
     jwt = None
 
+try:
+    import boto3
+    from botocore.config import Config as BotocoreConfig
+    from botocore.exceptions import ClientError
+except Exception:
+    boto3 = None
+    BotocoreConfig = None
+    ClientError = Exception
+
 
 BASE_DIR = os.path.dirname(__file__)
 WEBSITE_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "Website"))
@@ -33,6 +42,12 @@ AVATAR_DIR = os.path.join(DATA_DIR, "avatars")
 MEDIA_DIR = os.path.join(DATA_DIR, "media")
 HOST = os.environ.get("PRIME_MESSAGING_HOST", "0.0.0.0")
 PORT = int(os.environ.get("PRIME_MESSAGING_PORT") or os.environ.get("PORT", "8080"))
+SERVER_BUILD_ID = (os.environ.get("PRIME_MESSAGING_SERVER_BUILD_ID", "") or "").strip() or "unset"
+SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat()
+try:
+    SERVER_CODE_MTIME = datetime.fromtimestamp(os.path.getmtime(__file__), tz=timezone.utc).isoformat()
+except Exception:
+    SERVER_CODE_MTIME = None
 RAILWAY_PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
 PUBLIC_BASE_URL = (
     os.environ.get("PRIME_MESSAGING_PUBLIC_BASE_URL", "").strip().rstrip("/")
@@ -54,7 +69,20 @@ APNS_KEY_P8 = os.environ.get("PRIME_MESSAGING_APNS_KEY_P8", "").strip()
 APNS_KEY_ID = os.environ.get("PRIME_MESSAGING_APNS_KEY_ID", "").strip()
 APNS_TEAM_ID = os.environ.get("PRIME_MESSAGING_APNS_TEAM_ID", "").strip()
 APNS_TOPIC = os.environ.get("PRIME_MESSAGING_APNS_TOPIC", "").strip()
+APNS_VOIP_TOPIC = os.environ.get("PRIME_MESSAGING_APNS_VOIP_TOPIC", "").strip()
 APNS_ENVIRONMENT = (os.environ.get("PRIME_MESSAGING_APNS_ENVIRONMENT", "auto") or "auto").strip().lower()
+CALL_ICE_SERVERS_RAW = os.environ.get("PRIME_MESSAGING_CALL_ICE_SERVERS_JSON", "").strip()
+MEDIA_STORAGE_BACKEND = (os.environ.get("PRIME_MESSAGING_MEDIA_STORAGE_BACKEND", "local") or "local").strip().lower()
+MEDIA_S3_BUCKET = os.environ.get("PRIME_MESSAGING_MEDIA_S3_BUCKET", "").strip()
+MEDIA_S3_REGION = os.environ.get("PRIME_MESSAGING_MEDIA_S3_REGION", "").strip()
+MEDIA_S3_ENDPOINT_URL = os.environ.get("PRIME_MESSAGING_MEDIA_S3_ENDPOINT_URL", "").strip()
+MEDIA_S3_ACCESS_KEY_ID = os.environ.get("PRIME_MESSAGING_MEDIA_S3_ACCESS_KEY_ID", "").strip()
+MEDIA_S3_SECRET_ACCESS_KEY = os.environ.get("PRIME_MESSAGING_MEDIA_S3_SECRET_ACCESS_KEY", "").strip()
+MEDIA_S3_PREFIX = (os.environ.get("PRIME_MESSAGING_MEDIA_S3_PREFIX", "media") or "media").strip().strip("/")
+MEDIA_KEEP_LOCAL_COPY = (
+    (os.environ.get("PRIME_MESSAGING_MEDIA_KEEP_LOCAL_COPY", "0") or "0").strip().lower()
+    in {"1", "true", "yes"}
+)
 if APNS_ENVIRONMENT not in {"production", "development", "auto"}:
     APNS_ENVIRONMENT = "auto"
 try:
@@ -62,6 +90,49 @@ try:
 except ValueError:
     APNS_TIMEOUT_SECONDS = 10.0
 APNS_JWT_TTL_SECONDS = 50 * 60
+
+
+def parse_call_ice_servers(raw_value):
+    default_servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
+    if not raw_value:
+        return default_servers
+
+    try:
+        parsed = json.loads(raw_value)
+    except Exception:
+        return default_servers
+
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return default_servers
+
+    normalized_servers = []
+    for server in parsed:
+        if not isinstance(server, dict):
+            continue
+
+        urls = server.get("urls")
+        if isinstance(urls, str):
+            urls = [urls]
+        if not isinstance(urls, list):
+            continue
+        clean_urls = [str(url).strip() for url in urls if str(url).strip()]
+        if not clean_urls:
+            continue
+
+        normalized_servers.append(
+            {
+                "urls": clean_urls,
+                "username": (server.get("username") or "").strip() or None,
+                "credential": (server.get("credential") or "").strip() or None,
+            }
+        )
+
+    return normalized_servers or default_servers
+
+
+CALL_ICE_SERVERS = parse_call_ice_servers(CALL_ICE_SERVERS_RAW)
 
 
 def log_event(name, **fields):
@@ -74,10 +145,12 @@ def log_event(name, **fields):
 
 
 class APNsProvider:
-    INVALID_TOKEN_REASONS = {
+    INVALID_TOKEN_REASONS = {"BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic"}
+    RETRYABLE_ENVIRONMENT_REASONS = {
         "BadDeviceToken",
-        "Unregistered",
         "DeviceTokenNotForTopic",
+        "BadEnvironmentKeyInToken",
+        "BadCertificateEnvironment",
     }
 
     def __init__(
@@ -131,7 +204,7 @@ class APNsProvider:
             return "missing_apns_key_id"
         if not self.team_id:
             return "missing_apns_team_id"
-        if not self.topic:
+        if not self.topic and not APNS_VOIP_TOPIC:
             return "missing_apns_topic"
         if self.key_content:
             self._private_key = self.key_content.replace("\\n", "\n").strip()
@@ -168,7 +241,15 @@ class APNsProvider:
             self._cached_bearer_expiry = now_seconds + APNS_JWT_TTL_SECONDS
             return f"bearer {token}"
 
-    def send_notification(self, device_token, payload, push_type="alert", priority="10"):
+    def send_notification(
+        self,
+        device_token,
+        payload,
+        push_type="alert",
+        priority="10",
+        collapse_id=None,
+        topic_override=None,
+    ):
         if not self.is_configured:
             return {
                 "ok": False,
@@ -179,11 +260,13 @@ class APNsProvider:
 
         request_headers = {
             "authorization": self._authorization_header_value(),
-            "apns-topic": self.topic,
+            "apns-topic": topic_override or self.topic,
             "apns-push-type": push_type,
             "apns-priority": priority,
             "content-type": "application/json",
         }
+        if collapse_id:
+            request_headers["apns-collapse-id"] = str(collapse_id)[:64]
 
         last_result = {
             "ok": False,
@@ -191,7 +274,6 @@ class APNsProvider:
             "reason": "unknown",
             "apns_id": None,
             "environment": None,
-            "attempts": [],
         }
 
         for index, environment in enumerate(self.environments_to_try()):
@@ -206,13 +288,6 @@ class APNsProvider:
                     "reason": f"transport_error:{type(error).__name__}",
                     "apns_id": None,
                     "environment": environment,
-                    "attempts": [
-                        {
-                            "environment": environment,
-                            "status": None,
-                            "reason": f"transport_error:{type(error).__name__}",
-                        }
-                    ],
                 }
 
             response_reason = f"http_{response.status_code}"
@@ -230,32 +305,20 @@ class APNsProvider:
                     "reason": None,
                     "apns_id": response.headers.get("apns-id"),
                     "environment": environment,
-                    "attempts": last_result.get("attempts", [])
-                    + [
-                        {
-                            "environment": environment,
-                            "status": 200,
-                            "reason": None,
-                        }
-                    ],
                 }
 
-            attempt_entry = {
-                "environment": environment,
-                "status": response.status_code,
-                "reason": response_reason,
-            }
-            attempts = last_result.get("attempts", []) + [attempt_entry]
             last_result = {
                 "ok": False,
                 "status": response.status_code,
                 "reason": response_reason,
                 "apns_id": response.headers.get("apns-id"),
                 "environment": environment,
-                "attempts": attempts,
             }
 
-            should_retry_other_environment = index == 0
+            should_retry_other_environment = (
+                index == 0
+                and response_reason in self.RETRYABLE_ENVIRONMENT_REASONS
+            )
             if not should_retry_other_environment:
                 break
 
@@ -271,6 +334,268 @@ APNS_PROVIDER = APNsProvider(
     environment=APNS_ENVIRONMENT,
     timeout_seconds=APNS_TIMEOUT_SECONDS,
 )
+
+
+class MediaObjectStorage:
+    ENABLED_BACKENDS = {"s3", "r2"}
+
+    def __init__(
+        self,
+        backend,
+        bucket,
+        region,
+        endpoint_url,
+        access_key_id,
+        secret_access_key,
+        prefix,
+    ):
+        self.raw_backend = (backend or "local").strip().lower()
+        self.backend = self.raw_backend if self.raw_backend in self.ENABLED_BACKENDS else "local"
+        self.bucket = (bucket or "").strip()
+        self.region = (region or "").strip() or None
+        self.endpoint_url = (endpoint_url or "").strip() or None
+        self.access_key_id = (access_key_id or "").strip() or None
+        self.secret_access_key = (secret_access_key or "").strip() or None
+        self.prefix = (prefix or "media").strip().strip("/")
+        self._client = None
+        self._client_lock = threading.Lock()
+        self.configuration_error = self._load_configuration_error()
+
+    @property
+    def is_enabled(self):
+        return self.backend in self.ENABLED_BACKENDS
+
+    @property
+    def is_configured(self):
+        return self.configuration_error is None
+
+    def _load_configuration_error(self):
+        if not self.is_enabled:
+            return None
+        if boto3 is None:
+            return "missing_dependency_boto3"
+        if not self.bucket:
+            return "missing_media_s3_bucket"
+        if self.backend == "r2" and not self.endpoint_url:
+            return "missing_media_s3_endpoint_url"
+        return None
+
+    def status_payload(self):
+        return {
+            "backend": self.backend,
+            "bucket": self.bucket,
+            "region": self.region,
+            "endpointURL": self.endpoint_url,
+            "prefix": self.prefix,
+            "configured": self.is_configured,
+            "configurationError": self.configuration_error,
+            "keepLocalCopy": MEDIA_KEEP_LOCAL_COPY,
+        }
+
+    def object_key(self, file_name):
+        basename = os.path.basename(file_name or "")
+        if not basename:
+            raise ValueError("invalid_media_file_name")
+        if self.prefix:
+            return f"{self.prefix}/{basename}"
+        return basename
+
+    def _build_client(self):
+        kwargs = {
+            "service_name": "s3",
+        }
+        if self.region:
+            kwargs["region_name"] = self.region
+        if self.endpoint_url:
+            kwargs["endpoint_url"] = self.endpoint_url
+        if self.access_key_id and self.secret_access_key:
+            kwargs["aws_access_key_id"] = self.access_key_id
+            kwargs["aws_secret_access_key"] = self.secret_access_key
+        if BotocoreConfig:
+            kwargs["config"] = BotocoreConfig(
+                signature_version="s3v4",
+                retries={
+                    "max_attempts": 4,
+                    "mode": "standard",
+                },
+            )
+        return boto3.client(**kwargs)
+
+    def client(self):
+        if self.configuration_error:
+            raise RuntimeError(self.configuration_error)
+        with self._client_lock:
+            if self._client is None:
+                self._client = self._build_client()
+            return self._client
+
+    def head_by_name(self, file_name):
+        if not self.is_enabled:
+            return None
+        key = self.object_key(file_name)
+        try:
+            response = self.client().head_object(Bucket=self.bucket, Key=key)
+        except ClientError as error:
+            code = (
+                (error.response or {}).get("Error", {}).get("Code")
+                if hasattr(error, "response")
+                else None
+            )
+            if str(code) in {"404", "NoSuchKey", "NotFound"}:
+                return None
+            raise
+        return {
+            "fileName": os.path.basename(file_name),
+            "byteSize": int(response.get("ContentLength") or 0),
+            "mimeType": normalized_optional_string(response.get("ContentType")),
+            "storageBackend": self.backend,
+            "objectKey": key,
+        }
+
+    def upload_local_file(self, file_name, local_path, mime_type=None, expected_size=None, expected_sha256=None, upload_kind="attachment"):
+        key = self.object_key(file_name)
+        extra_args = {}
+        normalized_mime_type = normalized_optional_string(mime_type)
+        if normalized_mime_type:
+            extra_args["ContentType"] = normalized_mime_type
+
+        log_event(
+            "media.remote.upload.begin",
+            file_name=os.path.basename(file_name),
+            storage_backend=self.backend,
+            bucket=self.bucket,
+            object_key=key,
+            upload_kind=upload_kind,
+            expected_byte_size=expected_size,
+            expected_sha256=expected_sha256,
+        )
+        try:
+            if extra_args:
+                self.client().upload_file(local_path, self.bucket, key, ExtraArgs=extra_args)
+            else:
+                self.client().upload_file(local_path, self.bucket, key)
+        except Exception as error:
+            log_event(
+                "media.remote.upload.failed",
+                file_name=os.path.basename(file_name),
+                storage_backend=self.backend,
+                bucket=self.bucket,
+                object_key=key,
+                upload_kind=upload_kind,
+                error=type(error).__name__,
+            )
+            raise ValueError("media_remote_upload_failed")
+
+        remote_info = self.head_by_name(file_name)
+        if not remote_info:
+            raise ValueError("media_remote_upload_missing_after_write")
+
+        remote_size = int(remote_info.get("byteSize") or 0)
+        if expected_size is not None and remote_size != int(expected_size):
+            log_event(
+                "media.remote.upload.size_mismatch",
+                file_name=os.path.basename(file_name),
+                storage_backend=self.backend,
+                bucket=self.bucket,
+                object_key=key,
+                expected_byte_size=int(expected_size),
+                remote_byte_size=remote_size,
+            )
+            try:
+                self.delete_by_name(file_name)
+            except Exception:
+                pass
+            raise ValueError("media_remote_upload_size_mismatch")
+
+        log_event(
+            "media.remote.upload.complete",
+            file_name=os.path.basename(file_name),
+            storage_backend=self.backend,
+            bucket=self.bucket,
+            object_key=key,
+            upload_kind=upload_kind,
+            byte_size=remote_size,
+            sha256=expected_sha256,
+        )
+        return remote_info
+
+    def delete_by_name(self, file_name):
+        if not self.is_enabled:
+            return
+        key = self.object_key(file_name)
+        try:
+            self.client().delete_object(Bucket=self.bucket, Key=key)
+            log_event(
+                "media.remote.deleted",
+                file_name=os.path.basename(file_name),
+                storage_backend=self.backend,
+                bucket=self.bucket,
+                object_key=key,
+            )
+        except ClientError as error:
+            code = (
+                (error.response or {}).get("Error", {}).get("Code")
+                if hasattr(error, "response")
+                else None
+            )
+            if str(code) in {"404", "NoSuchKey", "NotFound"}:
+                return
+            log_event(
+                "media.remote.delete_failed",
+                file_name=os.path.basename(file_name),
+                storage_backend=self.backend,
+                bucket=self.bucket,
+                object_key=key,
+                error=str(code or type(error).__name__),
+            )
+            raise
+
+    def stream_by_name(self, file_name, start=None, end=None):
+        key = self.object_key(file_name)
+        request = {
+            "Bucket": self.bucket,
+            "Key": key,
+        }
+        if start is not None and end is not None:
+            request["Range"] = f"bytes={int(start)}-{int(end)}"
+        return self.client().get_object(**request)
+
+
+MEDIA_OBJECT_STORAGE = MediaObjectStorage(
+    backend=MEDIA_STORAGE_BACKEND,
+    bucket=MEDIA_S3_BUCKET,
+    region=MEDIA_S3_REGION,
+    endpoint_url=MEDIA_S3_ENDPOINT_URL,
+    access_key_id=MEDIA_S3_ACCESS_KEY_ID,
+    secret_access_key=MEDIA_S3_SECRET_ACCESS_KEY,
+    prefix=MEDIA_S3_PREFIX,
+)
+
+
+def finalise_media_blob_storage(file_name, mime_type=None, byte_size=None, sha256=None, upload_kind="attachment"):
+    local_path = os.path.join(MEDIA_DIR, os.path.basename(file_name or ""))
+    if not os.path.exists(local_path):
+        raise ValueError("uploaded_media_not_found")
+
+    if not MEDIA_OBJECT_STORAGE.is_enabled:
+        return
+    if not MEDIA_OBJECT_STORAGE.is_configured:
+        raise ValueError("media_object_storage_not_configured")
+
+    MEDIA_OBJECT_STORAGE.upload_local_file(
+        file_name=os.path.basename(file_name),
+        local_path=local_path,
+        mime_type=mime_type,
+        expected_size=byte_size,
+        expected_sha256=sha256,
+        upload_kind=upload_kind,
+    )
+    if MEDIA_KEEP_LOCAL_COPY:
+        return
+    try:
+        os.remove(local_path)
+    except OSError:
+        pass
 
 
 def now_iso():
@@ -296,7 +621,7 @@ def should_hide_deleted_message(message):
     created_at = parse_iso_timestamp(message.get("createdAt"))
     if not deleted_at or not created_at:
         return False
-    return (deleted_at - created_at).total_seconds() <= 15 * 60
+    return (deleted_at - created_at).total_seconds() <= 7 * 24 * 60 * 60
 
 
 def message_self_destruct_seconds(message):
@@ -483,7 +808,7 @@ def unique_entity_ids(values):
 def ensure_database_schema(database):
     did_update = False
 
-    for key in ("users", "chats", "messages", "sessions", "deviceTokens", "calls", "callEvents"):
+    for key in ("users", "chats", "messages", "sessions", "deviceTokens", "calls", "callEvents", "chatReadMarkers"):
         if key not in database:
             database[key] = []
             did_update = True
@@ -950,8 +1275,40 @@ def normalize_database_entities(database):
         normalized_sessions.append(session)
     database["sessions"] = normalized_sessions
 
+    normalized_read_markers = []
+    grouped_read_markers = {}
+    for marker in database.get("chatReadMarkers", []):
+        user_id = user_id_map.get(normalized_optional_string(marker.get("userID")), normalized_entity_id(marker.get("userID")))
+        chat_id = chat_id_map.get(normalized_optional_string(marker.get("chatID")), normalized_entity_id(marker.get("chatID")))
+        read_through_at = normalized_optional_string(marker.get("readThroughAt")) or now_iso()
+        if not user_id or not chat_id:
+            did_update = True
+            continue
+        marker_key = (user_id, chat_id)
+        grouped_read_markers.setdefault(marker_key, []).append(
+            {
+                "userID": user_id,
+                "chatID": chat_id,
+                "readThroughAt": read_through_at,
+            }
+        )
+
+    for marker_key, markers in grouped_read_markers.items():
+        latest_marker = max(
+            markers,
+            key=lambda item: parse_iso_datetime(item.get("readThroughAt")) or datetime.min.replace(tzinfo=timezone.utc),
+        )
+        normalized_read_markers.append(latest_marker)
+        if len(markers) > 1:
+            did_update = True
+
+    if normalized_read_markers != (database.get("chatReadMarkers") or []):
+        database["chatReadMarkers"] = normalized_read_markers
+        did_update = True
+
     normalized_device_tokens = []
     seen_tokens = set()
+    seen_user_devices = set()
     for entry in database.get("deviceTokens", []):
         canonical_entry_id = normalized_entity_id(entry.get("id")) or str(uuid.uuid4())
         if entry.get("id") != canonical_entry_id:
@@ -969,11 +1326,35 @@ def normalize_database_entities(database):
         if entry.get("platform") != platform_value:
             entry["platform"] = platform_value
             did_update = True
+        token_type_value = normalized_device_token_type(
+            entry.get("tokenType") or entry.get("token_type")
+        )
+        if entry.get("tokenType") != token_type_value:
+            entry["tokenType"] = token_type_value
+            did_update = True
+        topic_value = normalized_optional_string(entry.get("topic"))
+        if entry.get("topic") != topic_value:
+            entry["topic"] = topic_value
+            did_update = True
+        device_id_value = normalized_device_identifier(
+            entry.get("deviceID") or entry.get("device_id")
+        )
+        if entry.get("deviceID") != device_id_value:
+            entry["deviceID"] = device_id_value
+            did_update = True
         if token_value and token_value in seen_tokens:
+            did_update = True
+            continue
+        device_key = (canonical_user_id, device_id_value) if canonical_user_id and device_id_value else None
+        if device_key:
+            device_key = (device_key[0], device_key[1], token_type_value)
+        if device_key and device_key in seen_user_devices:
             did_update = True
             continue
         if token_value:
             seen_tokens.add(token_value)
+        if device_key:
+            seen_user_devices.add(device_key)
         normalized_device_tokens.append(entry)
     database["deviceTokens"] = normalized_device_tokens
 
@@ -1410,15 +1791,34 @@ def latest_user_session_activity(database, user_id):
     return latest
 
 
+def latest_user_device_token_activity(database, user_id):
+    latest = None
+    for entry in database.get("deviceTokens", []):
+        if not ids_equal(entry.get("userID"), user_id):
+            continue
+        updated_at = parse_iso_datetime(entry.get("updatedAt"))
+        if updated_at and (latest is None or updated_at > latest):
+            latest = updated_at
+    return latest
+
+
+def latest_user_presence_activity(database, user_id):
+    session_activity = latest_user_session_activity(database, user_id)
+    token_activity = latest_user_device_token_activity(database, user_id)
+    if session_activity and token_activity:
+        return max(session_activity, token_activity)
+    return session_activity or token_activity
+
+
 def user_is_online(database, user_id):
-    latest_activity = latest_user_session_activity(database, user_id)
+    latest_activity = latest_user_presence_activity(database, user_id)
     if not latest_activity:
         return False
     return (datetime.now(timezone.utc) - latest_activity).total_seconds() <= PRESENCE_ONLINE_WINDOW_SECONDS
 
 
 def serialize_presence(viewer, target_user, database):
-    latest_activity = latest_user_session_activity(database, target_user["id"])
+    latest_activity = latest_user_presence_activity(database, target_user["id"])
     allow_last_seen = privacy_settings_for(target_user).get("allowLastSeen", True)
 
     if user_is_online(database, target_user["id"]):
@@ -1625,6 +2025,26 @@ def normalized_device_platform(value):
     return normalized.lower() if normalized else None
 
 
+def normalized_device_token_type(value):
+    normalized = (normalized_optional_string(value) or "apns_alert").lower()
+    if normalized in {"apns", "alert", "apns_alert", "apns-standard"}:
+        return "apns_alert"
+    if normalized in {"voip", "apns_voip", "pushkit_voip"}:
+        return "apns_voip"
+    return "apns_alert"
+
+
+def normalized_device_identifier(value):
+    normalized = normalized_optional_string(value)
+    if not normalized:
+        return None
+    cleaned = "".join(
+        character for character in normalized
+        if character.isalnum() or character in ("-", "_", ".", ":")
+    )
+    return cleaned[:128] or None
+
+
 def normalized_apns_device_token(value):
     normalized = normalized_optional_string(value)
     if not normalized:
@@ -1633,6 +2053,14 @@ def normalized_apns_device_token(value):
     # variants, so we canonicalize before storing and dispatching.
     token = "".join(character for character in normalized if character.isalnum()).lower()
     return token or None
+
+
+def is_voip_device_token_entry(entry):
+    return normalized_device_token_type(entry.get("tokenType")) == "apns_voip"
+
+
+def is_alert_device_token_entry(entry):
+    return normalized_device_token_type(entry.get("tokenType")) == "apns_alert"
 
 
 def normalized_optional_url_string(value):
@@ -2034,6 +2462,10 @@ def resolved_user_display_name(user):
 
     username = (user["profile"].get("username") or "").strip()
     return username or None
+
+
+def display_name_for_user(user):
+    return resolved_user_display_name(user)
 
 
 def sync_user_snapshots(database, user):
@@ -2711,6 +3143,15 @@ def remove_file_for_url(file_url, directory):
     target_path = os.path.join(directory, basename)
     if os.path.exists(target_path):
         os.remove(target_path)
+    if MEDIA_OBJECT_STORAGE.is_enabled and MEDIA_OBJECT_STORAGE.is_configured:
+        try:
+            MEDIA_OBJECT_STORAGE.delete_by_name(basename)
+        except Exception:
+            log_event(
+                "media.remote.delete_failed",
+                file_name=basename,
+                storage_backend=MEDIA_OBJECT_STORAGE.backend,
+            )
 
 
 def remove_message_media_files(message):
@@ -2946,9 +3387,23 @@ def normalize_uploaded_video_mp4(directory, input_file_name, upload_kind):
         raise ValueError("video_normalization_failed")
 
 
-def save_base64_blob(directory, file_name, encoded_data):
+def save_base64_blob(directory, file_name, encoded_data, mime_type=None, upload_kind="attachment"):
     raw = base64.b64decode(encoded_data or "")
-    safe_name, size, _ = save_binary_blob(directory, file_name, raw)
+    safe_name, size, sha256 = save_binary_blob(
+        directory,
+        file_name,
+        raw,
+        mime_type=mime_type,
+        upload_kind=upload_kind,
+    )
+    if directory == MEDIA_DIR:
+        finalise_media_blob_storage(
+            file_name=safe_name,
+            mime_type=mime_type,
+            byte_size=size,
+            sha256=sha256,
+            upload_kind=upload_kind,
+        )
     return safe_name, size
 
 
@@ -2959,12 +3414,96 @@ def media_file_info_for_url(file_url, directory):
 
     file_path = os.path.join(directory, basename)
     if not os.path.exists(file_path):
-        return None
+        if not (directory == MEDIA_DIR and MEDIA_OBJECT_STORAGE.is_enabled and MEDIA_OBJECT_STORAGE.is_configured):
+            return None
+        try:
+            remote_info = MEDIA_OBJECT_STORAGE.head_by_name(basename)
+        except Exception:
+            log_event(
+                "media.remote.head_failed",
+                file_name=basename,
+                storage_backend=MEDIA_OBJECT_STORAGE.backend,
+            )
+            return None
+        if not remote_info:
+            return None
+        return {
+            "fileName": basename,
+            "filePath": None,
+            "byteSize": int(remote_info.get("byteSize") or 0),
+            "storageBackend": MEDIA_OBJECT_STORAGE.backend,
+        }
 
     return {
         "fileName": basename,
         "filePath": file_path,
         "byteSize": os.path.getsize(file_path),
+        "storageBackend": "local",
+    }
+
+
+def media_content_type_for_name(file_name, fallback=None):
+    content_type = normalized_optional_string(fallback)
+    if content_type:
+        return content_type
+    guessed_content_type, _ = mimetypes.guess_type(file_name or "")
+    if guessed_content_type:
+        content_type = guessed_content_type
+    else:
+        content_type = "application/octet-stream"
+    if str(file_name or "").lower().endswith(".m4a"):
+        return "audio/mp4"
+    if str(file_name or "").lower().endswith(".mov"):
+        return "video/quicktime"
+    return content_type
+
+
+def resolved_media_byte_range(range_header, file_size):
+    if file_size <= 0:
+        return {
+            "status": 200,
+            "start": 0,
+            "end": -1,
+            "length": 0,
+            "invalid": False,
+        }
+
+    start = 0
+    end = file_size - 1
+    status = 200
+    invalid = False
+
+    if range_header and range_header.startswith("bytes="):
+        range_spec = range_header.removeprefix("bytes=").split(",", 1)[0].strip()
+        start_text, _, end_text = range_spec.partition("-")
+        try:
+            if start_text == "" and end_text:
+                suffix_length = int(end_text)
+                if suffix_length <= 0:
+                    raise ValueError("invalid_suffix_length")
+                start = max(file_size - suffix_length, 0)
+                end = file_size - 1
+            else:
+                start = int(start_text or 0)
+                if end_text:
+                    end = min(int(end_text), file_size - 1)
+                else:
+                    end = file_size - 1
+            if start < 0 or start >= file_size or end < start:
+                invalid = True
+            else:
+                status = 206
+        except ValueError:
+            start = 0
+            end = file_size - 1
+            status = 200
+
+    return {
+        "status": status,
+        "start": start,
+        "end": end,
+        "length": max((end - start) + 1, 0),
+        "invalid": invalid,
     }
 
 
@@ -3257,6 +3796,8 @@ def serialize_chat(chat, current_user_id, database):
             if fallback_participant:
                 participants.append(fallback_participant)
 
+    unread_count = unread_count_for_chat_user(database, chat, current_user_id)
+
     return {
         "id": chat["id"],
         "mode": chat["mode"],
@@ -3268,7 +3809,7 @@ def serialize_chat(chat, current_user_id, database):
         "group": sanitized_group(chat.get("group")),
         "lastMessagePreview": message_preview(last_message) if last_message else guest_request_preview(chat, current_user_id),
         "lastActivityAt": last_message["createdAt"] if last_message else (guest_request_activity_at(chat) or chat["createdAt"]),
-        "unreadCount": 0,
+        "unreadCount": unread_count,
         "isPinned": False,
         "draft": None,
         "disappearingPolicy": None,
@@ -3433,11 +3974,120 @@ def sanitized_reactions(reactions):
     return sanitized
 
 
-def mark_chat_read(chat, database, reader_id):
-    if not chat or chat.get("mode") != "online" or chat.get("type") != "direct":
+def chat_read_marker_for(database, user_id, chat_id):
+    normalized_user_id = normalized_entity_id(user_id)
+    normalized_chat_id = normalized_entity_id(chat_id)
+    if not normalized_user_id or not normalized_chat_id:
+        return None
+
+    return next(
+        (
+            marker
+            for marker in database.get("chatReadMarkers", [])
+            if ids_equal(marker.get("userID"), normalized_user_id)
+            and ids_equal(marker.get("chatID"), normalized_chat_id)
+        ),
+        None,
+    )
+
+
+def chat_read_marker_timestamp(database, user_id, chat_id):
+    marker = chat_read_marker_for(database, user_id, chat_id)
+    if not marker:
+        return None
+    return parse_iso_datetime(marker.get("readThroughAt"))
+
+
+def upsert_chat_read_marker(database, user_id, chat_id, read_through_at):
+    normalized_user_id = normalized_entity_id(user_id)
+    normalized_chat_id = normalized_entity_id(chat_id)
+    read_through_at_value = normalized_optional_string(read_through_at)
+    if not normalized_user_id or not normalized_chat_id or not read_through_at_value:
         return False
 
-    did_update = False
+    next_timestamp = parse_iso_datetime(read_through_at_value) or datetime.now(timezone.utc)
+    existing_marker = chat_read_marker_for(database, normalized_user_id, normalized_chat_id)
+    if existing_marker:
+        existing_timestamp = parse_iso_datetime(existing_marker.get("readThroughAt")) or datetime.min.replace(tzinfo=timezone.utc)
+        if next_timestamp <= existing_timestamp:
+            return False
+        existing_marker["readThroughAt"] = next_timestamp.isoformat()
+        return True
+
+    database.setdefault("chatReadMarkers", []).append(
+        {
+            "userID": normalized_user_id,
+            "chatID": normalized_chat_id,
+            "readThroughAt": next_timestamp.isoformat(),
+        }
+    )
+    return True
+
+
+def unread_count_for_chat_user(database, chat, user_id):
+    if not chat or chat.get("mode") != "online":
+        return 0
+    if not any(ids_equal(participant_id, user_id) for participant_id in (chat.get("participantIDs") or [])):
+        return 0
+
+    read_through_at = chat_read_marker_timestamp(database, user_id, chat.get("id"))
+
+    unread_count = 0
+    for message in database.get("messages", []):
+        if not ids_equal(message.get("chatID"), chat.get("id")):
+            continue
+        if message_self_destruct_expired(message):
+            continue
+        if message.get("deletedForEveryoneAt"):
+            continue
+        if ids_equal(message.get("senderID"), user_id):
+            continue
+
+        if read_through_at:
+            message_created_at = parse_iso_datetime(message.get("createdAt"))
+            if message_created_at and message_created_at <= read_through_at:
+                continue
+        elif chat.get("type") == "direct" and normalized_optional_string(message.get("status")) == "read":
+            continue
+
+        unread_count += 1
+
+    return unread_count
+
+
+def mark_chat_read(chat, database, reader_id):
+    if not chat or chat.get("mode") != "online":
+        return False
+
+    if not any(ids_equal(reader_id, participant_id) for participant_id in (chat.get("participantIDs") or [])):
+        return False
+
+    latest_incoming_at = None
+    for message in database["messages"]:
+        if not ids_equal(message.get("chatID"), chat.get("id")):
+            continue
+        if ids_equal(message.get("senderID"), reader_id):
+            continue
+        if message.get("deletedForEveryoneAt"):
+            continue
+        if message_self_destruct_expired(message):
+            continue
+
+        created_at = parse_iso_datetime(message.get("createdAt"))
+        if created_at and (latest_incoming_at is None or created_at > latest_incoming_at):
+            latest_incoming_at = created_at
+
+    did_update = upsert_chat_read_marker(
+        database=database,
+        user_id=reader_id,
+        chat_id=chat.get("id"),
+        read_through_at=(latest_incoming_at.isoformat() if latest_incoming_at else now_iso()),
+    )
+
+    if chat.get("type") != "direct":
+        return did_update
+
+    did_mark_status_read = False
     for message in database["messages"]:
         if not ids_equal(message.get("chatID"), chat.get("id")):
             continue
@@ -3449,9 +4099,9 @@ def mark_chat_read(chat, database, reader_id):
             continue
 
         message["status"] = "read"
-        did_update = True
+        did_mark_status_read = True
 
-    return did_update
+    return did_update or did_mark_status_read
 
 
 def device_tokens_for_recipients(database, chat, excluding_user_id):
@@ -3467,11 +4117,26 @@ def device_tokens_for_recipients(database, chat, excluding_user_id):
     ]
     deduplicated = []
     seen_tokens = set()
+    seen_user_devices = set()
     for entry in matching_tokens:
+        if is_alert_device_token_entry(entry) is False:
+            continue
         token_value = normalized_apns_device_token(entry.get("token"))
         if not token_value or token_value in seen_tokens:
             continue
+        recipient_user_id = normalized_entity_id(entry.get("userID"))
+        recipient_device_id = normalized_device_identifier(entry.get("deviceID"))
+        token_type = normalized_device_token_type(entry.get("tokenType"))
+        user_device_key = (
+            recipient_user_id,
+            recipient_device_id,
+            token_type,
+        ) if recipient_user_id and recipient_device_id else None
+        if user_device_key and user_device_key in seen_user_devices:
+            continue
         seen_tokens.add(token_value)
+        if user_device_key:
+            seen_user_devices.add(user_device_key)
         deduplicated.append(entry)
     return deduplicated
 
@@ -3498,7 +4163,41 @@ def push_payload_for_message(chat, message, database):
     }
 
 
-def apns_payload_for_message(payload):
+def unread_badge_count_for_user(database, user_id):
+    normalized_user_id = normalized_entity_id(user_id)
+    if not normalized_user_id:
+        return 0
+
+    unread_count = 0
+    for chat in database.get("chats", []):
+        if chat.get("mode") != "online":
+            continue
+        if not any(ids_equal(participant_id, normalized_user_id) for participant_id in (chat.get("participantIDs") or [])):
+            continue
+        unread_count += unread_count_for_chat_user(database, chat, normalized_user_id)
+
+    return max(0, unread_count)
+
+
+def unread_badge_counts_for_users(user_ids):
+    normalized_ids = [
+        normalized_entity_id(user_id)
+        for user_id in (user_ids or [])
+        if normalized_entity_id(user_id)
+    ]
+    if not normalized_ids:
+        return {}
+
+    with LOCK:
+        database = load_db()
+
+    return {
+        user_id: unread_badge_count_for_user(database, user_id)
+        for user_id in normalized_ids
+    }
+
+
+def apns_payload_for_message(payload, badge_count):
     return {
         "aps": {
             "alert": {
@@ -3506,7 +4205,7 @@ def apns_payload_for_message(payload):
                 "body": payload["body"],
             },
             "sound": "default",
-            "badge": 1,
+            "badge": max(0, int(badge_count or 0)),
         },
         "chat_id": payload["chat_id"],
         "message_id": payload["message_id"],
@@ -3517,17 +4216,40 @@ def apns_payload_for_message(payload):
 
 def push_payload_for_call(call, database):
     caller = find_user(database, call.get("callerID"))
-    caller_name = display_name_for_user(caller) if caller else "Someone"
+    caller_name = resolved_user_display_name(caller) if caller else "Someone"
+    issued_at = now_iso()
     return {
         "call_id": call["id"],
         "chat_id": call.get("chatID"),
         "mode": call.get("mode") or "online",
+        "kind": call.get("kind") or "audio",
+        "caller_id": call.get("callerID"),
+        "caller_name": caller_name,
+        "call_event_id": str(uuid.uuid4()),
+        "issued_at": issued_at,
+        "notification_type": "incoming_call",
         "title": "Incoming call",
         "body": f"{caller_name} is calling",
     }
 
 
-def apns_payload_for_call(payload):
+def apns_payload_for_call(payload, badge_count, push_type="alert"):
+    if push_type == "voip":
+        return {
+            "aps": {
+                "content-available": 1,
+            },
+            "call_id": payload["call_id"],
+            "chat_id": payload["chat_id"],
+            "mode": payload["mode"],
+            "kind": payload.get("kind") or "audio",
+            "caller_id": payload.get("caller_id"),
+            "caller_name": payload.get("caller_name"),
+            "call_event_id": payload.get("call_event_id"),
+            "issued_at": payload.get("issued_at"),
+            "notification_type": payload.get("notification_type") or "incoming_call",
+        }
+
     return {
         "aps": {
             "alert": {
@@ -3535,26 +4257,29 @@ def apns_payload_for_call(payload):
                 "body": payload["body"],
             },
             "sound": "default",
-            "badge": 1,
+            "badge": max(0, int(badge_count or 0)),
+            "content-available": 1,
+            "interruption-level": "time-sensitive",
+            "category": "INCOMING_CALL",
         },
         "call_id": payload["call_id"],
         "chat_id": payload["chat_id"],
         "mode": payload["mode"],
+        "kind": payload.get("kind") or "audio",
+        "caller_id": payload.get("caller_id"),
+        "caller_name": payload.get("caller_name"),
+        "call_event_id": payload.get("call_event_id"),
+        "issued_at": payload.get("issued_at"),
+        "notification_type": payload.get("notification_type") or "incoming_call",
     }
 
 
 def initial_message_status_for_dispatch(database, chat, sender_id):
     if chat.get("mode") != "online":
         return "sent"
-    if chat.get("type") != "direct":
-        return "sent"
-
-    recipient_tokens = device_tokens_for_recipients(database, chat, sender_id)
-    has_recipient_token = any(
-        is_ios_apns_target(entry) and normalized_optional_string(entry.get("token"))
-        for entry in recipient_tokens
-    )
-    return "delivered" if has_recipient_token else "sent"
+    _ = database
+    _ = sender_id
+    return "sent"
 
 
 def remove_device_tokens(token_values):
@@ -3578,6 +4303,19 @@ def remove_device_tokens(token_values):
             database["deviceTokens"] = filtered
             save_db(database)
         return removed_count
+
+
+def resolve_apns_topic_for_dispatch(entry, push_type):
+    entry_topic = normalized_optional_string(entry.get("topic"))
+    if push_type == "voip":
+        if entry_topic:
+            return entry_topic
+        if APNS_VOIP_TOPIC:
+            return APNS_VOIP_TOPIC
+        if APNS_TOPIC:
+            return f"{APNS_TOPIC}.voip"
+        return None
+    return entry_topic or APNS_TOPIC
 
 
 def mark_message_delivered_by_id(message_id):
@@ -3617,33 +4355,74 @@ def dispatch_apns_notifications(dispatch_kind, device_tokens, payload, context):
     invalid_tokens = []
     token_suffixes = []
     used_environments = set()
-    attempt_details = []
-    reason_counts = {}
-    environment_mismatch_reasons = {"BadEnvironmentKeyInToken", "BadCertificateEnvironment"}
+    badge_counts_by_user = unread_badge_counts_for_users(
+        {
+            normalized_entity_id(entry.get("userID"))
+            for entry in device_tokens
+            if normalized_entity_id(entry.get("userID"))
+        }
+    )
+    collapse_id = (
+        f"msg-{normalized_entity_id(payload.get('message_id')) or 'unknown'}"
+        if dispatch_kind == "push"
+        else f"call-{normalized_entity_id(payload.get('call_id')) or 'unknown'}"
+    )
 
     for entry in device_tokens:
         if not is_ios_apns_target(entry):
+            continue
+        token_type = normalized_device_token_type(entry.get("tokenType"))
+        if dispatch_kind == "push" and token_type != "apns_alert":
+            continue
+        if dispatch_kind == "call" and token_type != "apns_voip":
+            continue
+        if dispatch_kind == "call_alert" and token_type != "apns_alert":
             continue
 
         token = normalized_apns_device_token(entry.get("token"))
         if not token:
             continue
 
+        recipient_user_id = normalized_entity_id(entry.get("userID"))
+        recipient_device_id = normalized_device_identifier(entry.get("deviceID"))
+        badge_count = badge_counts_by_user.get(recipient_user_id, 0)
         token_suffix = token[-8:]
         token_suffixes.append(token_suffix)
 
+        push_type = "alert"
+        priority = "10"
+        if dispatch_kind == "call":
+            push_type = "voip"
+            priority = "10"
+        elif dispatch_kind == "call_alert":
+            push_type = "alert"
+            priority = "10"
+        topic_override = resolve_apns_topic_for_dispatch(entry, push_type=push_type)
+        if not topic_override:
+            failure_count += 1
+            log_event(
+                f"{dispatch_kind}.dispatch.failed",
+                reason="missing_apns_topic_for_token_type",
+                token_type=token_type,
+                token_suffix=token_suffix,
+                recipient_user_id=recipient_user_id,
+                recipient_device_id=recipient_device_id,
+                **context,
+            )
+            continue
+
         apns_payload = (
-            apns_payload_for_message(payload)
+            apns_payload_for_message(payload, badge_count=badge_count)
             if dispatch_kind == "push"
-            else apns_payload_for_call(payload)
+            else apns_payload_for_call(payload, badge_count=badge_count, push_type=push_type)
         )
-        result = APNS_PROVIDER.send_notification(token, apns_payload, push_type="alert")
-        attempt_details.append(
-            {
-                "token_suffix": token_suffix,
-                "attempts": result.get("attempts"),
-                "ok": result.get("ok"),
-            }
+        result = APNS_PROVIDER.send_notification(
+            token,
+            apns_payload,
+            push_type=push_type,
+            priority=priority,
+            collapse_id=collapse_id,
+            topic_override=topic_override,
         )
         environment_used = result.get("environment")
         if environment_used:
@@ -3654,7 +4433,6 @@ def dispatch_apns_notifications(dispatch_kind, device_tokens, payload, context):
 
         failure_count += 1
         reason = result.get("reason") or "unknown"
-        reason_counts[reason] = reason_counts.get(reason, 0) + 1
         if reason in APNS_PROVIDER.INVALID_TOKEN_REASONS:
             invalid_tokens.append(token)
         log_event(
@@ -3663,8 +4441,12 @@ def dispatch_apns_notifications(dispatch_kind, device_tokens, payload, context):
             status=result.get("status"),
             apns_id=result.get("apns_id"),
             environment=environment_used,
-            attempts=result.get("attempts"),
             token_suffix=token_suffix,
+            token_type=token_type,
+            topic=topic_override,
+            badge_count=badge_count,
+            recipient_user_id=recipient_user_id,
+            recipient_device_id=recipient_device_id,
             **context,
         )
 
@@ -3677,14 +4459,12 @@ def dispatch_apns_notifications(dispatch_kind, device_tokens, payload, context):
         )
 
     if dispatch_kind == "push" and success_count > 0:
-        did_mark_delivered = mark_message_delivered_by_id(context.get("message_id"))
-        if did_mark_delivered:
-            log_event(
-                "push.message.delivered",
-                message_id=context.get("message_id"),
-                chat_id=context.get("chat_id"),
-                success_count=success_count,
-            )
+        log_event(
+            "push.message.dispatched",
+            message_id=context.get("message_id"),
+            chat_id=context.get("chat_id"),
+            success_count=success_count,
+        )
 
     log_event(
         f"{dispatch_kind}.dispatch.completed",
@@ -3695,22 +4475,11 @@ def dispatch_apns_notifications(dispatch_kind, device_tokens, payload, context):
         target_count=len(token_suffixes),
         success_count=success_count,
         failure_count=failure_count,
-        reason_counts=reason_counts,
-        attempts=attempt_details,
+        collapse_id=collapse_id,
+        badge_counts_by_user=badge_counts_by_user,
         token_suffixes=token_suffixes,
         **context,
     )
-
-    if failure_count > 0 and reason_counts and all(
-        reason in environment_mismatch_reasons for reason in reason_counts
-    ):
-        log_event(
-            f"{dispatch_kind}.dispatch.environment_mismatch",
-            configured_environment=APNS_PROVIDER.environment,
-            topic=APNS_PROVIDER.topic,
-            reason_counts=reason_counts,
-            **context,
-        )
 
 
 def schedule_apns_dispatch(dispatch_kind, device_tokens, payload, context):
@@ -3832,6 +4601,11 @@ def serialize_call(call, viewer_id, database):
 
 def serialize_call_event(event):
     payload = event.get("payload") or {}
+    raw_sdp_mline_index = payload.get("sdpMLineIndex")
+    try:
+        sdp_mline_index = int(raw_sdp_mline_index) if raw_sdp_mline_index is not None else None
+    except (TypeError, ValueError):
+        sdp_mline_index = None
     return {
         "id": event["id"],
         "callID": event["callID"],
@@ -3841,7 +4615,7 @@ def serialize_call_event(event):
         "sdp": payload.get("sdp"),
         "candidate": payload.get("candidate"),
         "sdpMid": payload.get("sdpMid"),
-        "sdpMLineIndex": payload.get("sdpMLineIndex"),
+        "sdpMLineIndex": sdp_mline_index,
         "createdAt": event.get("createdAt"),
     }
 
@@ -3957,21 +4731,47 @@ def log_call_dispatch_attempt(database, call):
     if normalized_optional_string(call.get("state")) != "ringing":
         return
 
+    log_event(
+        "call.dispatch.provider_state",
+        configured=APNS_PROVIDER.is_configured,
+        configuration_error=APNS_PROVIDER.configuration_error,
+        configured_environment=APNS_PROVIDER.environment,
+        topic=APNS_PROVIDER.topic,
+        voip_topic=(APNS_VOIP_TOPIC or None),
+        call_id=call["id"],
+        recipient_id=recipient_id,
+    )
+
     device_tokens = [
         token for token in database.get("deviceTokens", [])
         if ids_equal(token.get("userID"), recipient_id)
     ]
     deduplicated = []
     seen_tokens = set()
+    seen_user_devices = set()
     for entry in device_tokens:
-        token_value = normalized_optional_string(entry.get("token"))
+        token_value = normalized_apns_device_token(entry.get("token"))
         if not token_value or token_value in seen_tokens:
             continue
+        recipient_user_id = normalized_entity_id(entry.get("userID"))
+        recipient_device_id = normalized_device_identifier(entry.get("deviceID"))
+        token_type = normalized_device_token_type(entry.get("tokenType"))
+        user_device_key = (
+            recipient_user_id,
+            recipient_device_id,
+            token_type,
+        ) if recipient_user_id and recipient_device_id else None
+        if user_device_key and user_device_key in seen_user_devices:
+            continue
         seen_tokens.add(token_value)
+        if user_device_key:
+            seen_user_devices.add(user_device_key)
         deduplicated.append(entry)
-    device_tokens = deduplicated
+    deduplicated_tokens = deduplicated
+    voip_device_tokens = [token for token in deduplicated_tokens if is_voip_device_token_entry(token)]
+    alert_device_tokens = [token for token in deduplicated_tokens if is_alert_device_token_entry(token)]
 
-    if not device_tokens:
+    if not voip_device_tokens and not alert_device_tokens:
         log_event(
             "call.dispatch.skipped",
             reason="no_device_tokens",
@@ -3987,10 +4787,22 @@ def log_call_dispatch_attempt(database, call):
     }
     log_event(
         "call.dispatch.queued",
-        recipient_count=len(device_tokens),
+        voip_recipient_count=len(voip_device_tokens),
+        alert_recipient_count=len(alert_device_tokens),
         **context,
     )
-    schedule_apns_dispatch("call", device_tokens, payload, context)
+    if voip_device_tokens:
+        schedule_apns_dispatch("call", voip_device_tokens, payload, context)
+    if alert_device_tokens:
+        schedule_apns_dispatch(
+            "call_alert",
+            alert_device_tokens,
+            payload,
+            {
+                **context,
+                "fallback": "alert",
+            },
+        )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -4003,7 +4815,19 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
 
         if parsed.path == "/health":
-            return self.respond(200, {"status": "ok"})
+            return self.respond(200, {
+                "status": "ok",
+                "serverBuildID": SERVER_BUILD_ID,
+                "serverStartedAt": SERVER_STARTED_AT,
+                "serverCodeMTime": SERVER_CODE_MTIME,
+                "serverFunctions": {
+                    "resolved_user_display_name": callable(globals().get("resolved_user_display_name")),
+                    "display_name_for_user": callable(globals().get("display_name_for_user")),
+                    "push_payload_for_call": callable(globals().get("push_payload_for_call")),
+                    "log_call_dispatch_attempt": callable(globals().get("log_call_dispatch_attempt")),
+                },
+                "mediaStorage": MEDIA_OBJECT_STORAGE.status_payload(),
+            })
 
         if parsed.path.startswith("/avatars/"):
             return self.serve_avatar(parsed.path.removeprefix("/avatars/"))
@@ -4303,6 +5127,26 @@ class Handler(BaseHTTPRequestHandler):
                 if not user:
                     return self.respond(404, {"error": "user_not_found"})
                 return self.respond(200, serialize_presence(current_user, user, database))
+
+            if parsed.path == "/calls/ice-config":
+                params = parse_qs(parsed.query)
+                fallback_user_id = (
+                    (params.get("user_id") or [""])[0].strip()
+                    or (params.get("viewer_id") or [""])[0].strip()
+                    or None
+                )
+                _, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    fallback_user_id,
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                return self.respond(200, {"iceServers": CALL_ICE_SERVERS})
 
             if parsed.path == "/calls":
                 params = parse_qs(parsed.query)
@@ -4638,6 +5482,30 @@ class Handler(BaseHTTPRequestHandler):
         if normalized_mime_type:
             mime_type = normalized_mime_type
 
+        try:
+            finalise_media_blob_storage(
+                file_name=media_name,
+                mime_type=mime_type,
+                byte_size=stored_size,
+                sha256=sha256,
+                upload_kind=upload_kind,
+            )
+        except ValueError as error:
+            log_event(
+                "media.upload.storage.failed",
+                requester_id=requester["id"],
+                file_name=media_name,
+                mime_type=mime_type,
+                byte_size=stored_size,
+                upload_kind=upload_kind,
+                error=str(error),
+            )
+            try:
+                os.remove(os.path.join(MEDIA_DIR, media_name))
+            except OSError:
+                pass
+            return self.respond(409, {"error": str(error)})
+
         remote_url = f"{self.base_url()}/media/{media_name}"
         log_event(
             "media.upload.complete",
@@ -4648,6 +5516,7 @@ class Handler(BaseHTTPRequestHandler):
             upload_kind=upload_kind,
             remote_url=remote_url,
             sha256=sha256,
+            storage_backend=MEDIA_OBJECT_STORAGE.backend,
         )
         return self.respond(200, {
             "fileName": media_name,
@@ -5179,12 +6048,25 @@ class Handler(BaseHTTPRequestHandler):
 
                 token = normalized_apns_device_token(payload.get("token"))
                 platform = normalized_device_platform(payload.get("platform")) or "ios"
+                token_type = normalized_device_token_type(
+                    payload_string(payload, "token_type", "tokenType")
+                )
+                topic = normalized_optional_string(payload.get("topic"))
+                device_id = normalized_device_identifier(
+                    payload_string(payload, "device_id", "deviceID")
+                )
                 if not token:
                     return self.respond(409, {"error": "invalid_device_token"})
 
+                previous_count = len(database["deviceTokens"])
                 database["deviceTokens"] = [
                     entry for entry in database["deviceTokens"]
-                    if entry.get("token") != token
+                    if normalized_apns_device_token(entry.get("token")) != token
+                    and not (
+                        device_id
+                        and normalized_device_identifier(entry.get("deviceID")) == device_id
+                        and normalized_device_token_type(entry.get("tokenType")) == token_type
+                    )
                 ]
                 database["deviceTokens"].append(
                     {
@@ -5192,17 +6074,25 @@ class Handler(BaseHTTPRequestHandler):
                         "userID": current_user["id"],
                         "token": token,
                         "platform": platform,
+                        "tokenType": token_type,
+                        "topic": topic,
+                        "deviceID": device_id,
                         "updatedAt": now_iso(),
                     }
                 )
+                replaced_count = max(0, previous_count - len(database["deviceTokens"]) + 1)
                 save_db(database)
                 log_event(
                     "push.token.registered",
                     user_id=current_user["id"],
                     platform=platform,
+                    token_type=token_type,
+                    topic=topic,
                     token_suffix=(token[-8:] if token else None),
+                    device_id_suffix=(device_id[-8:] if device_id else None),
+                    replaced_count=replaced_count,
                 )
-                return self.respond(200, {"ok": True})
+                return self.respond(200, {"ok": True, "replacedCount": replaced_count})
 
             if method == "POST" and parsed.path == "/calls":
                 caller, _, auth_error = request_user_with_fallback(
@@ -6708,10 +7598,21 @@ class Handler(BaseHTTPRequestHandler):
                 attachments = []
                 for attachment in payload.get("attachments", []):
                     file_name = attachment.get("file_name") or "attachment.bin"
+                    attachment_type = attachment.get("type", "document")
+                    attachment_mime_type = attachment.get("mime_type", "application/octet-stream")
                     remote_url = None
                     byte_size = int(attachment.get("byte_size") or 0)
                     if attachment.get("data_base64"):
-                        media_name, detected_size = save_base64_blob(MEDIA_DIR, file_name, attachment.get("data_base64"))
+                        try:
+                            media_name, detected_size = save_base64_blob(
+                                MEDIA_DIR,
+                                file_name,
+                                attachment.get("data_base64"),
+                                mime_type=attachment_mime_type,
+                                upload_kind=attachment_type or "attachment",
+                            )
+                        except ValueError as error:
+                            return self.respond(409, {"error": str(error)})
                         remote_url = f"{self.base_url()}/media/{media_name}"
                         byte_size = detected_size
                     elif attachment.get("remote_url"):
@@ -6724,9 +7625,9 @@ class Handler(BaseHTTPRequestHandler):
                     attachments.append(
                         {
                             "id": str(uuid.uuid4()),
-                            "type": attachment.get("type", "document"),
+                            "type": attachment_type,
                             "fileName": file_name,
-                            "mimeType": attachment.get("mime_type", "application/octet-stream"),
+                            "mimeType": attachment_mime_type,
                             "localURL": None,
                             "remoteURL": remote_url,
                             "byteSize": byte_size,
@@ -6739,11 +7640,16 @@ class Handler(BaseHTTPRequestHandler):
                     remote_url = None
                     byte_size = int(voice_payload.get("byte_size") or 0)
                     if voice_payload.get("data_base64"):
-                        media_name, detected_size = save_base64_blob(
-                            MEDIA_DIR,
-                            voice_payload.get("file_name") or "voice.m4a",
-                            voice_payload.get("data_base64"),
-                        )
+                        try:
+                            media_name, detected_size = save_base64_blob(
+                                MEDIA_DIR,
+                                voice_payload.get("file_name") or "voice.m4a",
+                                voice_payload.get("data_base64"),
+                                mime_type=voice_payload.get("mime_type") or "audio/mp4",
+                                upload_kind="voice",
+                            )
+                        except ValueError as error:
+                            return self.respond(409, {"error": str(error)})
                         remote_url = f"{self.base_url()}/media/{media_name}"
                         byte_size = detected_size
                     elif voice_payload.get("remote_url"):
@@ -6999,64 +7905,152 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def serve_media(self, media_name):
-        media_path = os.path.join(MEDIA_DIR, os.path.basename(media_name))
-        if not os.path.exists(media_path):
+        media_file_name = os.path.basename(media_name or "")
+        if not media_file_name:
             return self.respond(404, {"error": "media_not_found"})
 
-        content_type, _ = mimetypes.guess_type(media_path)
-        if content_type is None:
-            content_type = "application/octet-stream"
-        elif media_path.endswith(".m4a"):
-            content_type = "audio/mp4"
-        elif media_path.endswith(".mov"):
-            content_type = "video/quicktime"
-
-        file_size = os.path.getsize(media_path)
         range_header = self.headers.get("Range")
+        media_path = os.path.join(MEDIA_DIR, media_file_name)
 
-        start = 0
-        end = max(file_size - 1, 0)
-        status = 200
+        remote_info = None
+        if MEDIA_OBJECT_STORAGE.is_enabled and MEDIA_OBJECT_STORAGE.is_configured:
+            try:
+                remote_info = MEDIA_OBJECT_STORAGE.head_by_name(media_file_name)
+            except Exception as error:
+                log_event(
+                    "media.remote.head_failed",
+                    file_name=media_file_name,
+                    storage_backend=MEDIA_OBJECT_STORAGE.backend,
+                    error=type(error).__name__,
+                )
+                remote_info = None
 
-        if range_header and range_header.startswith("bytes="):
-            range_spec = range_header.removeprefix("bytes=").strip()
-            start_text, _, end_text = range_spec.partition("-")
+        if remote_info:
+            file_size = int(remote_info.get("byteSize") or 0)
+            range_info = resolved_media_byte_range(range_header, file_size)
+            if range_info["invalid"]:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{file_size}")
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                log_event(
+                    "media.serve.range_invalid",
+                    file_name=media_file_name,
+                    source=MEDIA_OBJECT_STORAGE.backend,
+                    range_header=range_header,
+                    file_size=file_size,
+                )
+                return
+
+            status = range_info["status"]
+            start = range_info["start"]
+            end = range_info["end"]
+            content_length = range_info["length"]
+            content_type = media_content_type_for_name(media_file_name, remote_info.get("mimeType"))
 
             try:
-                if start_text == "" and end_text:
-                    suffix_length = int(end_text)
-                    if suffix_length <= 0:
-                        raise ValueError("invalid suffix length")
-                    start = max(file_size - suffix_length, 0)
-                    end = max(file_size - 1, 0)
-                else:
-                    start = int(start_text or 0)
-                    if end_text:
-                        end = min(int(end_text), file_size - 1)
+                stream_response = MEDIA_OBJECT_STORAGE.stream_by_name(
+                    media_file_name,
+                    start=start if status == 206 else None,
+                    end=end if status == 206 else None,
+                )
+            except ClientError as error:
+                code = (
+                    (error.response or {}).get("Error", {}).get("Code")
+                    if hasattr(error, "response")
+                    else None
+                )
+                if str(code) in {"404", "NoSuchKey", "NotFound"}:
+                    return self.respond(404, {"error": "media_not_found"})
+                log_event(
+                    "media.serve.remote_failed",
+                    file_name=media_file_name,
+                    source=MEDIA_OBJECT_STORAGE.backend,
+                    range_header=range_header,
+                    file_size=file_size,
+                    error=str(code or type(error).__name__),
+                )
+                return self.respond(409, {"error": "media_stream_failed"})
+            except Exception as error:
+                log_event(
+                    "media.serve.remote_failed",
+                    file_name=media_file_name,
+                    source=MEDIA_OBJECT_STORAGE.backend,
+                    range_header=range_header,
+                    file_size=file_size,
+                    error=type(error).__name__,
+                )
+                return self.respond(409, {"error": "media_stream_failed"})
 
-                if start_text != "" and end_text:
-                    end = min(int(end_text), file_size - 1)
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Disposition", "inline")
+            self.send_header("Content-Length", str(content_length))
+            self.send_header("Accept-Ranges", "bytes")
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+            self.end_headers()
 
-                if start < 0 or start >= file_size or end < start:
-                    self.send_response(416)
-                    self.send_header("Content-Range", f"bytes */{file_size}")
-                    self.send_header("Accept-Ranges", "bytes")
-                    self.end_headers()
-                    log_event(
-                        "media.serve.range_invalid",
-                        file_name=os.path.basename(media_path),
-                        range_header=range_header,
-                        file_size=file_size,
-                    )
-                    return
+            streamed = 0
+            body_stream = stream_response.get("Body")
+            try:
+                while streamed < content_length:
+                    chunk = body_stream.read(min(64 * 1024, content_length - streamed))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    streamed += len(chunk)
+            finally:
+                if body_stream is not None:
+                    body_stream.close()
 
-                status = 206
-            except ValueError:
-                start = 0
-                end = max(file_size - 1, 0)
-                status = 200
+            log_event(
+                "media.serve",
+                file_name=media_file_name,
+                source=MEDIA_OBJECT_STORAGE.backend,
+                status=status,
+                content_type=content_type,
+                file_size=file_size,
+                range_header=range_header,
+                range_start=start,
+                range_end=end,
+                content_length=content_length,
+                streamed_length=streamed,
+            )
+            return
 
-        content_length = max((end - start) + 1, 0)
+        if not os.path.exists(media_path):
+            if MEDIA_OBJECT_STORAGE.is_enabled and not MEDIA_OBJECT_STORAGE.is_configured:
+                log_event(
+                    "media.serve.storage_not_configured",
+                    file_name=media_file_name,
+                    storage_backend=MEDIA_OBJECT_STORAGE.backend,
+                    reason=MEDIA_OBJECT_STORAGE.configuration_error,
+                )
+                return self.respond(503, {"error": "media_object_storage_not_configured"})
+            return self.respond(404, {"error": "media_not_found"})
+
+        content_type = media_content_type_for_name(media_path)
+        file_size = os.path.getsize(media_path)
+        range_info = resolved_media_byte_range(range_header, file_size)
+        if range_info["invalid"]:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{file_size}")
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+            log_event(
+                "media.serve.range_invalid",
+                file_name=os.path.basename(media_path),
+                source="local",
+                range_header=range_header,
+                file_size=file_size,
+            )
+            return
+
+        status = range_info["status"]
+        start = range_info["start"]
+        end = range_info["end"]
+        content_length = range_info["length"]
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Disposition", "inline")
@@ -7068,6 +8062,7 @@ class Handler(BaseHTTPRequestHandler):
         log_event(
             "media.serve",
             file_name=os.path.basename(media_path),
+            source="local",
             status=status,
             content_type=content_type,
             file_size=file_size,
@@ -7164,6 +8159,14 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     ensure_storage()
+    log_event(
+        "server.startup",
+        build_id=SERVER_BUILD_ID,
+        started_at=SERVER_STARTED_AT,
+        code_mtime=SERVER_CODE_MTIME,
+        python_version=os.sys.version.split()[0],
+        backend_file=os.path.basename(__file__),
+    )
     key_source = "inline_env" if APNS_KEY_P8 else "path"
     if APNS_PROVIDER.is_configured:
         log_event(
@@ -7183,6 +8186,34 @@ if __name__ == "__main__":
             key_id=APNS_PROVIDER.key_id,
             key_path=APNS_PROVIDER.key_path,
             key_source=key_source,
+        )
+    if MEDIA_OBJECT_STORAGE.is_enabled and MEDIA_OBJECT_STORAGE.is_configured:
+        log_event(
+            "media.storage.ready",
+            backend=MEDIA_OBJECT_STORAGE.backend,
+            bucket=MEDIA_OBJECT_STORAGE.bucket,
+            region=MEDIA_OBJECT_STORAGE.region,
+            endpoint_url=MEDIA_OBJECT_STORAGE.endpoint_url,
+            prefix=MEDIA_OBJECT_STORAGE.prefix,
+            keep_local_copy=MEDIA_KEEP_LOCAL_COPY,
+        )
+    elif MEDIA_OBJECT_STORAGE.is_enabled:
+        log_event(
+            "media.storage.disabled",
+            backend=MEDIA_OBJECT_STORAGE.backend,
+            reason=MEDIA_OBJECT_STORAGE.configuration_error,
+            bucket=MEDIA_OBJECT_STORAGE.bucket,
+            region=MEDIA_OBJECT_STORAGE.region,
+            endpoint_url=MEDIA_OBJECT_STORAGE.endpoint_url,
+            prefix=MEDIA_OBJECT_STORAGE.prefix,
+            keep_local_copy=MEDIA_KEEP_LOCAL_COPY,
+        )
+    else:
+        log_event(
+            "media.storage.local_only",
+            backend=MEDIA_OBJECT_STORAGE.backend,
+            media_dir=MEDIA_DIR,
+            keep_local_copy=MEDIA_KEEP_LOCAL_COPY,
         )
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Prime Messaging backend listening on http://{HOST}:{PORT}")
