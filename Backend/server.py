@@ -6205,6 +6205,14 @@ class Handler(BaseHTTPRequestHandler):
                 call["updatedAt"] = call["answeredAt"]
                 append_call_event(database, call, "accepted", sender_id=requester["id"])
                 save_db(database)
+                log_event(
+                    "call.state.accepted",
+                    call_id=call.get("id"),
+                    requester_id=requester.get("id"),
+                    caller_id=call.get("callerID"),
+                    callee_id=call.get("calleeID"),
+                    answered_at=call.get("answeredAt"),
+                )
                 return self.respond(200, serialize_call(call, requester["id"], database))
 
             if method == "POST" and parsed.path.startswith("/calls/") and parsed.path.endswith("/reject"):
