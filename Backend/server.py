@@ -5266,6 +5266,14 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     since_sequence = 0
                 events = [serialize_call_event(event) for event in call_events_for(database, call_id, since_sequence)]
+                log_event(
+                    "call.events.fetch",
+                    call_id=call.get("id"),
+                    user_id=current_user.get("id"),
+                    since_sequence=since_sequence,
+                    event_count=len(events),
+                    latest_sequence=(events[-1]["sequence"] if events else since_sequence),
+                )
                 return self.respond(200, events)
 
             if parsed.path.startswith("/calls/"):
