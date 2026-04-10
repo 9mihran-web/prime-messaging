@@ -93,7 +93,18 @@ APNS_JWT_TTL_SECONDS = 50 * 60
 
 
 def parse_call_ice_servers(raw_value):
-    default_servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
+    default_servers = [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {
+            "urls": [
+                "turn:openrelay.metered.ca:80?transport=udp",
+                "turn:openrelay.metered.ca:443?transport=tcp",
+                "turns:openrelay.metered.ca:443?transport=tcp",
+            ],
+            "username": "openrelayproject",
+            "credential": "openrelayproject",
+        },
+    ]
     if not raw_value:
         return default_servers
 
@@ -6288,6 +6299,13 @@ class Handler(BaseHTTPRequestHandler):
                     payload={"sdp": payload_string(payload, "sdp")}
                 )
                 save_db(database)
+                log_event(
+                    "call.signal.offer.received",
+                    call_id=call.get("id"),
+                    sender_id=requester.get("id"),
+                    sequence=event.get("sequence"),
+                    sdp_size=len(payload_string(payload, "sdp") or ""),
+                )
                 return self.respond(200, serialize_call_event(event))
 
             if method == "POST" and parsed.path.startswith("/calls/") and parsed.path.endswith("/answer"):
@@ -6319,6 +6337,13 @@ class Handler(BaseHTTPRequestHandler):
                     payload={"sdp": payload_string(payload, "sdp")}
                 )
                 save_db(database)
+                log_event(
+                    "call.signal.answer.received",
+                    call_id=call.get("id"),
+                    sender_id=requester.get("id"),
+                    sequence=event.get("sequence"),
+                    sdp_size=len(payload_string(payload, "sdp") or ""),
+                )
                 return self.respond(200, serialize_call_event(event))
 
             if method == "POST" and parsed.path.startswith("/calls/") and parsed.path.endswith("/ice"):
@@ -6354,6 +6379,15 @@ class Handler(BaseHTTPRequestHandler):
                     }
                 )
                 save_db(database)
+                log_event(
+                    "call.signal.ice.received",
+                    call_id=call.get("id"),
+                    sender_id=requester.get("id"),
+                    sequence=event.get("sequence"),
+                    candidate_size=len(payload_string(payload, "candidate") or ""),
+                    sdp_mid=payload_string(payload, "sdp_mid", "sdpMid"),
+                    sdp_mline_index=payload.get("sdp_mline_index", payload.get("sdpMLineIndex")),
+                )
                 return self.respond(200, serialize_call_event(event))
 
             if method == "PATCH" and parsed.path.startswith("/users/") and parsed.path.endswith("/profile"):
