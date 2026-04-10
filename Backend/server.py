@@ -4245,6 +4245,46 @@ def apns_payload_for_message(payload, badge_count):
     }
 
 
+def push_payload_for_broadcast(title, body, deep_link=None, category=None, notification_type=None):
+    issued_at = now_iso()
+    return {
+        "broadcast_id": str(uuid.uuid4()),
+        "title": title,
+        "body": body,
+        "deep_link": normalized_optional_string(deep_link),
+        "category": normalized_optional_string(category),
+        "notification_type": normalized_optional_string(notification_type) or "broadcast",
+        "issued_at": issued_at,
+    }
+
+
+def apns_payload_for_broadcast(payload, badge_count):
+    aps = {
+        "alert": {
+            "title": payload["title"],
+            "body": payload["body"],
+        },
+        "sound": "default",
+        "badge": max(0, int(badge_count or 0)),
+        "content-available": 1,
+        "interruption-level": "active",
+    }
+    category = normalized_optional_string(payload.get("category"))
+    if category:
+        aps["category"] = category
+
+    response_payload = {
+        "aps": aps,
+        "broadcast_id": payload["broadcast_id"],
+        "notification_type": payload.get("notification_type") or "broadcast",
+        "issued_at": payload.get("issued_at"),
+    }
+    deep_link = normalized_optional_string(payload.get("deep_link"))
+    if deep_link:
+        response_payload["deep_link"] = deep_link
+    return response_payload
+
+
 def push_payload_for_call(call, database):
     caller = find_user(database, call.get("callerID"))
     caller_name = resolved_user_display_name(caller) if caller else "Someone"
@@ -4349,6 +4389,36 @@ def resolve_apns_topic_for_dispatch(entry, push_type):
     return entry_topic or APNS_TOPIC
 
 
+def deduplicated_alert_device_tokens_for_all_users(database):
+    deduplicated = []
+    seen_tokens = set()
+    seen_user_devices = set()
+    for entry in database.get("deviceTokens", []):
+        if is_alert_device_token_entry(entry) is False:
+            continue
+
+        token_value = normalized_apns_device_token(entry.get("token"))
+        if not token_value or token_value in seen_tokens:
+            continue
+
+        recipient_user_id = normalized_entity_id(entry.get("userID"))
+        recipient_device_id = normalized_device_identifier(entry.get("deviceID"))
+        token_type = normalized_device_token_type(entry.get("tokenType"))
+        user_device_key = (
+            recipient_user_id,
+            recipient_device_id,
+            token_type,
+        ) if recipient_user_id and recipient_device_id else None
+        if user_device_key and user_device_key in seen_user_devices:
+            continue
+
+        seen_tokens.add(token_value)
+        if user_device_key:
+            seen_user_devices.add(user_device_key)
+        deduplicated.append(entry)
+    return deduplicated
+
+
 def mark_message_delivered_by_id(message_id):
     normalized_message_id = normalized_entity_id(message_id)
     if not normalized_message_id:
@@ -4396,7 +4466,11 @@ def dispatch_apns_notifications(dispatch_kind, device_tokens, payload, context):
     collapse_id = (
         f"msg-{normalized_entity_id(payload.get('message_id')) or 'unknown'}"
         if dispatch_kind == "push"
-        else f"call-{normalized_entity_id(payload.get('call_id')) or 'unknown'}"
+        else (
+            f"broadcast-{normalized_entity_id(payload.get('broadcast_id')) or 'unknown'}"
+            if dispatch_kind == "broadcast"
+            else f"call-{normalized_entity_id(payload.get('call_id')) or 'unknown'}"
+        )
     )
 
     for entry in device_tokens:
@@ -4404,6 +4478,8 @@ def dispatch_apns_notifications(dispatch_kind, device_tokens, payload, context):
             continue
         token_type = normalized_device_token_type(entry.get("tokenType"))
         if dispatch_kind == "push" and token_type != "apns_alert":
+            continue
+        if dispatch_kind == "broadcast" and token_type != "apns_alert":
             continue
         if dispatch_kind == "call" and token_type != "apns_voip":
             continue
@@ -4445,7 +4521,11 @@ def dispatch_apns_notifications(dispatch_kind, device_tokens, payload, context):
         apns_payload = (
             apns_payload_for_message(payload, badge_count=badge_count)
             if dispatch_kind == "push"
-            else apns_payload_for_call(payload, badge_count=badge_count, push_type=push_type)
+            else (
+                apns_payload_for_broadcast(payload, badge_count=badge_count)
+                if dispatch_kind == "broadcast"
+                else apns_payload_for_call(payload, badge_count=badge_count, push_type=push_type)
+            )
         )
         result = APNS_PROVIDER.send_notification(
             token,
@@ -4494,6 +4574,12 @@ def dispatch_apns_notifications(dispatch_kind, device_tokens, payload, context):
             "push.message.dispatched",
             message_id=context.get("message_id"),
             chat_id=context.get("chat_id"),
+            success_count=success_count,
+        )
+    if dispatch_kind == "broadcast" and success_count > 0:
+        log_event(
+            "broadcast.message.dispatched",
+            broadcast_id=context.get("broadcast_id"),
             success_count=success_count,
         )
 
@@ -5645,6 +5731,55 @@ class Handler(BaseHTTPRequestHandler):
                 save_db(database)
                 return self.respond(200, admin_user_payload(database, user))
 
+            if method == "POST" and parsed.path == "/admin/push/broadcast":
+                admin_error = admin_request_error(database, self.headers)
+                if admin_error:
+                    return self.respond(401 if admin_error in {"admin_not_configured", "admin_token_required", "admin_auth_required"} else 403, {"error": admin_error})
+
+                title = payload_string(payload, "title")
+                body = payload_string(payload, "body", "message", "text")
+                if not title or not body:
+                    return self.respond(409, {"error": "broadcast_title_and_body_required"})
+
+                alert_tokens = deduplicated_alert_device_tokens_for_all_users(database)
+                if not alert_tokens:
+                    log_event(
+                        "broadcast.dispatch.skipped",
+                        reason="no_alert_device_tokens",
+                        title=title,
+                    )
+                    return self.respond(200, {
+                        "ok": True,
+                        "queued": False,
+                        "recipientCount": 0,
+                        "reason": "no_alert_device_tokens",
+                    })
+
+                broadcast_payload = push_payload_for_broadcast(
+                    title=title,
+                    body=body,
+                    deep_link=payload_string(payload, "deep_link", "deepLink"),
+                    category=payload_string(payload, "category"),
+                    notification_type=payload_string(payload, "notification_type", "notificationType"),
+                )
+                context = {
+                    "broadcast_id": broadcast_payload["broadcast_id"],
+                    "title": title,
+                    "body_size": len(body),
+                }
+                log_event(
+                    "broadcast.dispatch.queued",
+                    recipient_count=len(alert_tokens),
+                    **context,
+                )
+                schedule_apns_dispatch("broadcast", alert_tokens, broadcast_payload, context)
+                return self.respond(200, {
+                    "ok": True,
+                    "queued": True,
+                    "recipientCount": len(alert_tokens),
+                    "broadcastID": broadcast_payload["broadcast_id"],
+                })
+
             if method == "POST" and parsed.path.startswith("/admin/users/") and parsed.path.endswith("/ban"):
                 admin_error = admin_request_error(database, self.headers)
                 if admin_error:
@@ -6198,14 +6333,36 @@ class Handler(BaseHTTPRequestHandler):
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
+                    log_event(
+                        "call.state.accepted.auth_failed",
+                        call_id=call_id,
+                        auth_error=auth_error,
+                    )
                     return self.respond(401, {"error": auth_error})
 
                 call = find_call(database, call_id)
                 if not call:
+                    log_event(
+                        "call.state.accepted.call_not_found",
+                        call_id=call_id,
+                        requester_id=requester.get("id"),
+                    )
                     return self.respond(404, {"error": "call_not_found"})
                 if not can_manage_call(call, requester["id"]):
+                    log_event(
+                        "call.state.accepted.permission_denied",
+                        call_id=call_id,
+                        requester_id=requester.get("id"),
+                    )
                     return self.respond(403, {"error": "call_permission_denied"})
                 if not ids_equal(call.get("calleeID"), requester["id"]) or normalized_optional_string(call.get("state")) != "ringing":
+                    log_event(
+                        "call.state.accepted.invalid_operation",
+                        call_id=call_id,
+                        requester_id=requester.get("id"),
+                        state=call.get("state"),
+                        callee_id=call.get("calleeID"),
+                    )
                     return self.respond(409, {"error": "invalid_call_operation"})
 
                 call["state"] = "active"
@@ -6335,15 +6492,44 @@ class Handler(BaseHTTPRequestHandler):
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
+                    log_event(
+                        "call.signal.answer.auth_failed",
+                        call_id=call_id,
+                        auth_error=auth_error,
+                    )
                     return self.respond(401, {"error": auth_error})
 
                 call = find_call(database, call_id)
                 if not call:
+                    log_event(
+                        "call.signal.answer.call_not_found",
+                        call_id=call_id,
+                        sender_id=requester.get("id"),
+                    )
                     return self.respond(404, {"error": "call_not_found"})
                 if not can_manage_call(call, requester["id"]):
+                    log_event(
+                        "call.signal.answer.permission_denied",
+                        call_id=call_id,
+                        sender_id=requester.get("id"),
+                    )
                     return self.respond(403, {"error": "call_permission_denied"})
                 if normalized_optional_string(call.get("state")) not in ACTIVE_CALL_STATES:
+                    log_event(
+                        "call.signal.answer.invalid_operation",
+                        call_id=call_id,
+                        sender_id=requester.get("id"),
+                        state=call.get("state"),
+                    )
                     return self.respond(409, {"error": "invalid_call_operation"})
+
+                log_event(
+                    "call.signal.answer.attempt",
+                    call_id=call.get("id"),
+                    sender_id=requester.get("id"),
+                    call_state=call.get("state"),
+                    sdp_size=len(payload_string(payload, "sdp") or ""),
+                )
 
                 event = append_call_event(
                     database,
