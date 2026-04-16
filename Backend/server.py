@@ -8482,7 +8482,16 @@ class Handler(BaseHTTPRequestHandler):
                 if normalized_optional_string(call.get("state")) == "ringing" and ids_equal(call.get("callerID"), requester["id"]):
                     call["state"] = "cancelled"
                 elif normalized_optional_string(call.get("state")) == "ringing":
-                    call["state"] = "rejected"
+                    # Incoming ringing must be declined through /reject only.
+                    # This prevents accidental /hangup paths from auto-ending an incoming call.
+                    log_event(
+                        "call.state.hangup.invalid_incoming_ringing",
+                        call_id=call.get("id"),
+                        requester_id=requester.get("id"),
+                        caller_id=call.get("callerID"),
+                        callee_id=call.get("calleeID"),
+                    )
+                    return self.respond(409, {"error": "invalid_call_operation"})
                 else:
                     call["state"] = "ended"
                 call["endedAt"] = now_iso()
