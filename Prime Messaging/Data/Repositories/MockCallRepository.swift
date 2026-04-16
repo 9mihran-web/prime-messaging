@@ -5,6 +5,7 @@ enum CallRepositoryError: LocalizedError {
     case callNotFound
     case userNotFound
     case callPermissionDenied
+    case callRequiresSavedContact
     case invalidOperation
 
     var errorDescription: String? {
@@ -17,6 +18,8 @@ enum CallRepositoryError: LocalizedError {
             return "calls.error.user_not_found".localized
         case .callPermissionDenied:
             return "calls.error.permission_denied".localized
+        case .callRequiresSavedContact:
+            return "calls.unavailable.privacy".localized
         case .invalidOperation:
             return "calls.error.invalid_operation".localized
         }
@@ -36,6 +39,12 @@ actor MockCallStore {
             .sorted { $0.createdAt > $1.createdAt }
     }
 
+    func historyCalls(for userID: UUID) -> [InternetCall] {
+        calls.values
+            .filter { $0.callerID == userID || $0.calleeID == userID }
+            .sorted { $0.activityDate > $1.activityDate }
+    }
+
     func call(_ callID: UUID) -> InternetCall? {
         calls[callID]
     }
@@ -48,6 +57,7 @@ actor MockCallStore {
                 username: "contact",
                 bio: "",
                 status: "Available",
+                birthday: nil,
                 email: nil,
                 phoneNumber: nil,
                 profilePhotoURL: nil,
@@ -181,6 +191,10 @@ struct MockCallRepository: CallRepository {
         await MockCallStore.shared.activeCalls(for: userID)
     }
 
+    func fetchCallHistory(for userID: UUID) async throws -> [InternetCall] {
+        await MockCallStore.shared.historyCalls(for: userID)
+    }
+
     func fetchCall(_ callID: UUID, for userID: UUID) async throws -> InternetCall {
         guard let call = await MockCallStore.shared.call(callID) else {
             throw CallRepositoryError.callNotFound
@@ -199,6 +213,7 @@ struct MockCallRepository: CallRepository {
                 username: "primeuser",
                 bio: "",
                 status: "Available",
+                birthday: nil,
                 email: nil,
                 phoneNumber: nil,
                 profilePhotoURL: nil,

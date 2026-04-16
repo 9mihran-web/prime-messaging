@@ -2,6 +2,7 @@ import SwiftUI
 
 struct PrivacySettingsView: View {
     @Environment(\.appEnvironment) private var environment
+    @EnvironmentObject private var appState: AppState
     @State private var settings = PrivacySettings.defaultEmailOnly
 
     var body: some View {
@@ -13,6 +14,11 @@ struct PrivacySettingsView: View {
             Toggle("privacy.calls".localized, isOn: $settings.allowCallsFromNonContacts)
             Toggle("privacy.group_invites".localized, isOn: $settings.allowGroupInvitesFromNonContacts)
             Toggle("privacy.forwarding".localized, isOn: $settings.allowForwardLinkToProfile)
+
+            Picker("Guest message requests", selection: $settings.guestMessageRequests) {
+                Text("Approve first").tag(GuestMessageRequestPolicy.approvalRequired)
+                Text("Block guest requests").tag(GuestMessageRequestPolicy.blocked)
+            }
         }
         .navigationTitle("settings.privacy.controls".localized)
         .task {
@@ -21,8 +27,19 @@ struct PrivacySettingsView: View {
             } catch { }
         }
         .onDisappear {
+            let resolvedSettings = settings
             Task {
-                try? await environment.settingsRepository.updatePrivacySettings(settings)
+                do {
+                    try await environment.settingsRepository.updatePrivacySettings(resolvedSettings)
+                    await MainActor.run {
+                        var updatedUser = appState.currentUser
+                        updatedUser.privacySettings = resolvedSettings
+                        appState.applyAuthenticatedUser(
+                            updatedUser,
+                            requiresServerSessionValidation: appState.requiresServerSessionValidation
+                        )
+                    }
+                } catch { }
             }
         }
     }

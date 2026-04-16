@@ -5,13 +5,17 @@ import hmac
 import json
 import mimetypes
 import os
+import secrets
 import shutil
+import smtplib
+import struct
 import subprocess
 import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from email.message import EmailMessage
 from urllib.parse import parse_qs, urlparse
 
 try:
@@ -59,6 +63,35 @@ REFRESH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30
 SESSION_ACTIVITY_TOUCH_INTERVAL_SECONDS = 15
 PRESENCE_ONLINE_WINDOW_SECONDS = 45
 DEFAULT_OTP_CODE = "000000"
+OTP_CHALLENGE_TTL_SECONDS = int(os.environ.get("PRIME_MESSAGING_OTP_TTL_SECONDS", "300"))
+OTP_RESEND_COOLDOWN_SECONDS = int(os.environ.get("PRIME_MESSAGING_OTP_RESEND_COOLDOWN_SECONDS", "30"))
+OTP_VERIFY_ATTEMPT_LIMIT = int(os.environ.get("PRIME_MESSAGING_OTP_VERIFY_ATTEMPT_LIMIT", "5"))
+OTP_REQUEST_LIMIT_PER_HOUR = int(os.environ.get("PRIME_MESSAGING_OTP_REQUEST_LIMIT_PER_HOUR", "20"))
+OTP_PROVIDER = (os.environ.get("PRIME_MESSAGING_OTP_PROVIDER", "mock") or "mock").strip().lower()
+OTP_PROVIDER_WEBHOOK_URL = (os.environ.get("PRIME_MESSAGING_OTP_PROVIDER_WEBHOOK_URL", "") or "").strip()
+OTP_PROVIDER_WEBHOOK_TOKEN = (os.environ.get("PRIME_MESSAGING_OTP_PROVIDER_WEBHOOK_TOKEN", "") or "").strip()
+VONAGE_API_KEY = (os.environ.get("PRIME_MESSAGING_VONAGE_API_KEY", "") or "").strip()
+VONAGE_API_SECRET = (os.environ.get("PRIME_MESSAGING_VONAGE_API_SECRET", "") or "").strip()
+VONAGE_SMS_FROM = (os.environ.get("PRIME_MESSAGING_VONAGE_SMS_FROM", "PrimeMsg") or "PrimeMsg").strip()
+SMTP_HOST = (os.environ.get("PRIME_MESSAGING_SMTP_HOST", "") or "").strip()
+SMTP_PORT = int((os.environ.get("PRIME_MESSAGING_SMTP_PORT", "587") or "587").strip())
+SMTP_USERNAME = (os.environ.get("PRIME_MESSAGING_SMTP_USERNAME", "") or "").strip()
+SMTP_PASSWORD = (os.environ.get("PRIME_MESSAGING_SMTP_PASSWORD", "") or "").strip()
+SMTP_FROM = (os.environ.get("PRIME_MESSAGING_SMTP_FROM", "") or "").strip()
+SMTP_USE_TLS = ((os.environ.get("PRIME_MESSAGING_SMTP_USE_TLS", "1") or "1").strip().lower() in {"1", "true", "yes"})
+SENDGRID_API_KEY = (os.environ.get("PRIME_MESSAGING_SENDGRID_API_KEY", "") or "").strip()
+SENDGRID_FROM_EMAIL = (os.environ.get("PRIME_MESSAGING_SENDGRID_FROM_EMAIL", "") or "").strip()
+SENDGRID_FROM_NAME = (os.environ.get("PRIME_MESSAGING_SENDGRID_FROM_NAME", "Prime Messaging") or "Prime Messaging").strip()
+SENDGRID_OTP_SUBJECT = (os.environ.get("PRIME_MESSAGING_SENDGRID_OTP_SUBJECT", "Prime Messaging verification code") or "Prime Messaging verification code").strip()
+OTP_DEBUG_RETURN_CODE = (
+    (os.environ.get("PRIME_MESSAGING_OTP_DEBUG_RETURN_CODE", "0") or "0").strip().lower()
+    in {"1", "true", "yes"}
+)
+OTP_FAIL_OPEN_ON_DELIVERY_ERROR = (
+    (os.environ.get("PRIME_MESSAGING_OTP_FAIL_OPEN_ON_DELIVERY_ERROR", "0") or "0").strip().lower()
+    in {"1", "true", "yes"}
+)
+OTP_HASH_SECRET = (os.environ.get("PRIME_MESSAGING_OTP_HASH_SECRET", "") or "").strip() or SERVER_BUILD_ID or "prime-otp-secret"
 GUEST_ACCOUNT_LIFETIME_SECONDS = 60 * 60 * 24 * 3
 ADMIN_LOGIN = (os.environ.get("PRIME_MESSAGING_ADMIN_LOGIN", "admin") or "admin").strip().lower()
 ADMIN_PASSWORD = os.environ.get("PRIME_MESSAGING_ADMIN_PASSWORD", "Prime-admin-very-secret-2026").strip()
@@ -71,6 +104,13 @@ APNS_TEAM_ID = os.environ.get("PRIME_MESSAGING_APNS_TEAM_ID", "").strip()
 APNS_TOPIC = os.environ.get("PRIME_MESSAGING_APNS_TOPIC", "").strip()
 APNS_VOIP_TOPIC = os.environ.get("PRIME_MESSAGING_APNS_VOIP_TOPIC", "").strip()
 APNS_ENVIRONMENT = (os.environ.get("PRIME_MESSAGING_APNS_ENVIRONMENT", "auto") or "auto").strip().lower()
+APPLE_SIGNIN_AUDIENCES_RAW = (os.environ.get("PRIME_MESSAGING_APPLE_AUDIENCES", "") or "").strip()
+APPLE_SIGNIN_AUDIENCES = [item.strip() for item in APPLE_SIGNIN_AUDIENCES_RAW.split(",") if item.strip()]
+if not APPLE_SIGNIN_AUDIENCES:
+    fallback_audience = APNS_TOPIC.strip() or "prime1.prime-Messaging"
+    APPLE_SIGNIN_AUDIENCES = [fallback_audience]
+APPLE_SIGNIN_ISSUER = "https://appleid.apple.com"
+APPLE_SIGNIN_KEYS_URL = "https://appleid.apple.com/auth/keys"
 CALL_ICE_SERVERS_RAW = os.environ.get("PRIME_MESSAGING_CALL_ICE_SERVERS_JSON", "").strip()
 MEDIA_STORAGE_BACKEND = (os.environ.get("PRIME_MESSAGING_MEDIA_STORAGE_BACKEND", "local") or "local").strip().lower()
 MEDIA_S3_BUCKET = os.environ.get("PRIME_MESSAGING_MEDIA_S3_BUCKET", "").strip()
@@ -173,6 +213,361 @@ def log_event(name, **fields):
         **fields,
     }
     print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+REALTIME_EVENT_BUFFER_LIMIT = int(os.environ.get("PRIME_MESSAGING_REALTIME_EVENT_BUFFER_LIMIT", "300"))
+
+
+def websocket_accept_key(raw_key):
+    digest = hashlib.sha1((raw_key + WEBSOCKET_GUID).encode("utf-8")).digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
+def websocket_read_exact(stream, length):
+    data = b""
+    while len(data) < length:
+        chunk = stream.read(length - len(data))
+        if not chunk:
+            raise ConnectionError("websocket_stream_closed")
+        data += chunk
+    return data
+
+
+def websocket_read_frame(stream):
+    header = websocket_read_exact(stream, 2)
+    first_byte = header[0]
+    second_byte = header[1]
+
+    opcode = first_byte & 0x0F
+    masked = (second_byte & 0x80) != 0
+    payload_length = second_byte & 0x7F
+
+    if payload_length == 126:
+        payload_length = struct.unpack("!H", websocket_read_exact(stream, 2))[0]
+    elif payload_length == 127:
+        payload_length = struct.unpack("!Q", websocket_read_exact(stream, 8))[0]
+
+    if payload_length > 8 * 1024 * 1024:
+        raise ValueError("websocket_payload_too_large")
+
+    masking_key = websocket_read_exact(stream, 4) if masked else None
+    payload = websocket_read_exact(stream, payload_length) if payload_length > 0 else b""
+
+    if masked and masking_key:
+        payload = bytes(
+            payload[index] ^ masking_key[index % 4]
+            for index in range(payload_length)
+        )
+
+    return opcode, payload
+
+
+def websocket_frame(opcode, payload):
+    payload = payload or b""
+    payload_length = len(payload)
+
+    first_byte = 0x80 | (opcode & 0x0F)
+    header = bytearray([first_byte])
+
+    if payload_length < 126:
+        header.append(payload_length)
+    elif payload_length <= 0xFFFF:
+        header.append(126)
+        header.extend(struct.pack("!H", payload_length))
+    else:
+        header.append(127)
+        header.extend(struct.pack("!Q", payload_length))
+
+    return bytes(header) + payload
+
+
+class RealtimeClientState:
+    def __init__(self, connection_id, user_id, socket_connection):
+        self.connection_id = connection_id
+        self.user_id = normalized_entity_id(user_id)
+        self.socket_connection = socket_connection
+        self.send_lock = threading.Lock()
+        self.closed = False
+        self.feed_subscribed = False
+        self.subscribed_chat_ids = set()
+        self.typing_chat_ids = set()
+        self.typing_activity_at_by_chat = {}
+
+    def send_payload(self, payload):
+        if self.closed:
+            return False
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        frame = websocket_frame(0x1, body)
+        with self.send_lock:
+            if self.closed:
+                return False
+            try:
+                self.socket_connection.sendall(frame)
+                return True
+            except Exception:
+                self.closed = True
+                return False
+
+    def send_control(self, opcode, payload=b""):
+        if self.closed:
+            return False
+        frame = websocket_frame(opcode, payload)
+        with self.send_lock:
+            if self.closed:
+                return False
+            try:
+                self.socket_connection.sendall(frame)
+                return True
+            except Exception:
+                self.closed = True
+                return False
+
+
+class RealtimeHub:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.clients_by_id = {}
+        self.client_ids_by_user = {}
+        self.event_sequence_by_user = {}
+        self.event_buffer_by_user = {}
+        self.presence_activity_by_user = {}
+        self.presence_broadcast_at_by_user = {}
+        self.typing_refresh_interval_seconds = 2.0
+        self.typing_state_ttl_seconds = 7.0
+
+    def register_client(self, user_id, socket_connection):
+        client = RealtimeClientState(str(uuid.uuid4()), user_id, socket_connection)
+        user_key = normalized_entity_id(user_id)
+        with self.lock:
+            self.clients_by_id[client.connection_id] = client
+            self.client_ids_by_user.setdefault(user_key, set()).add(client.connection_id)
+        return client
+
+    def unregister_client(self, connection_id):
+        with self.lock:
+            client = self.clients_by_id.pop(connection_id, None)
+            if not client:
+                return None
+            client.closed = True
+            user_clients = self.client_ids_by_user.get(client.user_id)
+            remaining_connection_count = 0
+            if user_clients:
+                user_clients.discard(connection_id)
+                if not user_clients:
+                    self.client_ids_by_user.pop(client.user_id, None)
+                    remaining_connection_count = 0
+                else:
+                    remaining_connection_count = len(user_clients)
+            typing_chat_ids = list(client.typing_chat_ids)
+            client.typing_chat_ids.clear()
+            client.typing_activity_at_by_chat.clear()
+            return {
+                "user_id": client.user_id,
+                "remaining_connection_count": remaining_connection_count,
+                "typing_chat_ids": typing_chat_ids,
+            }
+
+    def set_feed_subscription(self, connection_id, subscribed):
+        with self.lock:
+            client = self.clients_by_id.get(connection_id)
+            if not client:
+                return False
+            client.feed_subscribed = bool(subscribed)
+            return True
+
+    def subscribe_chat(self, connection_id, chat_id):
+        normalized_chat_id = normalized_entity_id(chat_id)
+        if not normalized_chat_id:
+            return False
+        with self.lock:
+            client = self.clients_by_id.get(connection_id)
+            if not client:
+                return False
+            client.subscribed_chat_ids.add(normalized_chat_id)
+            return True
+
+    def unsubscribe_chat(self, connection_id, chat_id):
+        normalized_chat_id = normalized_entity_id(chat_id)
+        if not normalized_chat_id:
+            return False
+        with self.lock:
+            client = self.clients_by_id.get(connection_id)
+            if not client:
+                return False
+            client.subscribed_chat_ids.discard(normalized_chat_id)
+            return True
+
+    def set_typing_state(self, connection_id, chat_id, is_typing):
+        normalized_chat_id = normalized_entity_id(chat_id)
+        if not normalized_chat_id:
+            return None
+        with self.lock:
+            client = self.clients_by_id.get(connection_id)
+            if not client:
+                return None
+            now = datetime.now(timezone.utc)
+            if is_typing:
+                previous_activity_at = client.typing_activity_at_by_chat.get(normalized_chat_id)
+                client.typing_activity_at_by_chat[normalized_chat_id] = now
+                if normalized_chat_id in client.typing_chat_ids:
+                    if not previous_activity_at:
+                        return "refreshed"
+                    elapsed = (now - previous_activity_at).total_seconds()
+                    if elapsed >= float(self.typing_refresh_interval_seconds):
+                        return "refreshed"
+                    return None
+                client.typing_chat_ids.add(normalized_chat_id)
+                return "started"
+            client.typing_activity_at_by_chat.pop(normalized_chat_id, None)
+            if normalized_chat_id not in client.typing_chat_ids:
+                return None
+            client.typing_chat_ids.discard(normalized_chat_id)
+            return "stopped"
+
+    def collect_expired_typing_states(self):
+        now = datetime.now(timezone.utc)
+        expired = []
+        with self.lock:
+            for client in self.clients_by_id.values():
+                if not client.typing_chat_ids:
+                    continue
+                for chat_id in list(client.typing_chat_ids):
+                    activity_at = client.typing_activity_at_by_chat.get(chat_id)
+                    if activity_at and (now - activity_at).total_seconds() <= float(self.typing_state_ttl_seconds):
+                        continue
+                    client.typing_chat_ids.discard(chat_id)
+                    client.typing_activity_at_by_chat.pop(chat_id, None)
+                    expired.append({"user_id": client.user_id, "chat_id": chat_id})
+        return expired
+
+    def touch_user_presence(self, user_id, at_time=None):
+        normalized_user_id = normalized_entity_id(user_id)
+        if not normalized_user_id:
+            return
+        with self.lock:
+            self.presence_activity_by_user[normalized_user_id] = at_time or datetime.now(timezone.utc)
+
+    def latest_presence_activity(self, user_id):
+        normalized_user_id = normalized_entity_id(user_id)
+        if not normalized_user_id:
+            return None
+        with self.lock:
+            return self.presence_activity_by_user.get(normalized_user_id)
+
+    def has_active_connection(self, user_id):
+        normalized_user_id = normalized_entity_id(user_id)
+        if not normalized_user_id:
+            return False
+        with self.lock:
+            return bool(self.client_ids_by_user.get(normalized_user_id))
+
+    def should_broadcast_presence(self, user_id, min_interval_seconds=12.0, force=False):
+        normalized_user_id = normalized_entity_id(user_id)
+        if not normalized_user_id:
+            return False
+        with self.lock:
+            now = datetime.now(timezone.utc)
+            last_broadcast_at = self.presence_broadcast_at_by_user.get(normalized_user_id)
+            if force or not last_broadcast_at:
+                self.presence_broadcast_at_by_user[normalized_user_id] = now
+                return True
+            if (now - last_broadcast_at).total_seconds() >= float(min_interval_seconds):
+                self.presence_broadcast_at_by_user[normalized_user_id] = now
+                return True
+            return False
+
+    def replay_since(self, connection_id, since_seq):
+        stale_connection_ids = []
+        with self.lock:
+            client = self.clients_by_id.get(connection_id)
+            if not client:
+                return
+            user_events = self.event_buffer_by_user.get(client.user_id, [])
+            replay_items = [item for item in user_events if int(item.get("seq") or 0) > int(since_seq or 0)]
+
+        for item in replay_items:
+            if not self._should_deliver(client, item):
+                continue
+            if client.send_payload(item.get("payload") or {}) is False:
+                stale_connection_ids.append(client.connection_id)
+                break
+
+        for stale_id in stale_connection_ids:
+            self.unregister_client(stale_id)
+
+    def send_to_connection(self, connection_id, payload):
+        with self.lock:
+            client = self.clients_by_id.get(connection_id)
+        if not client:
+            return False
+        if client.send_payload(payload):
+            return True
+        self.unregister_client(connection_id)
+        return False
+
+    def enqueue_event(self, user_id, payload, chat_id=None, dispatch_kind="chat"):
+        normalized_user_id = normalized_entity_id(user_id)
+        if not normalized_user_id:
+            return
+
+        normalized_chat_id = normalized_entity_id(chat_id)
+        stale_connection_ids = []
+        with self.lock:
+            next_seq = int(self.event_sequence_by_user.get(normalized_user_id, 0)) + 1
+            self.event_sequence_by_user[normalized_user_id] = next_seq
+
+            envelope = dict(payload or {})
+            envelope["seq"] = next_seq
+            envelope.setdefault("timestamp", now_iso())
+            if normalized_chat_id and not envelope.get("chatID"):
+                envelope["chatID"] = normalized_chat_id
+
+            buffered_events = self.event_buffer_by_user.setdefault(normalized_user_id, [])
+            buffered_events.append(
+                {
+                    "seq": next_seq,
+                    "dispatch_kind": dispatch_kind,
+                    "chat_id": normalized_chat_id,
+                    "payload": envelope,
+                }
+            )
+            if len(buffered_events) > REALTIME_EVENT_BUFFER_LIMIT:
+                self.event_buffer_by_user[normalized_user_id] = buffered_events[-REALTIME_EVENT_BUFFER_LIMIT:]
+
+            recipient_clients = [
+                self.clients_by_id[client_id]
+                for client_id in self.client_ids_by_user.get(normalized_user_id, set())
+                if client_id in self.clients_by_id
+            ]
+
+        wrapped_event = {
+            "dispatch_kind": dispatch_kind,
+            "chat_id": normalized_chat_id,
+            "payload": envelope,
+        }
+        for client in recipient_clients:
+            if not self._should_deliver(client, wrapped_event):
+                continue
+            if client.send_payload(envelope) is False:
+                stale_connection_ids.append(client.connection_id)
+
+        for stale_id in stale_connection_ids:
+            self.unregister_client(stale_id)
+
+    def _should_deliver(self, client, wrapped_event):
+        dispatch_kind = (wrapped_event.get("dispatch_kind") or "chat").strip().lower()
+        chat_id = normalized_entity_id(wrapped_event.get("chat_id"))
+        if dispatch_kind == "message":
+            return chat_id in client.subscribed_chat_ids
+        if dispatch_kind == "system":
+            return True
+        if client.feed_subscribed:
+            return True
+        return chat_id in client.subscribed_chat_ids if chat_id else True
+
+
+REALTIME_HUB = RealtimeHub()
 
 
 class APNsProvider:
@@ -365,6 +760,8 @@ APNS_PROVIDER = APNsProvider(
     environment=APNS_ENVIRONMENT,
     timeout_seconds=APNS_TIMEOUT_SECONDS,
 )
+APPLE_SIGNIN_JWK_CLIENT = None
+APPLE_SIGNIN_JWK_CLIENT_LOCK = threading.Lock()
 
 
 class MediaObjectStorage:
@@ -774,6 +1171,66 @@ def is_valid_email(value):
     return len(parts) == 2 and bool(parts[0]) and bool(parts[1]) and "." in parts[1]
 
 
+def normalized_apple_user_id(value):
+    return normalized_optional_string(value)
+
+
+def apple_claim_truthy(value):
+    if isinstance(value, bool):
+        return value
+    normalized = normalized_optional_string(value)
+    return normalized in {"1", "true", "yes"}
+
+
+def apple_signin_jwk_client():
+    global APPLE_SIGNIN_JWK_CLIENT
+    with APPLE_SIGNIN_JWK_CLIENT_LOCK:
+        if APPLE_SIGNIN_JWK_CLIENT is not None:
+            return APPLE_SIGNIN_JWK_CLIENT
+        if jwt is None:
+            return None
+        try:
+            APPLE_SIGNIN_JWK_CLIENT = jwt.PyJWKClient(APPLE_SIGNIN_KEYS_URL, cache_keys=True)
+        except TypeError:
+            APPLE_SIGNIN_JWK_CLIENT = jwt.PyJWKClient(APPLE_SIGNIN_KEYS_URL)
+        return APPLE_SIGNIN_JWK_CLIENT
+
+
+def verify_apple_identity_token(identity_token):
+    if jwt is None:
+        return None, "apple_signin_unavailable"
+    if not APPLE_SIGNIN_AUDIENCES:
+        return None, "apple_signin_unavailable"
+    if not identity_token:
+        return None, "apple_token_invalid"
+
+    jwk_client = apple_signin_jwk_client()
+    if jwk_client is None:
+        return None, "apple_signin_unavailable"
+
+    audience = APPLE_SIGNIN_AUDIENCES if len(APPLE_SIGNIN_AUDIENCES) > 1 else APPLE_SIGNIN_AUDIENCES[0]
+
+    try:
+        signing_key = jwk_client.get_signing_key_from_jwt(identity_token)
+        claims = jwt.decode(
+            identity_token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=audience,
+            issuer=APPLE_SIGNIN_ISSUER,
+            options={"require": ["sub", "exp", "iat", "iss", "aud"]},
+        )
+        return claims, None
+    except Exception as error:
+        error_name = type(error).__name__
+        if error_name == "ExpiredSignatureError":
+            return None, "apple_token_expired"
+        if error_name in {"InvalidSignatureError", "InvalidIssuerError", "InvalidAudienceError", "DecodeError", "InvalidTokenError", "MissingRequiredClaimError"}:
+            return None, "apple_token_invalid"
+        log_event("auth.apple_signin.verify_failed", reason=error_name)
+        return None, "apple_signin_failed"
+
+
 def ensure_storage():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(AVATAR_DIR, exist_ok=True)
@@ -784,8 +1241,13 @@ def ensure_storage():
             "users": [],
             "chats": [],
             "messages": [],
+            "sessions": [],
+            "deviceTokens": [],
+            "otpChallenges": [],
             "calls": [],
             "callEvents": [],
+            "chatReadMarkers": [],
+            "blocks": [],
         }
         with open(DATA_FILE, "w", encoding="utf-8") as file:
             json.dump(seed, file, indent=2)
@@ -839,12 +1301,15 @@ def unique_entity_ids(values):
 def ensure_database_schema(database):
     did_update = False
 
-    for key in ("users", "chats", "messages", "sessions", "deviceTokens", "calls", "callEvents", "chatReadMarkers"):
+    for key in ("users", "chats", "messages", "sessions", "deviceTokens", "otpChallenges", "calls", "callEvents", "chatReadMarkers", "blocks"):
         if key not in database:
             database[key] = []
             did_update = True
 
     if normalize_database_entities(database):
+        did_update = True
+
+    if prune_otp_challenges(database):
         did_update = True
 
     return did_update
@@ -869,6 +1334,102 @@ def find_message(database, message_id):
     if not message_id:
         return None
     return next((message for message in database["messages"] if ids_equal(message.get("id"), message_id)), None)
+
+
+def normalized_block_relation(record):
+    if not isinstance(record, dict):
+        return None
+
+    blocker_id = normalized_entity_id(
+        record.get("blockerUserID")
+        or record.get("blocker_user_id")
+    )
+    blocked_id = normalized_entity_id(
+        record.get("blockedUserID")
+        or record.get("blocked_user_id")
+    )
+    if not blocker_id or not blocked_id or ids_equal(blocker_id, blocked_id):
+        return None
+
+    created_at = normalized_optional_string(record.get("createdAt")) or now_iso()
+    return {
+        "blockerUserID": blocker_id,
+        "blockedUserID": blocked_id,
+        "createdAt": created_at,
+    }
+
+
+def users_blocked_each_other(database, first_user_id, second_user_id):
+    first_user_id = normalized_entity_id(first_user_id)
+    second_user_id = normalized_entity_id(second_user_id)
+    if not first_user_id or not second_user_id:
+        return False
+
+    return any(
+        (
+            ids_equal(entry.get("blockerUserID"), first_user_id)
+            and ids_equal(entry.get("blockedUserID"), second_user_id)
+        )
+        or (
+            ids_equal(entry.get("blockerUserID"), second_user_id)
+            and ids_equal(entry.get("blockedUserID"), first_user_id)
+        )
+        for entry in database.get("blocks", [])
+    )
+
+
+def set_block_relation(database, blocker_user_id, blocked_user_id):
+    blocker_user_id = normalized_entity_id(blocker_user_id)
+    blocked_user_id = normalized_entity_id(blocked_user_id)
+    if not blocker_user_id or not blocked_user_id or ids_equal(blocker_user_id, blocked_user_id):
+        return False
+
+    if any(
+        ids_equal(entry.get("blockerUserID"), blocker_user_id)
+        and ids_equal(entry.get("blockedUserID"), blocked_user_id)
+        for entry in database.get("blocks", [])
+    ):
+        return False
+
+    database.setdefault("blocks", []).append({
+        "blockerUserID": blocker_user_id,
+        "blockedUserID": blocked_user_id,
+        "createdAt": now_iso(),
+    })
+    return True
+
+
+def remove_block_relation(database, blocker_user_id, blocked_user_id):
+    blocker_user_id = normalized_entity_id(blocker_user_id)
+    blocked_user_id = normalized_entity_id(blocked_user_id)
+    if not blocker_user_id or not blocked_user_id:
+        return False
+
+    previous_count = len(database.get("blocks", []))
+    database["blocks"] = [
+        entry
+        for entry in database.get("blocks", [])
+        if not (
+            ids_equal(entry.get("blockerUserID"), blocker_user_id)
+            and ids_equal(entry.get("blockedUserID"), blocked_user_id)
+        )
+    ]
+    return len(database.get("blocks", [])) != previous_count
+
+
+def remove_block_relations_for_user(database, user_id):
+    user_id = normalized_entity_id(user_id)
+    if not user_id:
+        return False
+
+    previous_count = len(database.get("blocks", []))
+    database["blocks"] = [
+        entry
+        for entry in database.get("blocks", [])
+        if not ids_equal(entry.get("blockerUserID"), user_id)
+        and not ids_equal(entry.get("blockedUserID"), user_id)
+    ]
+    return len(database.get("blocks", [])) != previous_count
 
 
 def prefer_first_timestamp(lhs, rhs):
@@ -1306,6 +1867,40 @@ def normalize_database_entities(database):
         normalized_sessions.append(session)
     database["sessions"] = normalized_sessions
 
+    normalized_otp_challenges = []
+    for challenge in database.get("otpChallenges", []):
+        challenge_id = normalized_entity_id(challenge.get("id")) or str(uuid.uuid4())
+        identifier = normalized_identifier_for_otp(challenge.get("identifier"))
+        purpose = normalized_otp_purpose(challenge.get("purpose"))
+        if not identifier or not purpose:
+            did_update = True
+            continue
+        created_at = normalized_optional_string(challenge.get("createdAt")) or now_iso()
+        expires_at = normalized_optional_string(challenge.get("expiresAt")) or expires_at_iso(OTP_CHALLENGE_TTL_SECONDS)
+        resend_available_at = normalized_optional_string(challenge.get("resendAvailableAt")) or created_at
+        attempt_limit = int(challenge.get("attemptLimit") or OTP_VERIFY_ATTEMPT_LIMIT)
+        attempts_used = int(challenge.get("attemptsUsed") or 0)
+        normalized_record = {
+            "id": challenge_id,
+            "identifier": identifier,
+            "purpose": purpose,
+            "codeHash": normalized_optional_string(challenge.get("codeHash")),
+            "channel": normalized_optional_string(challenge.get("channel")) or otp_channel_for_identifier(identifier),
+            "destinationMasked": normalized_optional_string(challenge.get("destinationMasked")) or masked_otp_destination(identifier),
+            "createdAt": created_at,
+            "expiresAt": expires_at,
+            "resendAvailableAt": resend_available_at,
+            "attemptLimit": max(1, attempt_limit),
+            "attemptsUsed": max(0, attempts_used),
+            "verifiedAt": normalized_optional_string(challenge.get("verifiedAt")),
+            "consumedAt": normalized_optional_string(challenge.get("consumedAt")),
+            "debugCode": normalized_optional_string(challenge.get("debugCode")),
+        }
+        normalized_otp_challenges.append(normalized_record)
+        if normalized_record != challenge:
+            did_update = True
+    database["otpChallenges"] = normalized_otp_challenges
+
     normalized_read_markers = []
     grouped_read_markers = {}
     for marker in database.get("chatReadMarkers", []):
@@ -1492,6 +2087,40 @@ def normalize_database_entities(database):
         normalized_call_events.append(event)
     database["callEvents"] = normalized_call_events
 
+    normalized_blocks = []
+    seen_block_pairs = set()
+    for entry in database.get("blocks", []):
+        normalized_entry = normalized_block_relation(entry)
+        if not normalized_entry:
+            did_update = True
+            continue
+
+        blocker_id = user_id_map.get(
+            normalized_optional_string(normalized_entry.get("blockerUserID")),
+            normalized_entity_id(normalized_entry.get("blockerUserID"))
+        )
+        blocked_id = user_id_map.get(
+            normalized_optional_string(normalized_entry.get("blockedUserID")),
+            normalized_entity_id(normalized_entry.get("blockedUserID"))
+        )
+        if not blocker_id or not blocked_id or ids_equal(blocker_id, blocked_id):
+            did_update = True
+            continue
+
+        if not find_user(database, blocker_id) or not find_user(database, blocked_id):
+            did_update = True
+            continue
+
+        normalized_entry["blockerUserID"] = blocker_id
+        normalized_entry["blockedUserID"] = blocked_id
+        block_key = (blocker_id, blocked_id)
+        if block_key in seen_block_pairs:
+            did_update = True
+            continue
+        seen_block_pairs.add(block_key)
+        normalized_blocks.append(normalized_entry)
+    database["blocks"] = normalized_blocks
+
     return did_update
 
 
@@ -1659,7 +2288,16 @@ def authenticated_user(database, headers):
 
     user = find_user(database, session.get("userID"))
     if not user:
-        return None, None, "user_not_found"
+        # Orphaned session (session points to a deleted/missing user).
+        # Treat it as invalid credentials and remove it to prevent repeated bad auth loops.
+        session_id = normalized_entity_id(session.get("id"))
+        if session_id:
+            database["sessions"] = [
+                entry for entry in database.get("sessions", [])
+                if not ids_equal(entry.get("id"), session_id)
+            ]
+            save_db(database)
+        return None, None, "invalid_credentials"
     if is_user_banned(user):
         return None, None, "account_banned"
 
@@ -1728,7 +2366,7 @@ def ensure_legacy_placeholder_user(database, user_id):
         "profile": {
             "displayName": "Prime User",
             "username": username,
-            "bio": "Welcome to Prime Messaging.",
+            "bio": "",
             "status": "Available",
             "email": None,
             "phoneNumber": None,
@@ -1836,12 +2474,29 @@ def latest_user_device_token_activity(database, user_id):
 def latest_user_presence_activity(database, user_id):
     session_activity = latest_user_session_activity(database, user_id)
     token_activity = latest_user_device_token_activity(database, user_id)
-    if session_activity and token_activity:
-        return max(session_activity, token_activity)
-    return session_activity or token_activity
+    realtime_activity = None
+    realtime_hub = globals().get("REALTIME_HUB")
+    if realtime_hub:
+        try:
+            realtime_activity = realtime_hub.latest_presence_activity(user_id)
+        except Exception:
+            realtime_activity = None
+
+    activities = [activity for activity in (session_activity, token_activity, realtime_activity) if activity]
+    if not activities:
+        return None
+    return max(activities)
 
 
 def user_is_online(database, user_id):
+    realtime_hub = globals().get("REALTIME_HUB")
+    if realtime_hub:
+        try:
+            if realtime_hub.has_active_connection(user_id):
+                return True
+        except Exception:
+            pass
+
     latest_activity = latest_user_presence_activity(database, user_id)
     if not latest_activity:
         return False
@@ -1912,26 +2567,434 @@ def privacy_settings_for(user):
 
 
 def find_user_by_identifier(database, identifier):
-    identifier = (identifier or "").strip().lower()
-    username_identifier = identifier.lstrip("@")
-    phone_identifier = normalize_phone_number(identifier)
+    matches = find_users_by_identifier(database, identifier)
+    return matches[0] if matches else None
+
+
+def find_users_by_identifier(database, identifier):
+    normalized_identifier = (identifier or "").strip().lower()
+    username_identifier = normalized_identifier.lstrip("@")
+    email_identifier = normalize_email(normalized_identifier)
+    phone_identifier = normalize_phone_number(normalized_identifier)
+    matches = []
     for user in database["users"]:
         profile = user["profile"]
         if (profile["username"] or "").lower() == username_identifier:
-            return user
-        if (profile.get("email") or "").lower() == identifier:
-            return user
-        if (profile.get("phoneNumber") or "") == phone_identifier:
-            return user
+            matches.append(user)
+            continue
+        if email_identifier and normalize_email(profile.get("email")) == email_identifier:
+            matches.append(user)
+            continue
+        if phone_identifier and normalize_phone_number(profile.get("phoneNumber") or "") == phone_identifier:
+            matches.append(user)
+            continue
+    if len(matches) > 1:
+        matches = sorted(matches, key=lambda candidate: identifier_match_sort_key(candidate, identifier))
+    return matches
+
+
+def preferred_user_from_candidates(candidates):
+    if not candidates:
+        return None
+
+    def sort_key(user):
+        created_at = parse_iso_datetime((user or {}).get("createdAt"))
+        return created_at or datetime.fromtimestamp(0, timezone.utc)
+
+    return sorted(candidates, key=sort_key, reverse=True)[0]
+
+
+def identifier_match_rank(user, identifier):
+    normalized_identifier = (identifier or "").strip().lower()
+    username_identifier = normalized_identifier.lstrip("@")
+    email_identifier = normalize_email(normalized_identifier)
+    phone_identifier = normalize_phone_number(normalized_identifier)
+
+    explicit_username = normalized_identifier.startswith("@")
+    explicit_email = bool(email_identifier and "@" in normalized_identifier and "." in normalized_identifier)
+    explicit_phone = bool(phone_identifier and explicit_email is False and any(character.isdigit() for character in normalized_identifier))
+
+    profile = (user or {}).get("profile") or {}
+    profile_username = normalized_optional_string(profile.get("username")) or ""
+    profile_email = normalize_email(profile.get("email"))
+    profile_phone = normalize_phone_number(profile.get("phoneNumber") or "")
+
+    ranks = []
+    if profile_username.lower() == username_identifier:
+        ranks.append(0 if explicit_username else 30)
+    if profile_email and email_identifier and profile_email == email_identifier:
+        ranks.append(5 if explicit_email else 35)
+    if profile_phone and phone_identifier and profile_phone == phone_identifier:
+        ranks.append(10 if explicit_phone else 40)
+
+    return min(ranks) if ranks else 90
+
+
+def identifier_match_sort_key(user, identifier):
+    created_at = parse_iso_datetime((user or {}).get("createdAt")) or datetime.fromtimestamp(0, timezone.utc)
+    return (
+        identifier_match_rank(user, identifier),
+        -created_at.timestamp(),
+    )
+
+
+def resolve_user_from_identifier(candidates, identifier):
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda candidate: identifier_match_sort_key(candidate, identifier))[0]
+
+
+def find_user_by_apple_subject(database, apple_subject):
+    normalized_subject = normalized_apple_user_id(apple_subject)
+    if not normalized_subject:
+        return None
+
+    return next(
+        (
+            user
+            for user in database.get("users", [])
+            if normalized_apple_user_id((user.get("appleIdentity") or {}).get("sub")) == normalized_subject
+        ),
+        None
+    )
+
+
+def apple_display_name(given_name=None, family_name=None, email=None):
+    given = normalized_optional_string(given_name) or ""
+    family = normalized_optional_string(family_name) or ""
+    full = f"{given} {family}".strip()
+    if full:
+        return full
+    normalized_email = normalize_email(email)
+    if normalized_email and "@" in normalized_email:
+        local = normalized_email.split("@", 1)[0].strip()
+        if local:
+            return local
+    return "Apple User"
+
+
+def generate_username_from_seed(database, seed):
+    normalized_seed = normalize_username(seed or "")
+    base = normalized_seed or "appleuser"
+    if len(base) < 5:
+        base = f"apple{base}"
+    base = base[:20]
+    if not base:
+        base = "appleuser"
+
+    if is_valid_username(base) and not username_taken(database, base):
+        return base
+
+    for attempt in range(0, 1000):
+        suffix = str(attempt)
+        prefix_limit = max(5, 32 - len(suffix))
+        candidate = f"{base[:prefix_limit]}{suffix}"
+        if is_valid_username(candidate) and not username_taken(database, candidate):
+            return candidate
+
+    fallback = f"apple{uuid.uuid4().hex[:10]}"
+    return fallback[:32]
+
+
+def normalized_otp_purpose(value):
+    normalized = normalized_optional_string(value)
+    if normalized in {"signup", "login", "reset_password"}:
+        return normalized
     return None
+
+
+def normalized_identifier_for_otp(value):
+    normalized_email = normalize_email(value)
+    if normalized_email and is_valid_email(normalized_email):
+        return normalized_email
+    normalized_phone = normalize_phone_number(value)
+    if normalized_phone and is_valid_phone_number(normalized_phone):
+        return normalized_phone
+    normalized_username = normalize_username((value or "").strip().lstrip("@"))
+    if normalized_username and is_valid_legacy_username(normalized_username):
+        return normalized_username
+    return None
+
+
+def otp_channel_for_identifier(identifier):
+    return "email" if "@" in (identifier or "") else "sms"
+
+
+def masked_otp_destination(identifier):
+    identifier = identifier or ""
+    if "@" in identifier:
+        local, domain = identifier.split("@", 1)
+        local_prefix = local[:2]
+        return f"{local_prefix}***@{domain}"
+    if identifier.startswith("+") and len(identifier) > 5:
+        return f"{identifier[:3]}***{identifier[-2:]}"
+    if len(identifier) > 4:
+        return f"{identifier[:2]}***{identifier[-2:]}"
+    return "***"
+
+
+def otp_code_hash(challenge_id, otp_code):
+    code = normalized_optional_string(otp_code) or ""
+    payload = f"{OTP_HASH_SECRET}:{challenge_id}:{code}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def prune_otp_challenges(database):
+    now = datetime.now(timezone.utc)
+    previous = database.get("otpChallenges") or []
+    retained = []
+    for challenge in previous:
+        expires_at = parse_iso_datetime(challenge.get("expiresAt"))
+        consumed_at = parse_iso_datetime(challenge.get("consumedAt"))
+        if consumed_at and now - consumed_at > timedelta(hours=24):
+            continue
+        if expires_at and now - expires_at > timedelta(days=1):
+            continue
+        retained.append(challenge)
+    if retained != previous:
+        database["otpChallenges"] = retained
+        return True
+    return False
+
+
+def otp_public_payload(challenge):
+    attempt_limit = int(challenge.get("attemptLimit") or OTP_VERIFY_ATTEMPT_LIMIT)
+    attempts_used = int(challenge.get("attemptsUsed") or 0)
+    payload = {
+        "challenge_id": challenge.get("id"),
+        "expires_at": challenge.get("expiresAt"),
+        "resend_available_at": challenge.get("resendAvailableAt"),
+        "attempt_limit": attempt_limit,
+        "remaining_attempts": max(0, attempt_limit - attempts_used),
+        "channel": challenge.get("channel"),
+        "destination_masked": challenge.get("destinationMasked"),
+    }
+    if OTP_DEBUG_RETURN_CODE:
+        payload["debug_otp_code"] = challenge.get("debugCode")
+    return payload
+
+
+def normalized_otp_delivery_failure_reason(raw_reason):
+    reason = normalized_optional_string(raw_reason) or "unknown_provider_error"
+    lowered = reason.lower()
+
+    if reason in {
+        "otp_provider_not_configured",
+        "otp_channel_not_supported",
+        "httpx_not_installed",
+        "unsupported_otp_provider",
+    }:
+        return reason
+
+    if lowered.startswith("sendgrid_http_401"):
+        return "sendgrid_auth_failed"
+    if lowered.startswith("sendgrid_http_429"):
+        return "sendgrid_rate_limited"
+    if lowered.startswith("sendgrid_http_5"):
+        return "sendgrid_unavailable"
+    if lowered.startswith("sendgrid_http_403"):
+        if "verified sender identity" in lowered or "from address does not match a verified sender identity" in lowered:
+            return "sendgrid_sender_not_verified"
+        return "sendgrid_forbidden"
+    if lowered.startswith("sendgrid_http_"):
+        return "sendgrid_request_failed"
+
+    if lowered.startswith("provider_http_"):
+        return "provider_http_failed"
+    if lowered.startswith("vonage_error_"):
+        return "vonage_delivery_failed"
+
+    return "provider_error"
+
+
+def otp_provider_send_code(identifier, channel, otp_code, purpose, challenge_id, expires_at):
+    if OTP_PROVIDER in {"mock", "console"}:
+        log_event(
+            "otp.delivery.mock",
+            identifier=identifier,
+            channel=channel,
+            purpose=purpose,
+            challenge_id=challenge_id,
+            expires_at=expires_at,
+            otp_code=otp_code,
+        )
+        return True, None
+
+    if OTP_PROVIDER == "webhook":
+        if not OTP_PROVIDER_WEBHOOK_URL:
+            return False, "otp_provider_not_configured"
+        if httpx is None:
+            return False, "httpx_not_installed"
+        request_body = {
+            "identifier": identifier,
+            "channel": channel,
+            "otp_code": otp_code,
+            "purpose": purpose,
+            "challenge_id": challenge_id,
+            "expires_at": expires_at,
+        }
+        headers = {"Content-Type": "application/json"}
+        if OTP_PROVIDER_WEBHOOK_TOKEN:
+            headers["Authorization"] = f"Bearer {OTP_PROVIDER_WEBHOOK_TOKEN}"
+        try:
+            with httpx.Client(timeout=8.0) as client:
+                response = client.post(OTP_PROVIDER_WEBHOOK_URL, json=request_body, headers=headers)
+            if 200 <= response.status_code < 300:
+                return True, None
+            return False, f"provider_http_{response.status_code}"
+        except Exception as error:
+            return False, str(error)
+
+    if OTP_PROVIDER == "vonage":
+        if channel != "sms":
+            return False, "otp_channel_not_supported"
+        if not VONAGE_API_KEY or not VONAGE_API_SECRET:
+            return False, "otp_provider_not_configured"
+        if httpx is None:
+            return False, "httpx_not_installed"
+        text = f"Prime Messaging OTP: {otp_code}. Expires in {max(1, OTP_CHALLENGE_TTL_SECONDS // 60)} min."
+        form_data = {
+            "api_key": VONAGE_API_KEY,
+            "api_secret": VONAGE_API_SECRET,
+            "to": identifier,
+            "from": VONAGE_SMS_FROM[:11] or "PrimeMsg",
+            "text": text,
+        }
+        try:
+            with httpx.Client(timeout=10) as client:
+                response = client.post("https://rest.nexmo.com/sms/json", data=form_data)
+            response.raise_for_status()
+            payload = response.json()
+            messages = payload.get("messages") if isinstance(payload, dict) else None
+            first = messages[0] if isinstance(messages, list) and messages else {}
+            status = str(first.get("status", ""))
+            if status != "0":
+                return False, f"vonage_error_{first.get('error-text', 'unknown')}"
+            return True, None
+        except Exception as error:
+            return False, str(error)
+
+    if OTP_PROVIDER == "smtp":
+        if channel != "email":
+            return False, "otp_channel_not_supported"
+        if not SMTP_HOST or not SMTP_USERNAME or not SMTP_PASSWORD or not SMTP_FROM:
+            return False, "otp_provider_not_configured"
+        try:
+            message = EmailMessage()
+            message["Subject"] = "Prime Messaging OTP"
+            message["From"] = SMTP_FROM
+            message["To"] = identifier
+            message.set_content(
+                f"Your Prime Messaging OTP code is: {otp_code}\n"
+                f"Purpose: {purpose}\n"
+                f"Expires at: {expires_at}\n"
+                "If you did not request this code, please ignore this e-mail."
+            )
+
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
+                if SMTP_USE_TLS:
+                    smtp.starttls()
+                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+                smtp.send_message(message)
+            return True, None
+        except Exception as error:
+            return False, str(error)
+
+    if OTP_PROVIDER == "sendgrid":
+        if channel != "email":
+            return False, "otp_channel_not_supported"
+        if not SENDGRID_API_KEY or not SENDGRID_FROM_EMAIL:
+            return False, "otp_provider_not_configured"
+        if httpx is None:
+            return False, "httpx_not_installed"
+
+        purpose_title = {
+            "signup": "Sign up",
+            "login": "Sign in",
+            "reset_password": "Password reset",
+        }.get(purpose, "Verification")
+        text_body = (
+            f"{SENDGRID_FROM_NAME} verification code: {otp_code}\n\n"
+            f"Action: {purpose_title}\n"
+            f"Expires at: {expires_at}\n\n"
+            "If you did not request this code, ignore this e-mail."
+        )
+        html_body = f"""
+        <html>
+          <body style="margin:0;padding:0;background:#0b0b0f;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;color:#f2f2f7;">
+            <table width="100%" cellpadding="0" cellspacing="0" style="padding:24px;">
+              <tr>
+                <td align="center">
+                  <table width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#15161a;border:1px solid #2a2c33;border-radius:18px;overflow:hidden;">
+                    <tr><td style="height:4px;background:linear-gradient(90deg,#d7263d,#ff5a5f);"></td></tr>
+                    <tr>
+                      <td style="padding:28px 24px;">
+                        <div style="font-size:20px;font-weight:700;color:#ffffff;">{SENDGRID_FROM_NAME}</div>
+                        <div style="margin-top:6px;font-size:14px;color:#a9adb8;">{purpose_title}</div>
+                        <div style="margin-top:22px;font-size:14px;color:#cfd3dd;">Your verification code</div>
+                        <div style="margin-top:8px;display:inline-block;background:#1e2027;border:1px solid #313441;border-radius:12px;padding:12px 18px;font-size:30px;letter-spacing:6px;font-weight:800;color:#ff5a5f;">{otp_code}</div>
+                        <div style="margin-top:16px;font-size:13px;color:#9aa0ad;">Expires at: {expires_at}</div>
+                        <div style="margin-top:24px;font-size:12px;color:#8b90a0;">If you did not request this code, ignore this e-mail.</div>
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+            </table>
+          </body>
+        </html>
+        """
+        payload = {
+            "personalizations": [{"to": [{"email": identifier}]}],
+            "from": {
+                "email": SENDGRID_FROM_EMAIL,
+                "name": SENDGRID_FROM_NAME,
+            },
+            "subject": SENDGRID_OTP_SUBJECT,
+            "content": [
+                {"type": "text/plain", "value": text_body},
+                {"type": "text/html", "value": html_body},
+            ],
+        }
+        headers = {
+            "Authorization": f"Bearer {SENDGRID_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.post("https://api.sendgrid.com/v3/mail/send", json=payload, headers=headers)
+            if response.status_code == 202:
+                return True, None
+            response_body = (response.text or "").strip()
+            if response_body:
+                return False, f"sendgrid_http_{response.status_code}_{response_body[:180]}"
+            return False, f"sendgrid_http_{response.status_code}"
+        except Exception as error:
+            return False, str(error)
+
+    return False, "unsupported_otp_provider"
+
+
+def latest_otp_challenge(database, identifier, purpose):
+    candidates = [
+        challenge for challenge in database.get("otpChallenges", [])
+        if challenge.get("identifier") == identifier
+        and challenge.get("purpose") == purpose
+        and not challenge.get("consumedAt")
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: parse_iso_datetime(item.get("createdAt")) or datetime.min.replace(tzinfo=timezone.utc))
 
 
 def username_taken(database, username, excluding_user_id=None):
     username = normalize_username(username)
-    for user in database["users"]:
-        if excluding_user_id and ids_equal(user["id"], excluding_user_id):
+    for user in database.get("users", []):
+        user_id = normalized_entity_id(user.get("id"))
+        if excluding_user_id and user_id and ids_equal(user_id, excluding_user_id):
             continue
-        if (user["profile"].get("username") or "").lower() == username:
+        profile = user.get("profile") if isinstance(user.get("profile"), dict) else {}
+        if (normalized_optional_string(profile.get("username")) or "").lower() == username:
             return True
     return False
 
@@ -1986,6 +3049,11 @@ def purge_expired_guests(database):
     database["deviceTokens"] = [
         item for item in database.get("deviceTokens", [])
         if normalized_entity_id(item.get("userID")) not in expired_guest_ids
+    ]
+    database["blocks"] = [
+        entry for entry in database.get("blocks", [])
+        if normalized_entity_id(entry.get("blockerUserID")) not in expired_guest_ids
+        and normalized_entity_id(entry.get("blockedUserID")) not in expired_guest_ids
     ]
 
     removed_chat_ids = {
@@ -2051,6 +3119,24 @@ def normalized_optional_string(value):
     return cleaned or None
 
 
+def normalized_optional_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return bool(value)
+    normalized = normalized_optional_string(value)
+    if normalized is None:
+        return None
+    lowered = normalized.lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
 def normalized_device_platform(value):
     normalized = normalized_optional_string(value)
     return normalized.lower() if normalized else None
@@ -2107,14 +3193,13 @@ def sanitized_profile(profile):
 
 def visible_profile_for_viewer(profile, viewer, target_user):
     payload = sanitized_profile(profile)
+    payload["phoneNumber"] = None
     if not viewer or ids_equal((viewer or {}).get("id"), (target_user or {}).get("id")):
         return payload
 
     privacy_settings = privacy_settings_for(target_user)
     if not privacy_settings.get("showEmail", True):
         payload["email"] = None
-    if not privacy_settings.get("showPhoneNumber", False):
-        payload["phoneNumber"] = None
     if not privacy_settings.get("allowProfilePhoto", True):
         payload["profilePhotoURL"] = None
     return payload
@@ -2240,6 +3325,15 @@ def normalized_community_details(raw_details, database, existing_details=None, r
     if incoming_is_official != previous_is_official and not is_official_channel_editor(requester):
         raise PermissionError("official_badge_permission_denied")
 
+    previous_admin_blocked = bool(existing_details.get("isBlockedByAdmin"))
+    incoming_admin_blocked = bool(
+        raw_details.get("isBlockedByAdmin")
+        if "isBlockedByAdmin" in raw_details
+        else raw_details.get("is_blocked_by_admin", previous_admin_blocked)
+    )
+    if incoming_admin_blocked != previous_admin_blocked and not is_official_channel_editor(requester):
+        raise PermissionError("admin_block_permission_denied")
+
     return {
         "kind": kind,
         "forumModeEnabled": bool(
@@ -2261,6 +3355,7 @@ def normalized_community_details(raw_details, database, existing_details=None, r
         "inviteCode": invite_code,
         "inviteLink": invite_link_for_code(invite_code),
         "isOfficial": incoming_is_official,
+        "isBlockedByAdmin": incoming_admin_blocked,
     }
 
 
@@ -2293,7 +3388,61 @@ def sanitized_community_details(details):
         "inviteCode": invite_code,
         "inviteLink": invite_link,
         "isOfficial": bool(details.get("isOfficial")),
+        "isBlockedByAdmin": bool(details.get("isBlockedByAdmin")),
     }
+
+
+def is_chat_blocked_by_admin(chat):
+    details = sanitized_community_details(chat.get("communityDetails")) or {}
+    return bool(details.get("isBlockedByAdmin"))
+
+
+def delete_chat_and_related_records(database, chat_id):
+    chat_id = normalized_entity_id(chat_id)
+    if not chat_id:
+        return False
+
+    target_chat = find_chat(database, chat_id)
+    if not target_chat:
+        return False
+
+    if target_chat.get("type") == "group":
+        remove_file_for_url((target_chat.get("group") or {}).get("photoURL"), AVATAR_DIR)
+
+    database["chats"] = [
+        chat for chat in database.get("chats", [])
+        if not ids_equal(chat.get("id"), chat_id)
+    ]
+
+    database["messages"] = [
+        message for message in database.get("messages", [])
+        if not ids_equal(message.get("chatID"), chat_id)
+    ]
+
+    database["chatReadMarkers"] = [
+        marker for marker in database.get("chatReadMarkers", [])
+        if not ids_equal(marker.get("chatID"), chat_id)
+    ]
+
+    removed_call_ids = {
+        normalized_entity_id(call.get("id"))
+        for call in database.get("calls", [])
+        if ids_equal(call.get("chatID"), chat_id)
+    }
+    removed_call_ids.discard(None)
+
+    database["calls"] = [
+        call for call in database.get("calls", [])
+        if not ids_equal(call.get("chatID"), chat_id)
+    ]
+
+    if removed_call_ids:
+        database["callEvents"] = [
+            event for event in database.get("callEvents", [])
+            if normalized_entity_id(event.get("callID")) not in removed_call_ids
+        ]
+
+    return True
 
 
 def chat_is_publicly_joinable(chat):
@@ -2487,11 +3636,12 @@ def resolved_user_display_name(user):
     if not user:
         return None
 
-    display_name = (user["profile"].get("displayName") or "").strip()
+    profile = user.get("profile") if isinstance(user.get("profile"), dict) else {}
+    display_name = (profile.get("displayName") or "").strip()
     if display_name:
         return display_name
 
-    username = (user["profile"].get("username") or "").strip()
+    username = (profile.get("username") or "").strip()
     return username or None
 
 
@@ -2502,14 +3652,20 @@ def display_name_for_user(user):
 def sync_user_snapshots(database, user):
     did_update = False
     display_name = resolved_user_display_name(user)
-    username = (user["profile"].get("username") or "").strip()
+    user_profile = user.get("profile") if isinstance(user.get("profile"), dict) else {}
+    username = (normalized_optional_string(user_profile.get("username")) or "").strip()
+    user_id = normalized_entity_id(user.get("id"))
+    if not user_id:
+        return did_update
 
-    for chat in database["chats"]:
+    for chat in database.get("chats", []):
         if chat.get("type") == "group":
             group = chat.get("group") or {}
             members = group.get("members") or []
             for member in members:
-                if not ids_equal(member.get("userID"), user["id"]):
+                if not isinstance(member, dict):
+                    continue
+                if not ids_equal(member.get("userID"), user_id):
                     continue
 
                 if display_name and member.get("displayName") != display_name:
@@ -2532,12 +3688,15 @@ def backfill_group_member_snapshots(chat, database):
     did_update = False
 
     for member in members:
+        if not isinstance(member, dict):
+            continue
         user = find_user(database, member.get("userID"))
         if not user:
             continue
 
         display_name = resolved_user_display_name(user)
-        username = (user["profile"].get("username") or "").strip()
+        profile = user.get("profile") if isinstance(user.get("profile"), dict) else {}
+        username = (normalized_optional_string(profile.get("username")) or "").strip()
 
         if display_name and member.get("displayName") != display_name:
             member["displayName"] = display_name
@@ -2556,6 +3715,8 @@ def group_member_display_name_for(chat, user_id):
 
     group = chat.get("group") or {}
     for member in group.get("members") or []:
+        if not isinstance(member, dict):
+            continue
         if not ids_equal(member.get("userID"), user_id):
             continue
 
@@ -2576,7 +3737,11 @@ def find_group_member(chat, user_id):
 
     group = chat.get("group") or {}
     return next(
-        (member for member in group.get("members") or [] if ids_equal(member.get("userID"), user_id)),
+        (
+            member
+            for member in (group.get("members") or [])
+            if isinstance(member, dict) and ids_equal(member.get("userID"), user_id)
+        ),
         None,
     )
 
@@ -2886,6 +4051,7 @@ def delete_user_account(database, user_id):
         for token in database.get("deviceTokens", [])
         if not ids_equal(token.get("userID"), user_id)
     ]
+    remove_block_relations_for_user(database, user_id)
 
     deleted_chat_ids = set()
     for chat in list(database.get("chats", [])):
@@ -3885,6 +5051,120 @@ def serialize_message(message, database):
     }
 
 
+def realtime_publish_chat_event(database, chat, event_type="chat.updated", actor_user_id=None):
+    if not chat:
+        return
+
+    participant_ids = unique_entity_ids(chat.get("participantIDs") or [])
+    for participant_id in participant_ids:
+        REALTIME_HUB.enqueue_event(
+            participant_id,
+            {
+                "type": event_type,
+                "chatID": chat.get("id"),
+                "mode": chat.get("mode"),
+                "actorUserID": normalized_entity_id(actor_user_id),
+                "chat": serialize_chat(chat, participant_id, database),
+            },
+            chat_id=chat.get("id"),
+            dispatch_kind="chat",
+        )
+
+
+def realtime_publish_message_event(database, chat, message, event_type, actor_user_id=None):
+    if not chat or not message:
+        return
+
+    participant_ids = unique_entity_ids(chat.get("participantIDs") or [])
+    serialized_message = serialize_message(message, database)
+    for participant_id in participant_ids:
+        REALTIME_HUB.enqueue_event(
+            participant_id,
+            {
+                "type": event_type,
+                "chatID": chat.get("id"),
+                "mode": chat.get("mode"),
+                "actorUserID": normalized_entity_id(actor_user_id),
+                "message": serialized_message,
+                "chat": serialize_chat(chat, participant_id, database),
+            },
+            chat_id=chat.get("id"),
+            dispatch_kind="message",
+        )
+
+
+def realtime_publish_typing_event(database, chat, actor_user_id, is_typing):
+    if not chat:
+        return
+    if chat.get("type") != "direct" or chat.get("mode") != "online":
+        return
+
+    actor_user_id = normalized_entity_id(actor_user_id)
+    if not actor_user_id:
+        return
+    actor_user = find_user(database, actor_user_id)
+    if not actor_user:
+        return
+
+    participant_ids = unique_entity_ids(chat.get("participantIDs") or [])
+    if actor_user_id not in participant_ids:
+        return
+
+    event_type = "typing.started" if bool(is_typing) else "typing.stopped"
+    for participant_id in participant_ids:
+        viewer = find_user(database, participant_id)
+        presence_payload = serialize_presence(viewer, actor_user, database)
+        presence_payload["isTyping"] = bool(is_typing)
+        REALTIME_HUB.enqueue_event(
+            participant_id,
+            {
+                "type": event_type,
+                "chatID": chat.get("id"),
+                "mode": chat.get("mode"),
+                "actorUserID": actor_user_id,
+                "presence": presence_payload,
+            },
+            chat_id=chat.get("id"),
+            dispatch_kind="message",
+        )
+
+
+def realtime_publish_presence_for_user(database, actor_user_id):
+    actor_user_id = normalized_entity_id(actor_user_id)
+    if not actor_user_id:
+        return
+    actor_user = find_user(database, actor_user_id)
+    if not actor_user:
+        return
+
+    direct_online_chats = [
+        chat
+        for chat in database.get("chats", [])
+        if chat.get("type") == "direct"
+        and chat.get("mode") == "online"
+        and actor_user_id in unique_entity_ids(chat.get("participantIDs") or [])
+    ]
+
+    for chat in direct_online_chats:
+        participant_ids = unique_entity_ids(chat.get("participantIDs") or [])
+        for participant_id in participant_ids:
+            viewer = find_user(database, participant_id)
+            presence_payload = serialize_presence(viewer, actor_user, database)
+            presence_payload["isTyping"] = False
+            REALTIME_HUB.enqueue_event(
+                participant_id,
+                {
+                    "type": "presence.updated",
+                    "chatID": chat.get("id"),
+                    "mode": chat.get("mode"),
+                    "actorUserID": actor_user_id,
+                    "presence": presence_payload,
+                },
+                chat_id=chat.get("id"),
+                dispatch_kind="message",
+            )
+
+
 def mark_messages_delivered(chat, database, recipient_id):
     if not chat or chat.get("mode") != "online" or chat.get("type") != "direct":
         return False
@@ -4285,16 +5565,19 @@ def apns_payload_for_broadcast(payload, badge_count):
     return response_payload
 
 
-def push_payload_for_call(call, database):
+def push_payload_for_call(call, database, recipient_user_id=None):
     caller = find_user(database, call.get("callerID"))
     caller_name = resolved_user_display_name(caller) if caller else "Someone"
     issued_at = now_iso()
+    normalized_recipient_user_id = normalized_entity_id(recipient_user_id)
     return {
         "call_id": call["id"],
         "chat_id": call.get("chatID"),
         "mode": call.get("mode") or "online",
         "kind": call.get("kind") or "audio",
         "caller_id": call.get("callerID"),
+        "callee_id": call.get("calleeID"),
+        "recipient_user_id": normalized_recipient_user_id or call.get("calleeID"),
         "caller_name": caller_name,
         "call_event_id": str(uuid.uuid4()),
         "issued_at": issued_at,
@@ -4315,6 +5598,8 @@ def apns_payload_for_call(payload, badge_count, push_type="alert"):
             "mode": payload["mode"],
             "kind": payload.get("kind") or "audio",
             "caller_id": payload.get("caller_id"),
+            "callee_id": payload.get("callee_id"),
+            "recipient_user_id": payload.get("recipient_user_id"),
             "caller_name": payload.get("caller_name"),
             "call_event_id": payload.get("call_event_id"),
             "issued_at": payload.get("issued_at"),
@@ -4338,6 +5623,8 @@ def apns_payload_for_call(payload, badge_count, push_type="alert"):
         "mode": payload["mode"],
         "kind": payload.get("kind") or "audio",
         "caller_id": payload.get("caller_id"),
+        "callee_id": payload.get("callee_id"),
+        "recipient_user_id": payload.get("recipient_user_id"),
         "caller_name": payload.get("caller_name"),
         "call_event_id": payload.get("call_event_id"),
         "issued_at": payload.get("issued_at"),
@@ -4699,6 +5986,7 @@ def serialize_call(call, viewer_id, database):
             call_participant_payload(database, call.get("calleeID")),
         ) if payload is not None
     ]
+    latest_remote_offer = latest_remote_offer_event_for_viewer(database, call, viewer_id)
 
     return {
         "id": call["id"],
@@ -4713,6 +6001,8 @@ def serialize_call(call, viewer_id, database):
         "answeredAt": call.get("answeredAt"),
         "endedAt": call.get("endedAt"),
         "lastEventSequence": int(call.get("lastEventSequence") or 0),
+        "latestRemoteOfferSDP": latest_remote_offer.get("sdp") if latest_remote_offer else None,
+        "latestRemoteOfferSequence": latest_remote_offer.get("sequence") if latest_remote_offer else None,
     }
 
 
@@ -4733,6 +6023,8 @@ def serialize_call_event(event):
         "candidate": payload.get("candidate"),
         "sdpMid": payload.get("sdpMid"),
         "sdpMLineIndex": sdp_mline_index,
+        "isMuted": normalized_optional_bool(payload.get("isMuted")),
+        "isVideoEnabled": normalized_optional_bool(payload.get("isVideoEnabled")),
         "createdAt": event.get("createdAt"),
     }
 
@@ -4762,6 +6054,44 @@ def call_events_for(database, call_id, since_sequence):
         ],
         key=lambda item: int(item.get("sequence") or 0),
     )
+
+
+def latest_remote_offer_event_for_viewer(database, call, viewer_id):
+    viewer_id = normalized_entity_id(viewer_id)
+    call_id = normalized_entity_id((call or {}).get("id"))
+    if not viewer_id or not call_id:
+        return None
+
+    latest_event = None
+    latest_sequence = -1
+    for event in database.get("callEvents", []):
+        if not ids_equal(event.get("callID"), call_id):
+            continue
+        if normalized_optional_string(event.get("type")) != "offer":
+            continue
+
+        sender_id = normalized_entity_id(event.get("senderID"))
+        if sender_id and ids_equal(sender_id, viewer_id):
+            continue
+
+        payload = event.get("payload") or {}
+        sdp = normalized_optional_string(payload.get("sdp"))
+        if not sdp:
+            continue
+
+        try:
+            sequence = int(event.get("sequence") or 0)
+        except (TypeError, ValueError):
+            sequence = 0
+        if sequence < latest_sequence:
+            continue
+        latest_sequence = sequence
+        latest_event = {
+            "sequence": sequence,
+            "sdp": sdp,
+        }
+
+    return latest_event
 
 
 def ensure_direct_chat_record(database, first_user_id, second_user_id, mode):
@@ -4897,7 +6227,7 @@ def log_call_dispatch_attempt(database, call):
         )
         return
 
-    payload = push_payload_for_call(call, database)
+    payload = push_payload_for_call(call, database, recipient_user_id=recipient_id)
     context = {
         "call_id": call["id"],
         "recipient_id": recipient_id,
@@ -4947,6 +6277,9 @@ class Handler(BaseHTTPRequestHandler):
                 "callIce": ice_capabilities,
                 "mediaStorage": MEDIA_OBJECT_STORAGE.status_payload(),
             })
+
+        if parsed.path == "/ws/realtime":
+            return self.handle_realtime_websocket(parsed)
 
         if parsed.path.startswith("/avatars/"):
             return self.serve_avatar(parsed.path.removeprefix("/avatars/"))
@@ -5004,14 +6337,51 @@ class Handler(BaseHTTPRequestHandler):
 
                 params = parse_qs(parsed.query)
                 user_id = normalized_entity_id((params.get("user_id") or [""])[0].strip())
-                user = find_user(database, user_id)
-                if not user:
-                    return self.respond(404, {"error": "user_not_found"})
+                admin_user, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error or not admin_user:
+                    return self.respond(401, {"error": "admin_auth_required"})
 
+                requested_kinds_raw = normalized_optional_string((params.get("kinds") or [""])[0])
+                if not requested_kinds_raw:
+                    requested_kinds_raw = normalized_optional_string((params.get("kind") or [""])[0])
+
+                allowed_kinds = {"group", "supergroup", "channel", "community"}
+                requested_kinds = {
+                    kind.strip().lower()
+                    for kind in (requested_kinds_raw or "").split(",")
+                    if kind.strip().lower() in allowed_kinds
+                }
+                if not requested_kinds:
+                    requested_kinds = allowed_kinds
+
+                include_blocked = (params.get("include_blocked") or ["1"])[0].strip().lower() in {"1", "true", "yes"}
                 chats = []
-                for chat in database.get("chats", []):
-                    if any(ids_equal(participant_id, user_id) for participant_id in (chat.get("participantIDs") or [])):
-                        chats.append(serialize_chat(chat, user_id, database))
+
+                if user_id:
+                    user = find_user(database, user_id)
+                    if not user:
+                        return self.respond(404, {"error": "user_not_found"})
+
+                    for chat in database.get("chats", []):
+                        if any(ids_equal(participant_id, user_id) for participant_id in (chat.get("participantIDs") or [])):
+                            details = sanitized_community_details(chat.get("communityDetails")) or {}
+                            chat_kind = normalized_optional_string(details.get("kind")) or "group"
+                            if chat.get("type") == "group" and chat_kind not in requested_kinds:
+                                continue
+                            if not include_blocked and is_chat_blocked_by_admin(chat):
+                                continue
+                            chats.append(serialize_chat(chat, user_id, database))
+                else:
+                    for chat in database.get("chats", []):
+                        if chat.get("type") != "group":
+                            continue
+                        details = sanitized_community_details(chat.get("communityDetails")) or {}
+                        chat_kind = normalized_optional_string(details.get("kind")) or "group"
+                        if chat_kind not in requested_kinds:
+                            continue
+                        if not include_blocked and is_chat_blocked_by_admin(chat):
+                            continue
+                        chats.append(serialize_chat(chat, admin_user.get("id"), database))
 
                 chats.sort(key=lambda item: item.get("lastActivityAt") or "", reverse=True)
                 return self.respond(200, chats)
@@ -5109,7 +6479,9 @@ class Handler(BaseHTTPRequestHandler):
                 users = [
                     serialize_user(user, current_user)
                     for user in database["users"]
-                    if not ids_equal(user["id"], current_user["id"]) and (
+                    if not ids_equal(user["id"], current_user["id"])
+                    and not users_blocked_each_other(database, current_user["id"], user["id"])
+                    and (
                         query in user["profile"]["username"].lower() or
                         query in user["profile"]["displayName"].lower() or
                         query in (user["profile"].get("email") or "").lower() or
@@ -5208,6 +6580,40 @@ class Handler(BaseHTTPRequestHandler):
                 if not ids_equal(current_user["id"], user_id):
                     return self.respond(403, {"error": "edit_not_allowed"})
                 return self.respond(200, current_user.get("privacySettings") or default_privacy_settings())
+
+            if parsed.path == "/users/blocked":
+                params = parse_qs(parsed.query)
+                fallback_user_id = (
+                    (params.get("user_id") or [""])[0].strip()
+                    or (params.get("viewer_id") or [""])[0].strip()
+                    or None
+                )
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    fallback_user_id,
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                blocked_relations = [
+                    entry
+                    for entry in database.get("blocks", [])
+                    if ids_equal(entry.get("blockerUserID"), current_user.get("id"))
+                ]
+                blocked_relations.sort(key=lambda item: item.get("createdAt") or "", reverse=True)
+
+                blocked_users = []
+                for relation in blocked_relations:
+                    blocked_user = find_user(database, relation.get("blockedUserID"))
+                    if not blocked_user:
+                        continue
+                    blocked_users.append(serialize_user(blocked_user, current_user))
+
+                return self.respond(200, blocked_users)
 
             if parsed.path.startswith("/users/") and "/profile" not in parsed.path and "/avatar" not in parsed.path and "/privacy" not in parsed.path:
                 user_id = normalized_entity_id(parsed.path.split("/")[2])
@@ -5492,16 +6898,43 @@ class Handler(BaseHTTPRequestHandler):
         return self.respond(404, {"error": "not_found"})
 
     def do_POST(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/media/upload":
-            return self.handle_media_upload(parsed)
-        return self.handle_mutation("POST")
+        try:
+            parsed = urlparse(self.path)
+            if parsed.path == "/media/upload":
+                return self.handle_media_upload(parsed)
+            return self.handle_mutation("POST")
+        except Exception as error:
+            log_event(
+                "http.unhandled_exception",
+                method="POST",
+                path=self.path,
+                error=type(error).__name__,
+            )
+            return self.respond(500, {"error": "internal_server_error"})
 
     def do_PATCH(self):
-        return self.handle_mutation("PATCH")
+        try:
+            return self.handle_mutation("PATCH")
+        except Exception as error:
+            log_event(
+                "http.unhandled_exception",
+                method="PATCH",
+                path=self.path,
+                error=type(error).__name__,
+            )
+            return self.respond(500, {"error": "internal_server_error"})
 
     def do_DELETE(self):
-        return self.handle_mutation("DELETE")
+        try:
+            return self.handle_mutation("DELETE")
+        except Exception as error:
+            log_event(
+                "http.unhandled_exception",
+                method="DELETE",
+                path=self.path,
+                error=type(error).__name__,
+            )
+            return self.respond(500, {"error": "internal_server_error"})
 
     def handle_media_upload(self, parsed):
         params = parse_qs(parsed.query)
@@ -5711,7 +7144,7 @@ class Handler(BaseHTTPRequestHandler):
                     "profile": {
                         "displayName": display_name,
                         "username": username,
-                        "bio": "Welcome to Prime Messaging.",
+                        "bio": "",
                         "status": "Available",
                         "birthday": None,
                         "email": None,
@@ -5849,6 +7282,63 @@ class Handler(BaseHTTPRequestHandler):
                 save_db(database)
                 return self.respond(200, serialize_chat(chat, admin_user["id"], database))
 
+            if method == "PATCH" and parsed.path.startswith("/admin/chats/") and parsed.path.endswith("/block"):
+                admin_error = admin_request_error(database, self.headers)
+                if admin_error:
+                    return self.respond(401 if admin_error in {"admin_not_configured", "admin_token_required", "admin_auth_required"} else 403, {"error": admin_error})
+
+                path_parts = parsed.path.strip("/").split("/")
+                chat_id = normalized_entity_id(path_parts[2] if len(path_parts) > 2 else None)
+                if not chat_id:
+                    return self.respond(404, {"error": "chat_not_found"})
+
+                chat = find_chat(database, chat_id)
+                if not chat:
+                    return self.respond(404, {"error": "chat_not_found"})
+                if chat.get("type") != "group":
+                    return self.respond(409, {"error": "invalid_group_chat"})
+
+                existing_details = sanitized_community_details(chat.get("communityDetails")) or {}
+                admin_user, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error or not admin_user:
+                    return self.respond(401, {"error": "admin_auth_required"})
+
+                requested_is_blocked = payload.get("is_blocked")
+                if requested_is_blocked is None and "isBlocked" in payload:
+                    requested_is_blocked = payload.get("isBlocked")
+                if requested_is_blocked is None and "isBlockedByAdmin" in payload:
+                    requested_is_blocked = payload.get("isBlockedByAdmin")
+
+                target_is_blocked = bool(requested_is_blocked)
+                try:
+                    updated_details = normalized_community_details(
+                        {"isBlockedByAdmin": target_is_blocked},
+                        database,
+                        existing_details=existing_details,
+                        requester=admin_user
+                    )
+                except PermissionError as error:
+                    return self.respond(403, {"error": str(error)})
+
+                chat["communityDetails"] = updated_details
+                save_db(database)
+                return self.respond(200, serialize_chat(chat, admin_user["id"], database))
+
+            if method == "DELETE" and parsed.path.startswith("/admin/chats/"):
+                admin_error = admin_request_error(database, self.headers)
+                if admin_error:
+                    return self.respond(401 if admin_error in {"admin_not_configured", "admin_token_required", "admin_auth_required"} else 403, {"error": admin_error})
+
+                chat_id = normalized_entity_id(parsed.path.split("/")[3] if len(parsed.path.split("/")) > 3 else None)
+                if not chat_id:
+                    return self.respond(404, {"error": "chat_not_found"})
+
+                if delete_chat_and_related_records(database, chat_id) is False:
+                    return self.respond(404, {"error": "chat_not_found"})
+
+                save_db(database)
+                return self.respond(200, {"ok": True, "chatID": chat_id})
+
             if method == "DELETE" and parsed.path.startswith("/admin/users/"):
                 admin_error = admin_request_error(database, self.headers)
                 if admin_error:
@@ -5886,13 +7376,17 @@ class Handler(BaseHTTPRequestHandler):
                 contact_value = payload.get("contact_value")
                 normalized_email = None
                 normalized_phone_number = None
+                normalized_signup_email = None
 
                 if account_kind == "standard":
-                    normalized_phone_number = normalize_phone_number(contact_value)
-                    if method_type != "phone" or not is_valid_phone_number(normalized_phone_number):
-                        return self.respond(409, {"error": "invalid_phone_number"})
-                    if phone_number_taken(database, normalized_phone_number, requested_user_id):
-                        return self.respond(409, {"error": "phone_taken"})
+                    if method_type == "email":
+                        normalized_email = normalize_email(contact_value)
+                        if not is_valid_email(normalized_email):
+                            return self.respond(409, {"error": "invalid_email"})
+                        if email_taken(database, normalized_email, requested_user_id):
+                            return self.respond(409, {"error": "email_taken"})
+                    else:
+                        return self.respond(409, {"error": "invalid_credentials"})
                 elif account_kind == "offlineOnly":
                     normalized_email = normalize_email(contact_value)
                     if method_type != "email" or not is_valid_email(normalized_email):
@@ -5901,6 +7395,31 @@ class Handler(BaseHTTPRequestHandler):
                         return self.respond(409, {"error": "email_taken"})
                 elif account_kind == "guest":
                     method_type = "username"
+
+                otp_challenge_id = normalized_entity_id(payload.get("otp_challenge_id"))
+                if account_kind in {"standard", "offlineOnly"}:
+                    if not otp_challenge_id:
+                        return self.respond(409, {"error": "otp_required"})
+                    normalized_signup_identifier = normalized_email
+                    challenge = next(
+                        (
+                            challenge for challenge in database.get("otpChallenges", [])
+                            if ids_equal(challenge.get("id"), otp_challenge_id)
+                        ),
+                        None
+                    )
+                    if not challenge:
+                        return self.respond(409, {"error": "otp_required"})
+                    if challenge.get("purpose") != "signup":
+                        return self.respond(409, {"error": "otp_not_verified"})
+                    if challenge.get("identifier") != normalized_signup_identifier:
+                        return self.respond(409, {"error": "otp_not_verified"})
+                    expires_at = parse_iso_datetime(challenge.get("expiresAt"))
+                    if not expires_at or expires_at <= datetime.now(timezone.utc):
+                        return self.respond(409, {"error": "otp_expired"})
+                    if not challenge.get("verifiedAt") or challenge.get("consumedAt"):
+                        return self.respond(409, {"error": "otp_not_verified"})
+                    challenge["consumedAt"] = now_iso()
 
                 birthday = normalized_optional_string(payload.get("birthday"))
                 email = contact_value if method_type == "email" else None
@@ -5913,7 +7432,7 @@ class Handler(BaseHTTPRequestHandler):
                     user["profile"] = {
                         "displayName": payload.get("display_name", ""),
                         "username": username,
-                        "bio": user["profile"].get("bio") or "Welcome to Prime Messaging.",
+                        "bio": normalized_optional_string(user["profile"].get("bio")) or "",
                         "status": user["profile"].get("status") or "Available",
                         "birthday": birthday,
                         "email": email,
@@ -5934,7 +7453,7 @@ class Handler(BaseHTTPRequestHandler):
                         "profile": {
                             "displayName": payload.get("display_name", ""),
                             "username": username,
-                            "bio": "Welcome to Prime Messaging.",
+                            "bio": "",
                             "status": "Available",
                             "birthday": birthday,
                             "email": email,
@@ -5961,30 +7480,324 @@ class Handler(BaseHTTPRequestHandler):
 
             if method == "POST" and parsed.path == "/auth/account-lookup":
                 identifier = payload.get("identifier", "")
-                user = find_user_by_identifier(database, identifier)
+                matched_users = find_users_by_identifier(database, identifier)
+                if not matched_users:
+                    log_event("auth.lookup.miss", identifier=normalized_identifier_for_otp(identifier) or str(identifier))
+                    return self.respond(200, {"exists": False, "accountKind": None, "displayName": None})
+
+                user = resolve_user_from_identifier(matched_users, identifier) or preferred_user_from_candidates(matched_users)
                 if not user:
                     return self.respond(200, {"exists": False, "accountKind": None, "displayName": None})
 
+                # If legacy duplicates exist for same identifier, avoid leaking incorrect name in lookup preview.
+                has_ambiguous_match = len(matched_users) > 1
+                if has_ambiguous_match:
+                    log_event(
+                        "auth.lookup.ambiguous",
+                        identifier=normalized_identifier_for_otp(identifier) or str(identifier),
+                        candidates=len(matched_users),
+                    )
                 display_name = normalized_optional_string(user.get("profile", {}).get("displayName"))
                 return self.respond(
                     200,
                     {
                         "exists": True,
                         "accountKind": (user.get("accountKind") or "standard").strip() or "standard",
-                        "displayName": display_name,
+                        "displayName": None if has_ambiguous_match else display_name,
                     }
                 )
+
+            if method == "POST" and parsed.path == "/contacts/match":
+                current_user, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                raw_contacts = payload.get("contacts")
+                if not isinstance(raw_contacts, list):
+                    return self.respond(409, {"error": "invalid_contacts_payload"})
+
+                contacts = raw_contacts[:1200]
+                visible_users = [
+                    user for user in database.get("users", [])
+                    if not ids_equal(user.get("id"), current_user.get("id"))
+                    and not users_blocked_each_other(database, current_user.get("id"), user.get("id"))
+                ]
+
+                users_by_email = {}
+                users_by_phone = {}
+                for user in visible_users:
+                    profile = user.get("profile") or {}
+                    email = normalize_email(profile.get("email"))
+                    if email:
+                        email = email.lower()
+                        users_by_email.setdefault(email, user)
+
+                    phone = normalize_phone_number(profile.get("phoneNumber"))
+                    if phone and is_valid_phone_number(phone):
+                        users_by_phone.setdefault(phone, user)
+
+                consumed_user_ids = set()
+                matches = []
+                for raw_contact in contacts:
+                    if not isinstance(raw_contact, dict):
+                        continue
+
+                    local_contact_id = normalized_optional_string(
+                        raw_contact.get("local_contact_id")
+                        or raw_contact.get("localContactID")
+                        or raw_contact.get("id")
+                    )
+                    if not local_contact_id:
+                        continue
+
+                    raw_emails = raw_contact.get("emails") or []
+                    if not isinstance(raw_emails, list):
+                        raw_emails = []
+                    contact_emails = []
+                    for raw_email in raw_emails:
+                        email = normalize_email(raw_email)
+                        if email and is_valid_email(email):
+                            contact_emails.append(email.lower())
+
+                    raw_phones = raw_contact.get("phones") or []
+                    if not isinstance(raw_phones, list):
+                        raw_phones = []
+                    contact_phones = []
+                    for raw_phone in raw_phones:
+                        phone = normalize_phone_number(raw_phone)
+                        if phone and is_valid_phone_number(phone):
+                            contact_phones.append(phone)
+
+                    matched_user = None
+                    matched_by = None
+
+                    for email in contact_emails:
+                        candidate = users_by_email.get(email)
+                        candidate_id = normalized_entity_id(candidate.get("id")) if candidate else None
+                        if candidate and candidate_id and candidate_id not in consumed_user_ids:
+                            matched_user = candidate
+                            matched_by = "email"
+                            break
+
+                    if matched_user is None:
+                        for phone in contact_phones:
+                            candidate = users_by_phone.get(phone)
+                            candidate_id = normalized_entity_id(candidate.get("id")) if candidate else None
+                            if candidate and candidate_id and candidate_id not in consumed_user_ids:
+                                matched_user = candidate
+                                matched_by = "phone"
+                                break
+
+                    if matched_user is None:
+                        continue
+
+                    matched_user_id = normalized_entity_id(matched_user.get("id"))
+                    if not matched_user_id:
+                        continue
+
+                    consumed_user_ids.add(matched_user_id)
+                    matches.append(
+                        {
+                            "local_contact_id": local_contact_id,
+                            "matched_by": matched_by or "unknown",
+                            "user": serialize_user(matched_user, current_user),
+                        }
+                    )
+
+                return self.respond(200, {"matches": matches})
+
+            if method == "POST" and parsed.path == "/auth/otp/request":
+                prune_otp_challenges(database)
+                identifier = normalized_identifier_for_otp(payload.get("identifier"))
+                purpose = normalized_otp_purpose(payload.get("purpose"))
+                if not identifier:
+                    return self.respond(409, {"error": "invalid_identifier"})
+                if not purpose:
+                    return self.respond(409, {"error": "invalid_otp_purpose"})
+
+                if purpose == "signup":
+                    if "@" in identifier:
+                        if not is_valid_email(identifier):
+                            return self.respond(409, {"error": "invalid_email"})
+                    elif identifier.startswith("+"):
+                        if not is_valid_phone_number(identifier):
+                            return self.respond(409, {"error": "invalid_phone_number"})
+                    else:
+                        return self.respond(409, {"error": "invalid_identifier"})
+                elif purpose == "login":
+                    if not find_user_by_identifier(database, identifier):
+                        return self.respond(404, {"error": "user_not_found"})
+
+                now = datetime.now(timezone.utc)
+                recent_challenges = [
+                    challenge for challenge in database.get("otpChallenges", [])
+                    if challenge.get("identifier") == identifier
+                    and challenge.get("purpose") == purpose
+                    and (parse_iso_datetime(challenge.get("createdAt")) or now) >= (now - timedelta(hours=1))
+                ]
+                if len(recent_challenges) >= OTP_REQUEST_LIMIT_PER_HOUR:
+                    return self.respond(429, {
+                        "error": "otp_request_limit_exceeded",
+                        "retry_after_seconds": 3600,
+                    })
+
+                latest_challenge = latest_otp_challenge(database, identifier, purpose)
+                if latest_challenge:
+                    resend_available_at = parse_iso_datetime(latest_challenge.get("resendAvailableAt"))
+                    if resend_available_at and resend_available_at > now:
+                        retry_after = int((resend_available_at - now).total_seconds())
+                        return self.respond(429, {
+                            "error": "otp_resend_cooldown",
+                            "retry_after_seconds": max(1, retry_after),
+                            **otp_public_payload(latest_challenge),
+                        })
+
+                challenge_id = str(uuid.uuid4())
+                otp_code = f"{secrets.randbelow(1_000_000):06d}"
+                expires_at = now + timedelta(seconds=max(60, OTP_CHALLENGE_TTL_SECONDS))
+                resend_available_at = now + timedelta(seconds=max(1, OTP_RESEND_COOLDOWN_SECONDS))
+                challenge_record = {
+                    "id": challenge_id,
+                    "identifier": identifier,
+                    "purpose": purpose,
+                    "codeHash": otp_code_hash(challenge_id, otp_code),
+                    "channel": otp_channel_for_identifier(identifier),
+                    "destinationMasked": masked_otp_destination(identifier),
+                    "createdAt": now_iso(),
+                    "expiresAt": expires_at.isoformat(),
+                    "resendAvailableAt": resend_available_at.isoformat(),
+                    "attemptLimit": max(1, OTP_VERIFY_ATTEMPT_LIMIT),
+                    "attemptsUsed": 0,
+                    "verifiedAt": None,
+                    "consumedAt": None,
+                    "debugCode": otp_code if OTP_DEBUG_RETURN_CODE else None,
+                }
+                ok, error_reason = otp_provider_send_code(
+                    identifier=identifier,
+                    channel=challenge_record["channel"],
+                    otp_code=otp_code,
+                    purpose=purpose,
+                    challenge_id=challenge_id,
+                    expires_at=challenge_record["expiresAt"],
+                )
+                if not ok:
+                    failure_reason_code = normalized_otp_delivery_failure_reason(error_reason)
+                    log_event(
+                        "otp.delivery.failed",
+                        identifier=identifier,
+                        channel=challenge_record["channel"],
+                        purpose=purpose,
+                        challenge_id=challenge_id,
+                        failure_reason_code=failure_reason_code,
+                        reason=error_reason,
+                    )
+                    if OTP_FAIL_OPEN_ON_DELIVERY_ERROR:
+                        challenge_record["codeHash"] = otp_code_hash(challenge_id, DEFAULT_OTP_CODE)
+                        challenge_record["debugCode"] = DEFAULT_OTP_CODE if OTP_DEBUG_RETURN_CODE else None
+                        database.setdefault("otpChallenges", []).append(challenge_record)
+                        save_db(database)
+                        log_event(
+                            "otp.delivery.fail_open",
+                            identifier=identifier,
+                            purpose=purpose,
+                            challenge_id=challenge_id,
+                            failure_reason_code=failure_reason_code,
+                        )
+                        payload_response = otp_public_payload(challenge_record)
+                        payload_response["delivery_warning"] = failure_reason_code
+                        payload_response["fallback_mode"] = "default_otp"
+                        return self.respond(200, payload_response)
+
+                    return self.respond(503, {
+                        "error": "otp_delivery_failed",
+                        "reason": failure_reason_code,
+                    })
+
+                database.setdefault("otpChallenges", []).append(challenge_record)
+                save_db(database)
+                return self.respond(200, otp_public_payload(challenge_record))
+
+            if method == "POST" and parsed.path == "/auth/otp/verify":
+                prune_otp_challenges(database)
+                challenge_id = normalized_entity_id(payload.get("challenge_id"))
+                otp_code = normalized_optional_string(payload.get("otp_code"))
+                if not challenge_id or not otp_code:
+                    return self.respond(409, {"error": "invalid_otp_payload"})
+
+                challenge = next(
+                    (
+                        challenge for challenge in database.get("otpChallenges", [])
+                        if ids_equal(challenge.get("id"), challenge_id)
+                    ),
+                    None
+                )
+                if not challenge:
+                    return self.respond(404, {"error": "otp_challenge_not_found"})
+                if challenge.get("consumedAt"):
+                    return self.respond(409, {"error": "otp_consumed"})
+
+                expires_at = parse_iso_datetime(challenge.get("expiresAt"))
+                if not expires_at or expires_at <= datetime.now(timezone.utc):
+                    return self.respond(409, {"error": "otp_expired"})
+
+                attempts_used = int(challenge.get("attemptsUsed") or 0)
+                attempt_limit = int(challenge.get("attemptLimit") or OTP_VERIFY_ATTEMPT_LIMIT)
+                if attempts_used >= attempt_limit:
+                    return self.respond(409, {"error": "otp_attempt_limit_exceeded", **otp_public_payload(challenge)})
+
+                challenge["attemptsUsed"] = attempts_used + 1
+                if challenge.get("codeHash") != otp_code_hash(challenge_id, otp_code):
+                    save_db(database)
+                    return self.respond(401, {"error": "invalid_otp", **otp_public_payload(challenge)})
+
+                challenge["verifiedAt"] = now_iso()
+                save_db(database)
+                return self.respond(200, otp_public_payload(challenge))
 
             if method == "POST" and parsed.path == "/auth/otp-login":
                 identifier = payload.get("identifier", "")
                 otp_code = str(payload.get("otp_code", "")).strip()
-                if otp_code != DEFAULT_OTP_CODE:
+                challenge_id = normalized_entity_id(payload.get("challenge_id"))
+                if challenge_id:
+                    challenge = next(
+                        (
+                            challenge for challenge in database.get("otpChallenges", [])
+                            if ids_equal(challenge.get("id"), challenge_id)
+                        ),
+                        None
+                    )
+                    if not challenge:
+                        return self.respond(404, {"error": "otp_challenge_not_found"})
+                    if challenge.get("purpose") != "login":
+                        return self.respond(409, {"error": "otp_not_verified"})
+                    if challenge.get("identifier") != normalized_identifier_for_otp(identifier):
+                        return self.respond(409, {"error": "otp_not_verified"})
+                    expires_at = parse_iso_datetime(challenge.get("expiresAt"))
+                    if not expires_at or expires_at <= datetime.now(timezone.utc):
+                        return self.respond(409, {"error": "otp_expired"})
+                    attempts_used = int(challenge.get("attemptsUsed") or 0)
+                    attempt_limit = int(challenge.get("attemptLimit") or OTP_VERIFY_ATTEMPT_LIMIT)
+                    if attempts_used >= attempt_limit:
+                        return self.respond(409, {"error": "otp_attempt_limit_exceeded"})
+                    challenge["attemptsUsed"] = attempts_used + 1
+                    if challenge.get("codeHash") != otp_code_hash(challenge_id, otp_code):
+                        save_db(database)
+                        return self.respond(401, {"error": "invalid_otp"})
+                    challenge["verifiedAt"] = challenge.get("verifiedAt") or now_iso()
+                    challenge["consumedAt"] = now_iso()
+                elif otp_code != DEFAULT_OTP_CODE:
                     return self.respond(401, {"error": "invalid_otp"})
-                user = find_user_by_identifier(database, identifier)
+                matched_users = find_users_by_identifier(database, identifier)
+                if not matched_users:
+                    return self.respond(404, {"error": "user_not_found"})
+                active_candidates = [user for user in matched_users if not is_user_banned(user)]
+                if not active_candidates:
+                    return self.respond(403, {"error": "account_banned"})
+                user = resolve_user_from_identifier(active_candidates, identifier) or preferred_user_from_candidates(active_candidates)
                 if not user:
                     return self.respond(404, {"error": "user_not_found"})
-                if is_user_banned(user):
-                    return self.respond(403, {"error": "account_banned"})
                 session, access_token, refresh_token = issue_session(
                     database,
                     user["id"],
@@ -5996,29 +7809,265 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and parsed.path == "/auth/login":
                 identifier = str(payload.get("identifier", "")).strip().lower()
                 password = str(payload.get("password", ""))
-                user = find_user_by_identifier(database, identifier)
-                if not user:
+                matched_users = find_users_by_identifier(database, identifier)
+                if not matched_users:
+                    log_event("auth.login.miss", identifier=normalized_identifier_for_otp(identifier) or identifier)
                     return self.respond(404, {"error": "user_not_found"})
-                if is_user_banned(user):
+                active_candidates = [user for user in matched_users if not is_user_banned(user)]
+                if not active_candidates:
+                    log_event(
+                        "auth.login.all_banned",
+                        identifier=normalized_identifier_for_otp(identifier) or identifier,
+                        candidates=len(matched_users),
+                    )
                     return self.respond(403, {"error": "account_banned"})
-                if user.get("password") != password:
+
+                password_matched_candidates = [
+                    user for user in active_candidates if str(user.get("password") or "") == password
+                ]
+                password_matched_user = resolve_user_from_identifier(password_matched_candidates, identifier)
+                if not password_matched_user:
+                    log_event(
+                        "auth.login.password_mismatch",
+                        identifier=normalized_identifier_for_otp(identifier) or identifier,
+                        candidates=len(active_candidates),
+                    )
                     return self.respond(401, {"error": "invalid_credentials"})
+                session, access_token, refresh_token = issue_session(
+                    database,
+                    password_matched_user["id"],
+                    device_metadata=session_device_metadata_from_headers(self.headers)
+                )
+                if len(password_matched_candidates) > 1:
+                    log_event(
+                        "auth.login.ambiguous_resolved",
+                        identifier=normalized_identifier_for_otp(identifier) or identifier,
+                        candidates=len(password_matched_candidates),
+                        resolved_user_id=normalized_entity_id(password_matched_user.get("id")),
+                    )
+                save_db(database)
+                return self.respond(200, session_payload(password_matched_user, session, access_token, refresh_token))
+
+            if method == "POST" and parsed.path == "/auth/apple-signin":
+                identity_token = normalized_optional_string(payload.get("identity_token"))
+                if not identity_token:
+                    return self.respond(409, {"error": "apple_token_invalid"})
+
+                claims, verification_error = verify_apple_identity_token(identity_token)
+                if verification_error:
+                    if verification_error == "apple_signin_unavailable":
+                        return self.respond(503, {"error": verification_error})
+                    return self.respond(401, {"error": verification_error})
+
+                apple_subject = normalized_apple_user_id((claims or {}).get("sub"))
+                if not apple_subject:
+                    return self.respond(401, {"error": "apple_token_invalid"})
+
+                claimed_apple_user_id = normalized_apple_user_id(payload.get("apple_user_id"))
+                if claimed_apple_user_id and claimed_apple_user_id != apple_subject:
+                    return self.respond(401, {"error": "apple_token_invalid"})
+
+                email_from_claim = normalize_email((claims or {}).get("email"))
+                if email_from_claim and not is_valid_email(email_from_claim):
+                    email_from_claim = None
+                email_from_payload = normalize_email(payload.get("email"))
+                if email_from_payload and not is_valid_email(email_from_payload):
+                    email_from_payload = None
+                resolved_email = email_from_claim or email_from_payload
+
+                given_name = normalized_optional_string(payload.get("given_name"))
+                family_name = normalized_optional_string(payload.get("family_name"))
+
+                user = find_user_by_apple_subject(database, apple_subject)
+                is_new_user = False
+                if not user and resolved_email:
+                    user = next(
+                        (
+                            candidate
+                            for candidate in database.get("users", [])
+                            if normalize_email((candidate.get("profile") or {}).get("email")) == resolved_email
+                        ),
+                        None
+                    )
+
+                if user and is_user_banned(user):
+                    return self.respond(403, {"error": "account_banned"})
+
+                if not user:
+                    is_new_user = True
+                    username_seed = normalize_username(given_name or "")
+                    if not username_seed and resolved_email:
+                        username_seed = normalize_username(resolved_email.split("@", 1)[0])
+                    if not username_seed:
+                        username_seed = f"apple{apple_subject[:10]}"
+
+                    generated_username = generate_username_from_seed(database, username_seed)
+                    user = {
+                        "id": str(uuid.uuid4()),
+                        "password": uuid.uuid4().hex,
+                        "profile": {
+                            "displayName": apple_display_name(given_name, family_name, resolved_email),
+                            "username": generated_username,
+                            "bio": "",
+                            "status": "Available",
+                            "birthday": None,
+                            "email": resolved_email,
+                            "phoneNumber": None,
+                            "profilePhotoURL": None,
+                            "socialLink": None,
+                        },
+                        "identityMethods": build_identity_methods(generated_username, email=resolved_email, phone_number=None),
+                        "privacySettings": default_privacy_settings(),
+                        "accountKind": "standard",
+                        "createdAt": now_iso(),
+                        "guestExpiresAt": None,
+                    }
+                    database.setdefault("users", []).append(user)
+                else:
+                    profile = user.setdefault("profile", {})
+                    username = normalize_username(profile.get("username"))
+                    if not username or not is_valid_legacy_username(username):
+                        username_seed = normalize_username(given_name or "") or f"apple{apple_subject[:10]}"
+                        username = generate_username_from_seed(database, username_seed)
+                    profile["username"] = username
+                    if not normalized_optional_string(profile.get("displayName")):
+                        profile["displayName"] = apple_display_name(given_name, family_name, resolved_email)
+                    profile["email"] = resolved_email or normalize_email(profile.get("email"))
+                    profile["phoneNumber"] = None
+                    user["identityMethods"] = build_identity_methods(username, email=profile.get("email"), phone_number=None)
+                    user["accountKind"] = user.get("accountKind") or "standard"
+                    user["createdAt"] = user.get("createdAt") or now_iso()
+                    user["guestExpiresAt"] = None
+
+                user["appleIdentity"] = {
+                    "sub": apple_subject,
+                    "email": resolved_email,
+                    "emailVerified": apple_claim_truthy((claims or {}).get("email_verified")),
+                    "isPrivateEmail": apple_claim_truthy((claims or {}).get("is_private_email")),
+                    "lastSignInAt": now_iso(),
+                    "authorizationCodePresent": bool(normalized_optional_string(payload.get("authorization_code"))),
+                }
+                if user.get("accountKind") == "guest":
+                    user["accountKind"] = "standard"
+                    user["guestExpiresAt"] = None
+
                 session, access_token, refresh_token = issue_session(
                     database,
                     user["id"],
                     device_metadata=session_device_metadata_from_headers(self.headers)
                 )
                 save_db(database)
-                return self.respond(200, session_payload(user, session, access_token, refresh_token))
+                payload = session_payload(user, session, access_token, refresh_token)
+                payload["is_new_user"] = is_new_user
+                return self.respond(200, payload)
+
+            if method == "POST" and parsed.path == "/auth/apple-link":
+                identity_token = normalized_optional_string(payload.get("identity_token"))
+                if not identity_token:
+                    return self.respond(409, {"error": "apple_token_invalid"})
+
+                current_user, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                claims, verification_error = verify_apple_identity_token(identity_token)
+                if verification_error:
+                    if verification_error == "apple_signin_unavailable":
+                        return self.respond(503, {"error": verification_error})
+                    return self.respond(401, {"error": verification_error})
+
+                apple_subject = normalized_apple_user_id((claims or {}).get("sub"))
+                if not apple_subject:
+                    return self.respond(401, {"error": "apple_token_invalid"})
+
+                claimed_apple_user_id = normalized_apple_user_id(payload.get("apple_user_id"))
+                if claimed_apple_user_id and claimed_apple_user_id != apple_subject:
+                    return self.respond(401, {"error": "apple_token_invalid"})
+
+                linked_user = find_user_by_apple_subject(database, apple_subject)
+                if linked_user and not ids_equal(linked_user.get("id"), current_user.get("id")):
+                    return self.respond(409, {"error": "apple_identity_taken"})
+
+                profile = current_user.setdefault("profile", {})
+                username = normalize_username(profile.get("username"))
+                if not username or not is_valid_legacy_username(username):
+                    username_seed = normalize_username(profile.get("displayName") or "") or f"apple{apple_subject[:10]}"
+                    username = generate_username_from_seed(database, username_seed)
+
+                email_from_claim = normalize_email((claims or {}).get("email"))
+                if email_from_claim and not is_valid_email(email_from_claim):
+                    email_from_claim = None
+                email_from_payload = normalize_email(payload.get("email"))
+                if email_from_payload and not is_valid_email(email_from_payload):
+                    email_from_payload = None
+
+                existing_email = normalize_email(profile.get("email"))
+                if existing_email and not is_valid_email(existing_email):
+                    existing_email = None
+                resolved_email = existing_email or email_from_claim or email_from_payload
+
+                profile["username"] = username
+                profile["displayName"] = normalized_optional_string(profile.get("displayName")) or apple_display_name(
+                    normalized_optional_string(payload.get("given_name")),
+                    normalized_optional_string(payload.get("family_name")),
+                    resolved_email,
+                )
+                profile["email"] = resolved_email
+                profile["phoneNumber"] = None
+
+                current_user["appleIdentity"] = {
+                    "sub": apple_subject,
+                    "email": resolved_email,
+                    "emailVerified": apple_claim_truthy((claims or {}).get("email_verified")),
+                    "isPrivateEmail": apple_claim_truthy((claims or {}).get("is_private_email")),
+                    "lastSignInAt": now_iso(),
+                    "authorizationCodePresent": bool(normalized_optional_string(payload.get("authorization_code"))),
+                }
+                current_user["identityMethods"] = build_identity_methods(
+                    username,
+                    email=resolved_email,
+                    phone_number=None,
+                )
+                if current_user.get("accountKind") == "guest":
+                    current_user["accountKind"] = "standard"
+                    current_user["guestExpiresAt"] = None
+
+                save_db(database)
+                return self.respond(200, serialize_user(current_user, current_user))
 
             if method == "POST" and parsed.path == "/auth/reset-password":
                 identifier = payload.get("identifier", "")
+                challenge_id = normalized_entity_id(payload.get("challenge_id"))
                 new_password = str(payload.get("new_password", "")).strip()
                 user = find_user_by_identifier(database, identifier)
                 if not user:
                     return self.respond(404, {"error": "user_not_found"})
                 if not new_password:
                     return self.respond(409, {"error": "invalid_credentials"})
+                if not challenge_id:
+                    return self.respond(409, {"error": "otp_required"})
+                challenge = next(
+                    (
+                        challenge for challenge in database.get("otpChallenges", [])
+                        if ids_equal(challenge.get("id"), challenge_id)
+                    ),
+                    None
+                )
+                if not challenge:
+                    return self.respond(404, {"error": "otp_challenge_not_found"})
+                if challenge.get("purpose") != "reset_password":
+                    return self.respond(409, {"error": "otp_not_verified"})
+                normalized_identifier = normalized_identifier_for_otp(identifier)
+                if challenge.get("identifier") != normalized_identifier:
+                    return self.respond(409, {"error": "otp_not_verified"})
+                expires_at = parse_iso_datetime(challenge.get("expiresAt"))
+                if not expires_at or expires_at <= datetime.now(timezone.utc):
+                    return self.respond(409, {"error": "otp_expired"})
+                if not challenge.get("verifiedAt") or challenge.get("consumedAt"):
+                    return self.respond(409, {"error": "otp_not_verified"})
+                challenge["consumedAt"] = now_iso()
                 user["password"] = new_password
                 save_db(database)
                 return self.respond(200, {"ok": True})
@@ -6592,63 +8641,241 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return self.respond(200, serialize_call_event(event))
 
-            if method == "PATCH" and parsed.path.startswith("/users/") and parsed.path.endswith("/profile"):
-                user_id = normalized_entity_id(parsed.path.split("/")[2])
-                current_user, _, auth_error = request_user_with_fallback(
+            if method == "POST" and parsed.path.startswith("/calls/") and parsed.path.endswith("/media-state"):
+                call_id = normalized_entity_id(parsed.path.split("/")[2])
+                requester, _, auth_error = request_user_with_fallback(
                     database,
                     self.headers,
-                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID") or user_id,
+                    payload_string(payload, "user_id", "userID", "requester_id", "requesterID"),
                     create_if_missing=True
                 )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
                     return self.respond(401, {"error": auth_error})
+
+                call = find_call(database, call_id)
+                if not call:
+                    return self.respond(404, {"error": "call_not_found"})
+                if not can_manage_call(call, requester["id"]):
+                    return self.respond(403, {"error": "call_permission_denied"})
+                if normalized_optional_string(call.get("state")) not in ACTIVE_CALL_STATES:
+                    return self.respond(409, {"error": "invalid_call_operation"})
+
+                is_muted = normalized_optional_bool(payload.get("is_muted", payload.get("isMuted")))
+                is_video_enabled = normalized_optional_bool(
+                    payload.get("is_video_enabled", payload.get("isVideoEnabled"))
+                )
+                if is_muted is None or is_video_enabled is None:
+                    return self.respond(409, {"error": "invalid_media_state_payload"})
+
+                event = append_call_event(
+                    database,
+                    call,
+                    "media_state",
+                    sender_id=requester["id"],
+                    payload={
+                        "isMuted": is_muted,
+                        "isVideoEnabled": is_video_enabled,
+                    }
+                )
+                save_db(database)
+                log_event(
+                    "call.signal.media_state.received",
+                    call_id=call.get("id"),
+                    sender_id=requester.get("id"),
+                    sequence=event.get("sequence"),
+                    is_muted=is_muted,
+                    is_video_enabled=is_video_enabled,
+                )
+                return self.respond(200, serialize_call_event(event))
+
+            if method == "PATCH" and parsed.path.startswith("/users/") and parsed.path.endswith("/profile"):
+                user_id = normalized_entity_id(parsed.path.split("/")[2])
+                log_event(
+                    "profile.update.request",
+                    path_user_id=user_id,
+                    has_bearer=bool(bearer_token_from_headers(self.headers)),
+                )
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID") or user_id,
+                    create_if_missing=False
+                )
+                if auth_error == "user_not_found":
+                    log_event("profile.update.rejected", reason="user_not_found", path_user_id=user_id)
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    log_event("profile.update.rejected", reason=auth_error, path_user_id=user_id)
+                    return self.respond(401, {"error": auth_error})
                 if not ids_equal(current_user["id"], user_id):
+                    log_event(
+                        "profile.update.rejected",
+                        reason="edit_not_allowed",
+                        path_user_id=user_id,
+                        actor_user_id=current_user.get("id"),
+                    )
                     return self.respond(403, {"error": "edit_not_allowed"})
 
-                username = normalize_username(payload.get("username", current_user["profile"]["username"]))
-                current_username = normalize_username(current_user["profile"]["username"])
-                if username == current_username:
-                    if not is_valid_legacy_username(username):
-                        return self.respond(409, {"error": "invalid_username"})
-                elif not is_valid_username(username):
-                    return self.respond(409, {"error": "invalid_username"})
-                if username_taken(database, username, user_id):
-                    return self.respond(409, {"error": "username_taken"})
+                current_profile = current_user.get("profile")
+                if not isinstance(current_profile, dict):
+                    current_profile = {}
+                current_user["profile"] = current_profile
 
-                current_account_kind = (current_user.get("accountKind") or "standard").strip() or "standard"
-                email = normalize_email(payload.get("email"))
-                phone_number = normalize_phone_number(payload.get("phone_number"))
+                current_username_raw = normalized_optional_string(current_profile.get("username")) or ""
+                current_username_normalized = normalize_username(current_username_raw)
+                incoming_username_raw = payload.get("username", current_username_raw)
+                incoming_username_normalized = normalize_username(incoming_username_raw)
+
+                if incoming_username_normalized == current_username_normalized:
+                    username = current_username_raw
+                else:
+                    username = incoming_username_normalized
+                    if not is_valid_username(username):
+                        log_event(
+                            "profile.update.rejected",
+                            reason="invalid_username",
+                            actor_user_id=current_user.get("id"),
+                            attempted_username=username,
+                        )
+                        return self.respond(409, {"error": "invalid_username"})
+                    if username_taken(database, username, user_id):
+                        log_event(
+                            "profile.update.rejected",
+                            reason="username_taken",
+                            actor_user_id=current_user.get("id"),
+                            attempted_username=username,
+                        )
+                        return self.respond(409, {"error": "username_taken"})
+
+                existing_display_name = (
+                    normalized_optional_string(current_profile.get("displayName"))
+                    or normalized_optional_string(current_profile.get("display_name"))
+                    or current_username_raw
+                    or "Prime User"
+                )
+                existing_bio = normalized_optional_string(current_profile.get("bio")) or ""
+                existing_status = normalized_optional_string(current_profile.get("status")) or "Available"
+                existing_birthday = normalized_optional_string(current_profile.get("birthday"))
+                existing_email = normalize_email(current_profile.get("email"))
+                existing_phone_number = normalize_phone_number(
+                    current_profile.get("phoneNumber") if "phoneNumber" in current_profile else current_profile.get("phone_number")
+                )
+                existing_profile_photo_url = normalized_optional_url_string(
+                    current_profile.get("profilePhotoURL")
+                    if "profilePhotoURL" in current_profile
+                    else current_profile.get("profile_photo_url")
+                )
+                existing_social_link = normalized_optional_url_string(
+                    current_profile.get("socialLink")
+                    if "socialLink" in current_profile
+                    else current_profile.get("social_link")
+                )
+
+                current_account_kind = normalized_optional_string(current_user.get("accountKind")) or "standard"
+                if current_account_kind not in {"standard", "offlineOnly", "guest"}:
+                    current_account_kind = "standard"
+                email = (
+                    normalize_email(payload.get("email"))
+                    if "email" in payload
+                    else existing_email
+                )
+                phone_number = (
+                    normalize_phone_number(payload.get("phone_number"))
+                    if "phone_number" in payload
+                    else existing_phone_number
+                )
                 if email and not is_valid_email(email):
+                    log_event(
+                        "profile.update.rejected",
+                        reason="invalid_email",
+                        actor_user_id=current_user.get("id"),
+                        attempted_email=email,
+                    )
                     return self.respond(409, {"error": "invalid_email"})
                 if phone_number and not is_valid_phone_number(phone_number):
+                    log_event(
+                        "profile.update.rejected",
+                        reason="invalid_phone_number",
+                        actor_user_id=current_user.get("id"),
+                        attempted_phone=phone_number,
+                    )
                     return self.respond(409, {"error": "invalid_phone_number"})
                 if email and email_taken(database, email, user_id):
+                    log_event(
+                        "profile.update.rejected",
+                        reason="email_taken",
+                        actor_user_id=current_user.get("id"),
+                        attempted_email=email,
+                    )
                     return self.respond(409, {"error": "email_taken"})
                 if phone_number and phone_number_taken(database, phone_number, user_id):
+                    log_event(
+                        "profile.update.rejected",
+                        reason="phone_taken",
+                        actor_user_id=current_user.get("id"),
+                        attempted_phone=phone_number,
+                    )
                     return self.respond(409, {"error": "phone_taken"})
                 if current_account_kind == "offlineOnly":
                     phone_number = None
                 if current_account_kind == "guest":
-                    email = current_user["profile"].get("email")
-                    phone_number = current_user["profile"].get("phoneNumber")
+                    email = existing_email
+                    phone_number = existing_phone_number
+
+                incoming_display_name = normalized_optional_string(payload.get("display_name"))
+                display_name = incoming_display_name if incoming_display_name is not None else existing_display_name
+
+                if "bio" in payload:
+                    incoming_bio_value = payload.get("bio")
+                    bio = str(incoming_bio_value).strip() if incoming_bio_value is not None else ""
+                else:
+                    bio = existing_bio
+
+                if "status" in payload:
+                    incoming_status_value = payload.get("status")
+                    status = str(incoming_status_value).strip() if incoming_status_value is not None else ""
+                else:
+                    status = existing_status
+
                 current_user["profile"] = {
-                    "displayName": payload.get("display_name", current_user["profile"]["displayName"]),
+                    "displayName": display_name,
                     "username": username,
-                    "bio": payload.get("bio", current_user["profile"]["bio"]),
-                    "status": payload.get("status", current_user["profile"]["status"]),
-                    "birthday": normalized_optional_string(payload.get("birthday", current_user["profile"].get("birthday"))),
+                    "bio": bio,
+                    "status": status,
+                    "birthday": normalized_optional_string(payload.get("birthday")) or existing_birthday,
                     "email": email,
                     "phoneNumber": phone_number,
                     "profilePhotoURL": normalized_optional_url_string(
-                        payload.get("profile_photo_url", current_user["profile"].get("profilePhotoURL"))
+                        payload.get("profile_photo_url")
+                        if "profile_photo_url" in payload
+                        else existing_profile_photo_url
                     ),
-                    "socialLink": normalized_optional_url_string(payload.get("social_link")),
+                    "socialLink": normalized_optional_url_string(
+                        payload.get("social_link")
+                        if "social_link" in payload
+                        else existing_social_link
+                    ),
                 }
                 current_user["identityMethods"] = build_identity_methods(username, email=email, phone_number=phone_number)
-                sync_user_snapshots(database, current_user)
+                try:
+                    sync_user_snapshots(database, current_user)
+                except Exception as error:
+                    # Snapshot sync is best-effort; do not fail profile updates because of malformed legacy chat data.
+                    log_event(
+                        "profile.update.snapshot_sync_failed",
+                        actor_user_id=current_user.get("id"),
+                        error=type(error).__name__,
+                    )
                 save_db(database)
+                log_event(
+                    "profile.update.success",
+                    actor_user_id=current_user.get("id"),
+                    username=username,
+                    email=email,
+                    account_kind=current_user.get("accountKind"),
+                )
                 return self.respond(200, serialize_user(current_user, current_user))
 
             if method == "PATCH" and parsed.path.startswith("/users/") and parsed.path.endswith("/privacy"):
@@ -6657,7 +8884,7 @@ class Handler(BaseHTTPRequestHandler):
                     database,
                     self.headers,
                     payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID") or user_id,
-                    create_if_missing=True
+                    create_if_missing=False
                 )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
@@ -6691,7 +8918,7 @@ class Handler(BaseHTTPRequestHandler):
                     database,
                     self.headers,
                     payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID") or user_id,
-                    create_if_missing=True
+                    create_if_missing=False
                 )
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
@@ -6700,8 +8927,63 @@ class Handler(BaseHTTPRequestHandler):
                 if not ids_equal(current_user["id"], user_id):
                     return self.respond(403, {"error": "edit_not_allowed"})
 
-                current_user["password"] = str(payload.get("password", "")).strip()
+                old_password = str(payload.get("old_password", "")).strip()
+                new_password = str(payload.get("password", "")).strip()
+                if not new_password:
+                    return self.respond(409, {"error": "invalid_credentials"})
+
+                existing_password = str(current_user.get("password", "")).strip()
+                if existing_password:
+                    if not old_password:
+                        return self.respond(409, {"error": "current_password_required"})
+                    if old_password != existing_password:
+                        return self.respond(401, {"error": "invalid_credentials"})
+
+                current_user["password"] = new_password
                 save_db(database)
+                return self.respond(200, {"ok": True})
+
+            if method == "POST" and parsed.path.startswith("/users/") and parsed.path.endswith("/block"):
+                blocked_user_id = normalized_entity_id(parsed.path.split("/")[2])
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID"),
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                if ids_equal(current_user.get("id"), blocked_user_id):
+                    return self.respond(409, {"error": "self_block_not_allowed"})
+
+                blocked_user = find_user(database, blocked_user_id)
+                if not blocked_user:
+                    return self.respond(404, {"error": "user_not_found"})
+
+                did_update = set_block_relation(database, current_user.get("id"), blocked_user_id)
+                if did_update:
+                    save_db(database)
+                return self.respond(200, {"ok": True})
+
+            if method == "POST" and parsed.path.startswith("/users/") and parsed.path.endswith("/unblock"):
+                blocked_user_id = normalized_entity_id(parsed.path.split("/")[2])
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload_string(payload, "user_id", "userID", "current_user_id", "currentUserID"),
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                did_update = remove_block_relation(database, current_user.get("id"), blocked_user_id)
+                if did_update:
+                    save_db(database)
                 return self.respond(200, {"ok": True})
 
             if method == "POST" and parsed.path.startswith("/users/") and parsed.path.endswith("/avatar"):
@@ -7142,6 +9424,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(404, {"error": "chat_not_found"})
                 if chat.get("type") != "group":
                     return self.respond(409, {"error": "invalid_group_chat"})
+                if is_chat_blocked_by_admin(chat):
+                    return self.respond(403, {"error": "chat_admin_blocked"})
                 if not chat_is_publicly_joinable(chat):
                     return self.respond(403, {"error": "chat_not_public"})
                 if is_group_banned(chat, requester_id):
@@ -7426,6 +9710,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(404, {"error": "invite_not_found"})
                 if chat.get("type") != "group":
                     return self.respond(409, {"error": "invalid_group_chat"})
+                if is_chat_blocked_by_admin(chat):
+                    return self.respond(403, {"error": "chat_admin_blocked"})
                 if is_group_banned(chat, requester_id):
                     save_db(database)
                     return self.respond(403, {"error": "user_banned"})
@@ -7469,6 +9755,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(404, {"error": "chat_not_found"})
                 if chat.get("type") != "group":
                     return self.respond(409, {"error": "invalid_group_chat"})
+                if is_chat_blocked_by_admin(chat):
+                    return self.respond(403, {"error": "chat_admin_blocked"})
                 if not chat_is_publicly_joinable(chat):
                     return self.respond(403, {"error": "chat_not_public"})
                 if is_group_banned(chat, requester_id):
@@ -7762,6 +10050,12 @@ class Handler(BaseHTTPRequestHandler):
                 did_update = mark_chat_read(chat, database, reader["id"])
                 if did_update:
                     save_db(database)
+                    realtime_publish_chat_event(
+                        database,
+                        chat,
+                        event_type="chat.read",
+                        actor_user_id=reader["id"],
+                    )
                 return self.respond(200, {"ok": True})
 
             if method == "POST" and parsed.path == "/messages/send":
@@ -7839,6 +10133,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 delivery_options = sanitized_delivery_options(payload.get("delivery_options"))
                 community_details = sanitized_community_details(chat.get("communityDetails")) or {}
+                if community_details.get("isBlockedByAdmin"):
+                    return self.respond(403, {"error": "chat_admin_blocked"})
                 if community_details.get("kind") == "channel":
                     can_manage_channel = can_manage_group(chat, sender_id)
                     parent_post_id = (community_context or {}).get("parentPostID")
@@ -7965,6 +10261,19 @@ class Handler(BaseHTTPRequestHandler):
                     if message_status_rank(initial_status) > message_status_rank(existing_message.get("status")):
                         existing_message["status"] = initial_status
                     save_db(database)
+                    realtime_publish_message_event(
+                        database,
+                        chat,
+                        existing_message,
+                        event_type="message.updated",
+                        actor_user_id=sender_id,
+                    )
+                    realtime_publish_chat_event(
+                        database,
+                        chat,
+                        event_type="chat.updated",
+                        actor_user_id=sender_id,
+                    )
                     log_event(
                         "message.send.duplicate",
                         chat_id=chat["id"],
@@ -8001,6 +10310,19 @@ class Handler(BaseHTTPRequestHandler):
                 backfill_group_member_snapshots(chat, database)
                 database["messages"].append(message)
                 save_db(database)
+                realtime_publish_message_event(
+                    database,
+                    chat,
+                    message,
+                    event_type="message.created",
+                    actor_user_id=sender_id,
+                )
+                realtime_publish_chat_event(
+                    database,
+                    chat,
+                    event_type="chat.updated",
+                    actor_user_id=sender_id,
+                )
                 log_event(
                     "message.send.accepted",
                     chat_id=chat["id"],
@@ -8073,6 +10395,13 @@ class Handler(BaseHTTPRequestHandler):
                     )
 
                 save_db(database)
+                realtime_publish_message_event(
+                    database,
+                    chat,
+                    message,
+                    event_type="message.updated",
+                    actor_user_id=requester_id,
+                )
                 return self.respond(200, serialize_message(message, database))
 
             if method == "PATCH" and parsed.path.startswith("/messages/"):
@@ -8111,6 +10440,19 @@ class Handler(BaseHTTPRequestHandler):
                 message["text"] = updated_text
                 message["editedAt"] = now_iso()
                 save_db(database)
+                realtime_publish_message_event(
+                    database,
+                    chat,
+                    message,
+                    event_type="message.updated",
+                    actor_user_id=editor_id,
+                )
+                realtime_publish_chat_event(
+                    database,
+                    chat,
+                    event_type="chat.updated",
+                    actor_user_id=editor_id,
+                )
                 return self.respond(200, serialize_message(message, database))
 
             if method == "DELETE" and parsed.path.startswith("/messages/"):
@@ -8144,9 +10486,416 @@ class Handler(BaseHTTPRequestHandler):
                 message["voiceMessage"] = None
                 message["deletedForEveryoneAt"] = now_iso()
                 save_db(database)
+                realtime_publish_message_event(
+                    database,
+                    chat,
+                    message,
+                    event_type="message.deleted",
+                    actor_user_id=requester_id,
+                )
+                realtime_publish_chat_event(
+                    database,
+                    chat,
+                    event_type="chat.updated",
+                    actor_user_id=requester_id,
+                )
                 return self.respond(200, serialize_message(message, database))
 
         return self.respond(404, {"error": "not_found"})
+
+    def handle_realtime_websocket(self, parsed):
+        upgrade_header = (self.headers.get("Upgrade") or "").strip().lower()
+        connection_header = (self.headers.get("Connection") or "").strip().lower()
+        websocket_key = (self.headers.get("Sec-WebSocket-Key") or "").strip()
+        websocket_version = (self.headers.get("Sec-WebSocket-Version") or "").strip()
+
+        if upgrade_header != "websocket" or "upgrade" not in connection_header or not websocket_key:
+            return self.respond(400, {"error": "websocket_upgrade_required"})
+        if websocket_version and websocket_version != "13":
+            return self.respond(409, {"error": "unsupported_websocket_version"})
+
+        params = parse_qs(parsed.query)
+        fallback_user_id = (
+            (params.get("user_id") or [""])[0].strip()
+            or (params.get("requester_id") or [""])[0].strip()
+            or None
+        )
+        with LOCK:
+            database = load_db()
+            user, _, auth_error = request_user_with_fallback(
+                database,
+                self.headers,
+                fallback_user_id,
+                create_if_missing=False
+            )
+        if auth_error:
+            return self.respond(401, {"error": auth_error})
+
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", websocket_accept_key(websocket_key))
+        self.end_headers()
+
+        client = REALTIME_HUB.register_client(user.get("id"), self.connection)
+        REALTIME_HUB.touch_user_presence(client.user_id)
+        since_query = (params.get("since") or ["0"])[0].strip()
+        try:
+            since_sequence = int(since_query or "0")
+        except ValueError:
+            since_sequence = 0
+
+        query_feed_subscribed = (params.get("feed") or ["0"])[0].strip().lower() in {"1", "true", "yes"}
+        query_chat_ids = [
+            normalized_entity_id(chat_id)
+            for chat_id in (params.get("chat_id") or [])
+            if normalized_entity_id(chat_id)
+        ]
+        if query_feed_subscribed:
+            REALTIME_HUB.set_feed_subscription(client.connection_id, True)
+        for query_chat_id in query_chat_ids:
+            REALTIME_HUB.subscribe_chat(client.connection_id, query_chat_id)
+
+        if since_sequence > 0:
+            REALTIME_HUB.replay_since(client.connection_id, since_sequence)
+
+        REALTIME_HUB.send_to_connection(
+            client.connection_id,
+            {
+                "type": "system.connected",
+                "chatID": None,
+                "mode": "online",
+                "timestamp": now_iso(),
+            },
+        )
+        log_event(
+            "realtime.client.connected",
+            connection_id=client.connection_id,
+            user_id=client.user_id,
+            feed_subscribed=query_feed_subscribed,
+            subscribed_chat_count=len(query_chat_ids),
+        )
+        with LOCK:
+            database = load_db()
+            realtime_publish_presence_for_user(database, client.user_id)
+
+        try:
+            while True:
+                opcode, payload = websocket_read_frame(self.rfile)
+
+                if opcode == 0x8:
+                    client.send_control(0x8, payload)
+                    break
+
+                if opcode == 0x9:
+                    client.send_control(0xA, payload)
+                    continue
+
+                if opcode == 0xA:
+                    continue
+
+                if opcode != 0x1:
+                    continue
+
+                if not payload:
+                    continue
+
+                try:
+                    command = json.loads(payload.decode("utf-8"))
+                except Exception:
+                    REALTIME_HUB.send_to_connection(
+                        client.connection_id,
+                        {
+                            "type": "system.error",
+                            "reason": "invalid_json",
+                            "timestamp": now_iso(),
+                        },
+                    )
+                    continue
+
+                self.process_realtime_command(client, command)
+        except Exception as error:
+            log_event(
+                "realtime.client.disconnected",
+                connection_id=client.connection_id,
+                user_id=client.user_id,
+                reason=type(error).__name__,
+            )
+        finally:
+            unregister_snapshot = REALTIME_HUB.unregister_client(client.connection_id)
+            if unregister_snapshot:
+                typing_chat_ids = unregister_snapshot.get("typing_chat_ids") or []
+                if typing_chat_ids:
+                    with LOCK:
+                        database = load_db()
+                        for chat_id in typing_chat_ids:
+                            chat = find_chat(database, chat_id)
+                            if chat:
+                                realtime_publish_typing_event(
+                                    database,
+                                    chat,
+                                    unregister_snapshot.get("user_id"),
+                                    is_typing=False,
+                                )
+                if int(unregister_snapshot.get("remaining_connection_count") or 0) == 0:
+                    with LOCK:
+                        database = load_db()
+                        realtime_publish_presence_for_user(
+                            database,
+                            unregister_snapshot.get("user_id"),
+                        )
+            try:
+                self.connection.close()
+            except Exception:
+                pass
+
+    def process_realtime_command(self, client, command):
+        if not isinstance(command, dict):
+            REALTIME_HUB.send_to_connection(
+                client.connection_id,
+                {
+                    "type": "system.error",
+                    "reason": "invalid_command",
+                    "timestamp": now_iso(),
+                },
+            )
+            return
+
+        action = normalized_optional_string(command.get("action")) or ""
+
+        expired_typing_entries = REALTIME_HUB.collect_expired_typing_states()
+        if expired_typing_entries:
+            with LOCK:
+                database = load_db()
+                for entry in expired_typing_entries:
+                    chat = find_chat(database, entry.get("chat_id"))
+                    if chat:
+                        realtime_publish_typing_event(
+                            database,
+                            chat,
+                            entry.get("user_id"),
+                            is_typing=False,
+                        )
+
+        if action == "hello":
+            REALTIME_HUB.touch_user_presence(client.user_id)
+            since_value = command.get("since")
+            try:
+                since_sequence = int(since_value or 0)
+            except (TypeError, ValueError):
+                since_sequence = 0
+
+            feed_subscribed = bool(command.get("feed"))
+            REALTIME_HUB.set_feed_subscription(client.connection_id, feed_subscribed)
+            for chat_id in command.get("chat_ids") or []:
+                REALTIME_HUB.subscribe_chat(client.connection_id, chat_id)
+            if since_sequence > 0:
+                REALTIME_HUB.replay_since(client.connection_id, since_sequence)
+
+            REALTIME_HUB.send_to_connection(
+                client.connection_id,
+                {
+                    "type": "system.hello",
+                    "chatID": None,
+                    "mode": "online",
+                    "timestamp": now_iso(),
+                },
+            )
+            return
+
+        if action == "presence":
+            REALTIME_HUB.touch_user_presence(client.user_id)
+            raw_force = command.get("force")
+            if isinstance(raw_force, str):
+                force_refresh = raw_force.strip().lower() in {"1", "true", "yes", "on"}
+            else:
+                force_refresh = bool(raw_force)
+            if REALTIME_HUB.should_broadcast_presence(client.user_id, force=force_refresh):
+                with LOCK:
+                    database = load_db()
+                    realtime_publish_presence_for_user(database, client.user_id)
+            REALTIME_HUB.send_to_connection(
+                client.connection_id,
+                {
+                    "type": "system.presence_ack",
+                    "chatID": None,
+                    "mode": "online",
+                    "timestamp": now_iso(),
+                },
+            )
+            return
+
+        if action == "typing":
+            chat_id = normalized_entity_id(command.get("chat_id"))
+            raw_is_typing = command.get("is_typing")
+            if isinstance(raw_is_typing, str):
+                is_typing = raw_is_typing.strip().lower() in {"1", "true", "yes", "on"}
+            else:
+                is_typing = bool(raw_is_typing)
+
+            if not chat_id:
+                REALTIME_HUB.send_to_connection(
+                    client.connection_id,
+                    {
+                        "type": "system.error",
+                        "reason": "typing_chat_required",
+                        "timestamp": now_iso(),
+                    },
+                )
+                return
+
+            with LOCK:
+                database = load_db()
+                chat = find_chat(database, chat_id)
+            if not chat:
+                REALTIME_HUB.send_to_connection(
+                    client.connection_id,
+                    {
+                        "type": "system.error",
+                        "reason": "chat_not_found",
+                        "timestamp": now_iso(),
+                    },
+                )
+                return
+            if chat.get("mode") != "online":
+                REALTIME_HUB.send_to_connection(
+                    client.connection_id,
+                    {
+                        "type": "system.error",
+                        "reason": "typing_online_only",
+                        "timestamp": now_iso(),
+                    },
+                )
+                return
+            if chat.get("type") != "direct":
+                REALTIME_HUB.send_to_connection(
+                    client.connection_id,
+                    {
+                        "type": "system.error",
+                        "reason": "typing_direct_only",
+                        "timestamp": now_iso(),
+                    },
+                )
+                return
+            if not any(ids_equal(participant_id, client.user_id) for participant_id in (chat.get("participantIDs") or [])):
+                REALTIME_HUB.send_to_connection(
+                    client.connection_id,
+                    {
+                        "type": "system.error",
+                        "reason": "sender_not_in_chat",
+                        "timestamp": now_iso(),
+                    },
+                )
+                return
+
+            REALTIME_HUB.touch_user_presence(client.user_id)
+            typing_transition = REALTIME_HUB.set_typing_state(client.connection_id, chat_id, is_typing)
+            if typing_transition:
+                with LOCK:
+                    database = load_db()
+                    fresh_chat = find_chat(database, chat_id)
+                    if fresh_chat:
+                        realtime_publish_typing_event(
+                            database,
+                            fresh_chat,
+                            client.user_id,
+                            is_typing=is_typing,
+                        )
+            REALTIME_HUB.send_to_connection(
+                client.connection_id,
+                {
+                    "type": "system.typing_ack",
+                    "chatID": chat_id,
+                    "mode": "online",
+                    "timestamp": now_iso(),
+                    "isTyping": bool(is_typing),
+                    "transition": typing_transition or "noop",
+                },
+            )
+            return
+
+        if action == "subscribe":
+            chat_id = command.get("chat_id")
+            if REALTIME_HUB.subscribe_chat(client.connection_id, chat_id):
+                REALTIME_HUB.send_to_connection(
+                    client.connection_id,
+                    {
+                        "type": "system.subscribed",
+                        "chatID": normalized_entity_id(chat_id),
+                        "mode": "online",
+                        "timestamp": now_iso(),
+                    },
+                )
+            return
+
+        if action == "unsubscribe":
+            chat_id = command.get("chat_id")
+            REALTIME_HUB.unsubscribe_chat(client.connection_id, chat_id)
+            REALTIME_HUB.send_to_connection(
+                client.connection_id,
+                {
+                    "type": "system.unsubscribed",
+                    "chatID": normalized_entity_id(chat_id),
+                    "mode": "online",
+                    "timestamp": now_iso(),
+                },
+            )
+            return
+
+        if action == "subscribe_feed":
+            REALTIME_HUB.set_feed_subscription(client.connection_id, True)
+            REALTIME_HUB.send_to_connection(
+                client.connection_id,
+                {
+                    "type": "system.feed_subscribed",
+                    "chatID": None,
+                    "mode": "online",
+                    "timestamp": now_iso(),
+                },
+            )
+            return
+
+        if action == "unsubscribe_feed":
+            REALTIME_HUB.set_feed_subscription(client.connection_id, False)
+            REALTIME_HUB.send_to_connection(
+                client.connection_id,
+                {
+                    "type": "system.feed_unsubscribed",
+                    "chatID": None,
+                    "mode": "online",
+                    "timestamp": now_iso(),
+                },
+            )
+            return
+
+        if action in {"ping", "resync"}:
+            REALTIME_HUB.touch_user_presence(client.user_id)
+            since_value = command.get("since")
+            try:
+                since_sequence = int(since_value or 0)
+            except (TypeError, ValueError):
+                since_sequence = 0
+            if since_sequence > 0:
+                REALTIME_HUB.replay_since(client.connection_id, since_sequence)
+            REALTIME_HUB.send_to_connection(
+                client.connection_id,
+                {
+                    "type": "system.pong",
+                    "chatID": None,
+                    "mode": "online",
+                    "timestamp": now_iso(),
+                },
+            )
+            return
+
+        REALTIME_HUB.send_to_connection(
+            client.connection_id,
+            {
+                "type": "system.error",
+                "reason": "unsupported_action",
+                "timestamp": now_iso(),
+            },
+        )
 
     def serve_avatar(self, avatar_name):
         avatar_path = os.path.join(AVATAR_DIR, os.path.basename(avatar_name))

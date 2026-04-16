@@ -18,11 +18,13 @@ final class NearbyPermissionRequester: NSObject, ObservableObject {
             options: [CBCentralManagerOptionShowPowerAlertKey: true]
         )
 
+        #if !os(tvOS)
         peripheralManager = CBPeripheralManager(
             delegate: self,
             queue: nil,
             options: [CBPeripheralManagerOptionShowPowerAlertKey: true]
         )
+        #endif
     }
 }
 

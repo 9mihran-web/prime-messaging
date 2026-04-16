@@ -1,5 +1,22 @@
 import Foundation
 
+struct AccountLookupResult: Codable, Hashable {
+    var exists: Bool
+    var accountKind: AccountKind?
+    var displayName: String?
+}
+
+struct ChatModeTransitionRequest {
+    var fromMode: ChatMode
+    var toMode: ChatMode
+    var currentUser: User
+    var activeChat: Chat?
+}
+
+struct ChatModeTransitionResult {
+    var routedChat: Chat?
+}
+
 protocol AuthRepository {
     func currentUser() async throws -> User
     func signUp(
@@ -7,9 +24,13 @@ protocol AuthRepository {
         username: String,
         password: String,
         contactValue: String,
-        methodType: IdentityMethodType
+        methodType: IdentityMethodType,
+        accountKind: AccountKind
     ) async throws -> User
+    func lookupAccount(identifier: String) async throws -> AccountLookupResult
+    func authenticate(identifier: String, otpCode: String) async throws -> User?
     func logIn(identifier: String, password: String) async throws -> User
+    func resetPassword(identifier: String, newPassword: String) async throws
     func refreshUser(userID: UUID) async throws -> User
     func userProfile(userID: UUID) async throws -> User
     func updateProfile(_ profile: Profile, for userID: UUID) async throws -> User
@@ -23,21 +44,72 @@ protocol AuthRepository {
 protocol ChatRepository {
     func fetchChats(mode: ChatMode, for userID: UUID) async throws -> [Chat]
     func fetchMessages(chatID: UUID, mode: ChatMode) async throws -> [Message]
+    func cachedChats(mode: ChatMode, for userID: UUID) async -> [Chat]
+    func cachedMessages(chatID: UUID, mode: ChatMode) async -> [Message]
     func markChatRead(chatID: UUID, mode: ChatMode, readerID: UUID) async throws
     func sendMessage(_ text: String, in chatID: UUID, mode: ChatMode, senderID: UUID) async throws -> Message
+    func sendMessage(_ draft: OutgoingMessageDraft, in chat: Chat, senderID: UUID) async throws -> Message
     func sendMessage(_ draft: OutgoingMessageDraft, in chatID: UUID, mode: ChatMode, senderID: UUID) async throws -> Message
+    func toggleReaction(_ emoji: String, on messageID: UUID, in chatID: UUID, mode: ChatMode, userID: UUID) async throws -> Message
     func editMessage(_ messageID: UUID, text: String, in chatID: UUID, mode: ChatMode, editorID: UUID) async throws -> Message
     func deleteMessage(_ messageID: UUID, in chatID: UUID, mode: ChatMode, requesterID: UUID) async throws -> Message
     func createDirectChat(with otherUserID: UUID, currentUserID: UUID, mode: ChatMode) async throws -> Chat
-    func createGroupChat(title: String, memberIDs: [UUID], ownerID: UUID, mode: ChatMode) async throws -> Chat
+    func submitGuestRequest(introText: String, in chatID: UUID, senderID: UUID) async throws -> Chat
+    func respondToGuestRequest(in chatID: UUID, approve: Bool, responderID: UUID) async throws -> Chat
+    func createGroupChat(
+        title: String,
+        memberIDs: [UUID],
+        ownerID: UUID,
+        mode: ChatMode,
+        communityDetails: CommunityChatDetails?
+    ) async throws -> Chat
     func updateGroup(_ chat: Chat, title: String, requesterID: UUID) async throws -> Chat
+    func deleteGroup(_ chat: Chat, requesterID: UUID) async throws
+    func updateCommunityDetails(_ details: CommunityChatDetails, for chat: Chat, requesterID: UUID) async throws -> Chat
     func uploadGroupAvatar(imageData: Data, for chat: Chat, requesterID: UUID) async throws -> Chat
     func removeGroupAvatar(for chat: Chat, requesterID: UUID) async throws -> Chat
     func addMembers(_ memberIDs: [UUID], to chat: Chat, requesterID: UUID) async throws -> Chat
     func removeMember(_ memberID: UUID, from chat: Chat, requesterID: UUID) async throws -> Chat
     func updateMemberRole(_ role: GroupMemberRole, for memberID: UUID, in chat: Chat, requesterID: UUID) async throws -> Chat
+    func transferGroupOwnership(to memberID: UUID, in chat: Chat, requesterID: UUID) async throws -> Chat
+    func leaveGroup(_ chat: Chat, requesterID: UUID) async throws
+    func searchDiscoverableChats(query: String, mode: ChatMode, currentUserID: UUID) async throws -> [Chat]
+    func joinDiscoverableChat(_ chat: Chat, requesterID: UUID) async throws -> Chat
+    func joinChat(inviteCode: String, mode: ChatMode, requesterID: UUID) async throws -> Chat
+    func submitJoinRequest(for chat: Chat, requesterID: UUID, answers: [String]) async throws
+    func fetchModerationDashboard(for chat: Chat, requesterID: UUID) async throws -> ModerationDashboard
+    func resolveJoinRequest(
+        for requesterUserID: UUID,
+        approve: Bool,
+        in chat: Chat,
+        requesterID: UUID
+    ) async throws -> ModerationDashboard
+    func reportChatContent(
+        in chat: Chat,
+        requesterID: UUID,
+        targetMessageID: UUID?,
+        targetUserID: UUID?,
+        reason: ModerationReportReason,
+        details: String?
+    ) async throws
+    func banMember(
+        _ memberID: UUID,
+        duration: TimeInterval,
+        reason: String?,
+        in chat: Chat,
+        requesterID: UUID
+    ) async throws -> ModerationDashboard
+    func removeBan(
+        for memberID: UUID,
+        in chat: Chat,
+        requesterID: UUID
+    ) async throws -> ModerationDashboard
     func createNearbyChat(with peer: OfflinePeer, currentUser: User) async throws -> Chat
     func saveDraft(_ draft: Draft) async throws
+    func prepareModeTransition(_ request: ChatModeTransitionRequest) async throws -> ChatModeTransitionResult
+    func retryPendingOutgoingMessages(currentUserID: UUID) async
+    func cancelPendingOutgoingMessage(clientMessageID: UUID, in chat: Chat, ownerUserID: UUID) async
+    func purgeLocalChatArtifacts(chatIDs: [UUID], currentUserID: UUID) async
 }
 
 protocol PresenceRepository {
@@ -46,6 +118,7 @@ protocol PresenceRepository {
 
 protocol CallRepository {
     func fetchActiveCalls(for userID: UUID) async throws -> [InternetCall]
+    func fetchCallHistory(for userID: UUID) async throws -> [InternetCall]
     func fetchCall(_ callID: UUID, for userID: UUID) async throws -> InternetCall
     func startAudioCall(with calleeID: UUID, from callerID: UUID) async throws -> InternetCall
     func answerCall(_ callID: UUID, userID: UUID) async throws -> InternetCall
@@ -97,6 +170,7 @@ enum PushAuthorizationStatus: String {
 protocol PushNotificationService: AnyObject {
     func registerForRemoteNotifications() async
     func syncDeviceToken(_ token: Data) async
+    func syncVoIPDeviceToken(_ token: Data) async
     func authorizationStatus() async -> PushAuthorizationStatus
     func startMonitoring(currentUser: User, chatRepository: ChatRepository) async
     func stopMonitoring() async
@@ -108,19 +182,186 @@ protocol OfflineTransporting {
     func startScanning() async
     func stopScanning() async
     func discoveredPeers() async -> [OfflinePeer]
+    func reachablePeer(userID: UUID) async -> OfflinePeer?
     func connect(to peer: OfflinePeer) async throws -> BluetoothSession
     func fetchChats(currentUserID: UUID) async -> [Chat]
     func openChat(with peer: OfflinePeer, currentUser: User) async throws -> Chat
     func fetchMessages(chatID: UUID) async -> [Message]
     func sendMessage(_ text: String, in chat: Chat, senderID: UUID) async throws -> Message
     func sendMessage(_ draft: OutgoingMessageDraft, in chat: Chat, senderID: UUID) async throws -> Message
+    func toggleReaction(_ emoji: String, on messageID: UUID, in chatID: UUID, userID: UUID) async throws -> Message
     func editMessage(_ messageID: UUID, text: String, in chatID: UUID, editorID: UUID) async throws -> Message
     func deleteMessage(_ messageID: UUID, in chatID: UUID, requesterID: UUID) async throws -> Message
+    func synchronizeArchivedChats(with onlineRepository: ChatRepository, currentUserID: UUID) async
+    func importHistory(_ messages: [Message], into chat: Chat, currentUser: User) async throws -> Chat
 }
 
 protocol LocalStore {
     func loadDrafts() async -> [Draft]
+    func loadDraft(chatID: UUID, mode: ChatMode) async -> Draft?
     func saveDraft(_ draft: Draft) async
+    func removeDraft(chatID: UUID, mode: ChatMode) async
     func loadChats(for mode: ChatMode) async -> [Chat]
     func saveChats(_ chats: [Chat], for mode: ChatMode) async
+}
+
+extension ChatRepository {
+    func sendMessage(_ draft: OutgoingMessageDraft, in chat: Chat, senderID: UUID) async throws -> Message {
+        try await sendMessage(draft, in: chat.id, mode: chat.mode, senderID: senderID)
+    }
+
+    func cachedChats(mode: ChatMode, for userID: UUID) async -> [Chat] {
+        _ = mode
+        _ = userID
+        return []
+    }
+
+    func cachedMessages(chatID: UUID, mode: ChatMode) async -> [Message] {
+        _ = chatID
+        _ = mode
+        return []
+    }
+
+    func prepareModeTransition(_ request: ChatModeTransitionRequest) async throws -> ChatModeTransitionResult {
+        _ = request
+        return ChatModeTransitionResult(routedChat: nil)
+    }
+
+    func retryPendingOutgoingMessages(currentUserID: UUID) async {
+        _ = currentUserID
+    }
+
+    func cancelPendingOutgoingMessage(clientMessageID: UUID, in chat: Chat, ownerUserID: UUID) async {
+        _ = clientMessageID
+        _ = chat
+        _ = ownerUserID
+    }
+
+    func purgeLocalChatArtifacts(chatIDs: [UUID], currentUserID: UUID) async {
+        _ = chatIDs
+        _ = currentUserID
+    }
+
+    func transferGroupOwnership(to memberID: UUID, in chat: Chat, requesterID: UUID) async throws -> Chat {
+        _ = memberID
+        _ = requesterID
+        return chat
+    }
+
+    func leaveGroup(_ chat: Chat, requesterID: UUID) async throws {
+        _ = chat
+        _ = requesterID
+    }
+
+    func updateCommunityDetails(_ details: CommunityChatDetails, for chat: Chat, requesterID: UUID) async throws -> Chat {
+        _ = details
+        _ = requesterID
+        return chat
+    }
+
+    func searchDiscoverableChats(query: String, mode: ChatMode, currentUserID: UUID) async throws -> [Chat] {
+        _ = query
+        _ = mode
+        _ = currentUserID
+        return []
+    }
+
+    func joinDiscoverableChat(_ chat: Chat, requesterID: UUID) async throws -> Chat {
+        _ = requesterID
+        return chat
+    }
+
+    func joinChat(inviteCode: String, mode: ChatMode, requesterID: UUID) async throws -> Chat {
+        _ = inviteCode
+        _ = mode
+        _ = requesterID
+        throw ChatRepositoryError.chatNotFound
+    }
+
+    func submitJoinRequest(for chat: Chat, requesterID: UUID, answers: [String]) async throws {
+        _ = chat
+        _ = requesterID
+        _ = answers
+        throw ChatRepositoryError.unsupportedOfflineAction
+    }
+
+    func fetchModerationDashboard(for chat: Chat, requesterID: UUID) async throws -> ModerationDashboard {
+        _ = chat
+        _ = requesterID
+        return ModerationDashboard()
+    }
+
+    func resolveJoinRequest(
+        for requesterUserID: UUID,
+        approve: Bool,
+        in chat: Chat,
+        requesterID: UUID
+    ) async throws -> ModerationDashboard {
+        _ = requesterUserID
+        _ = approve
+        _ = chat
+        _ = requesterID
+        return ModerationDashboard()
+    }
+
+    func reportChatContent(
+        in chat: Chat,
+        requesterID: UUID,
+        targetMessageID: UUID?,
+        targetUserID: UUID?,
+        reason: ModerationReportReason,
+        details: String?
+    ) async throws {
+        _ = chat
+        _ = requesterID
+        _ = targetMessageID
+        _ = targetUserID
+        _ = reason
+        _ = details
+    }
+
+    func banMember(
+        _ memberID: UUID,
+        duration: TimeInterval,
+        reason: String?,
+        in chat: Chat,
+        requesterID: UUID
+    ) async throws -> ModerationDashboard {
+        _ = memberID
+        _ = duration
+        _ = reason
+        _ = chat
+        _ = requesterID
+        return ModerationDashboard()
+    }
+
+    func removeBan(
+        for memberID: UUID,
+        in chat: Chat,
+        requesterID: UUID
+    ) async throws -> ModerationDashboard {
+        _ = memberID
+        _ = chat
+        _ = requesterID
+        return ModerationDashboard()
+    }
+}
+
+extension PushNotificationService {
+    func syncVoIPDeviceToken(_ token: Data) async {
+        _ = token
+    }
+}
+
+extension OfflineTransporting {
+    func reachablePeer(userID: UUID) async -> OfflinePeer? {
+        let peers = await discoveredPeers()
+        return peers.first(where: { $0.id == userID && $0.isReachable })
+    }
+
+    func importHistory(_ messages: [Message], into chat: Chat, currentUser: User) async throws -> Chat {
+        _ = messages
+        _ = currentUser
+        return chat
+    }
 }

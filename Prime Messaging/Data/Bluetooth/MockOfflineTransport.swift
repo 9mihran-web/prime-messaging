@@ -30,9 +30,9 @@ struct MockOfflineTransport: OfflineTransporting {
             participantIDs: [currentUserID],
             group: nil,
             lastMessagePreview: Self.messagesByChatID[currentUserID]?.last?.text,
-            lastActivityAt: Self.messagesByChatID[currentUserID]?.last?.createdAt ?? .now,
+            lastActivityAt: Self.messagesByChatID[currentUserID]?.last?.createdAt ?? .distantPast,
             unreadCount: 0,
-            isPinned: true,
+            isPinned: false,
             draft: nil,
             disappearingPolicy: nil,
             notificationPreferences: NotificationPreferences(muteState: .active, previewEnabled: true, customSoundName: nil, badgeEnabled: true)
@@ -69,6 +69,71 @@ struct MockOfflineTransport: OfflineTransporting {
         Self.messagesByChatID[chatID] ?? []
     }
 
+    func importHistory(_ messages: [Message], into chat: Chat, currentUser: User) async throws -> Chat {
+        let targetChatID: UUID
+        switch chat.type {
+        case .selfChat:
+            targetChatID = currentUser.id
+        case .direct:
+            targetChatID = chat.id
+        case .group:
+            throw ChatRepositoryError.unsupportedOfflineAction
+        case .secret:
+            throw ChatRepositoryError.unsupportedOfflineAction
+        }
+
+        var mergedByClientMessageID: [UUID: Message] = [:]
+        for message in Self.messagesByChatID[targetChatID] ?? [] {
+            mergedByClientMessageID[message.clientMessageID] = message
+        }
+        for message in messages {
+            mergedByClientMessageID[message.clientMessageID] = Message(
+                id: message.id,
+                chatID: targetChatID,
+                senderID: message.senderID,
+                clientMessageID: message.clientMessageID,
+                senderDisplayName: message.senderDisplayName,
+                mode: .offline,
+                deliveryState: message.deliveryState,
+                kind: message.kind,
+                text: message.text,
+                attachments: message.attachments,
+                replyToMessageID: message.replyToMessageID,
+                replyPreview: message.replyPreview,
+                status: message.status,
+                createdAt: message.createdAt,
+                editedAt: message.editedAt,
+                deletedForEveryoneAt: message.deletedForEveryoneAt,
+                reactions: message.reactions,
+                voiceMessage: message.voiceMessage,
+                liveLocation: message.liveLocation
+            )
+        }
+
+        let importedChat = Chat(
+            id: targetChatID,
+            mode: .offline,
+            type: chat.type,
+            title: chat.title,
+            subtitle: chat.subtitle,
+            participantIDs: chat.type == .selfChat ? [currentUser.id] : chat.participantIDs,
+            participants: chat.participants,
+            group: nil,
+            lastMessagePreview: mergedByClientMessageID.values.sorted(by: { $0.createdAt < $1.createdAt }).last?.text,
+            lastActivityAt: mergedByClientMessageID.values.sorted(by: { $0.createdAt < $1.createdAt }).last?.createdAt ?? .now,
+            unreadCount: 0,
+            isPinned: chat.isPinned,
+            draft: chat.draft,
+            disappearingPolicy: chat.disappearingPolicy,
+            notificationPreferences: chat.notificationPreferences,
+            guestRequest: nil
+        )
+
+        Self.chats[targetChatID] = importedChat
+        Self.messagesByChatID[targetChatID] = mergedByClientMessageID.values.sorted(by: { $0.createdAt < $1.createdAt })
+        return importedChat
+    }
+
     func sendMessage(_ text: String, in chat: Chat, senderID: UUID) async throws -> Message {
         try await sendMessage(OutgoingMessageDraft(text: text), in: chat, senderID: senderID)
     }
@@ -78,14 +143,20 @@ struct MockOfflineTransport: OfflineTransporting {
             id: UUID(),
             chatID: chat.id,
             senderID: senderID,
+            clientMessageID: draft.clientMessageID,
             senderDisplayName: senderID == Self.currentUser.id ? Self.currentUser.profile.displayName : chat.title,
             mode: .offline,
+            deliveryState: draft.deliveryStateOverride ?? .offline,
+            deliveryRoute: chat.type == .selfChat ? nil : .bluetooth,
             kind: resolvedKind(for: draft),
             text: draft.normalizedText,
             attachments: draft.attachments,
-            replyToMessageID: nil,
+            replyToMessageID: draft.replyToMessageID,
+            replyPreview: draft.replyPreview,
+            communityContext: draft.communityContext,
+            deliveryOptions: draft.deliveryOptions,
             status: .sent,
-            createdAt: .now,
+            createdAt: draft.createdAt ?? .now,
             editedAt: nil,
             deletedForEveryoneAt: nil,
             reactions: [],
@@ -101,6 +172,30 @@ struct MockOfflineTransport: OfflineTransporting {
             Self.chats[chat.id] = updatedChat
         }
         return message
+    }
+
+    func toggleReaction(_ emoji: String, on messageID: UUID, in chatID: UUID, userID: UUID) async throws -> Message {
+        guard var messages = Self.messagesByChatID[chatID], let index = messages.firstIndex(where: { $0.id == messageID }) else {
+            throw OfflineTransportError.chatUnavailable
+        }
+
+        if let reactionIndex = messages[index].reactions.firstIndex(where: { $0.emoji == emoji }) {
+            if messages[index].reactions[reactionIndex].userIDs.contains(userID) {
+                messages[index].reactions[reactionIndex].userIDs.removeAll { $0 == userID }
+                if messages[index].reactions[reactionIndex].userIDs.isEmpty {
+                    messages[index].reactions.remove(at: reactionIndex)
+                }
+            } else {
+                messages[index].reactions[reactionIndex].userIDs.append(userID)
+            }
+        } else {
+            messages[index].reactions.append(
+                MessageReaction(id: UUID(), emoji: emoji, userIDs: [userID])
+            )
+        }
+
+        Self.messagesByChatID[chatID] = messages
+        return messages[index]
     }
 
     func editMessage(_ messageID: UUID, text: String, in chatID: UUID, editorID: UUID) async throws -> Message {
@@ -133,6 +228,8 @@ struct MockOfflineTransport: OfflineTransporting {
         refreshChatPreview(chatID: chatID)
         return messages[index]
     }
+
+    func synchronizeArchivedChats(with onlineRepository: ChatRepository, currentUserID: UUID) async { }
 
     private func resolvedKind(for draft: OutgoingMessageDraft) -> MessageKind {
         if draft.voiceMessage != nil {
@@ -193,6 +290,7 @@ struct MockOfflineTransport: OfflineTransporting {
             senderID: Self.currentUser.id,
             senderDisplayName: Self.currentUser.profile.displayName,
             mode: .offline,
+            deliveryState: .offline,
             kind: .text,
             text: nil,
             attachments: [],

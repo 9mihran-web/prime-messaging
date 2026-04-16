@@ -6,7 +6,23 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		76575B8C661971CDD25CE147 /* Prime Messaging Watch App/WatchHomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9A0381719DFCF881E73A011 /* Prime Messaging Watch App/WatchHomeView.swift */; };
+		9A1B2C3D4E5F678901234567 /* WebRTC in Frameworks */ = {isa = PBXBuildFile; productRef = 9A1B2C3D4E5F678901234568 /* WebRTC */; };
+		A8C18286CA07A02932847D9D /* Prime Messaging Watch App/Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 95CD3983A0D47A8BF618A83C /* Prime Messaging Watch App/Assets.xcassets */; };
+		C4A8A7D52F9B30020062BF0F /* Prime Messaging Watch App.app in Embed Watch Content */ = {isa = PBXBuildFile; fileRef = E4F128DAB2BF4D85101DFEB1 /* Prime Messaging Watch App.app */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		F3EEA511898E39DBF7D624D9 /* Prime Messaging Watch App/PrimeMessagingWatchApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43456D63C11235A546F65871 /* Prime Messaging Watch App/PrimeMessagingWatchApp.swift */; };
+		F7DEB3D56FE928C4D54805FD /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 82826B56B2BF447E248F9F50 /* Foundation.framework */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
+		800B75452F8813D80040319B /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 80C602B72F6723750062BF0F /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = B882FF79105F4D7F23675F3B;
+			remoteInfo = "Prime Messaging Watch App";
+		};
 		80C602CD2F6723760062BF0F /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = 80C602B72F6723750062BF0F /* Project object */;
@@ -23,10 +39,29 @@
 		};
 /* End PBXContainerItemProxy section */
 
+/* Begin PBXCopyFilesBuildPhase section */
+		C4A8A7D62F9B30020062BF0F /* Embed Watch Content */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "$(CONTENTS_FOLDER_PATH)/Watch";
+			dstSubfolderSpec = 16;
+			files = (
+				C4A8A7D52F9B30020062BF0F /* Prime Messaging Watch App.app in Embed Watch Content */,
+			);
+			name = "Embed Watch Content";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
+		43456D63C11235A546F65871 /* Prime Messaging Watch App/PrimeMessagingWatchApp.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = "Prime Messaging Watch App/PrimeMessagingWatchApp.swift"; sourceTree = SOURCE_ROOT; };
 		80C602BF2F6723750062BF0F /* Prime Messaging.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Prime Messaging.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		80C602CC2F6723760062BF0F /* Prime MessagingTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Prime MessagingTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		80C602D62F6723760062BF0F /* Prime MessagingUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Prime MessagingUITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
+		82826B56B2BF447E248F9F50 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/WatchOS.platform/Developer/SDKs/WatchOS11.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
+		95CD3983A0D47A8BF618A83C /* Prime Messaging Watch App/Assets.xcassets */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = folder.assetcatalog; path = "Prime Messaging Watch App/Assets.xcassets"; sourceTree = SOURCE_ROOT; };
+		B9A0381719DFCF881E73A011 /* Prime Messaging Watch App/WatchHomeView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = "Prime Messaging Watch App/WatchHomeView.swift"; sourceTree = SOURCE_ROOT; };
+		E4F128DAB2BF4D85101DFEB1 /* Prime Messaging Watch App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Prime Messaging Watch App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -52,6 +87,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				9A1B2C3D4E5F678901234567 /* WebRTC in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -69,9 +105,25 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		9B7E1416295633E6FE6848BC /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F7DEB3D56FE928C4D54805FD /* Foundation.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		58465095981845F9358A48C4 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				F80F947CCFE8ED33FF9346F2 /* watchOS */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
 		80C602B62F6723750062BF0F = {
 			isa = PBXGroup;
 			children = (
@@ -79,6 +131,8 @@
 				80C602CF2F6723760062BF0F /* Prime MessagingTests */,
 				80C602D92F6723760062BF0F /* Prime MessagingUITests */,
 				80C602C02F6723750062BF0F /* Products */,
+				C41B1FCAEB5E6F0DCBB10BF5 /* Prime Messaging Watch App */,
+				58465095981845F9358A48C4 /* Frameworks */,
 			);
 			sourceTree = "<group>";
 		};
@@ -88,8 +142,27 @@
 				80C602BF2F6723750062BF0F /* Prime Messaging.app */,
 				80C602CC2F6723760062BF0F /* Prime MessagingTests.xctest */,
 				80C602D62F6723760062BF0F /* Prime MessagingUITests.xctest */,
+				E4F128DAB2BF4D85101DFEB1 /* Prime Messaging Watch App.app */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		C41B1FCAEB5E6F0DCBB10BF5 /* Prime Messaging Watch App */ = {
+			isa = PBXGroup;
+			children = (
+				43456D63C11235A546F65871 /* Prime Messaging Watch App/PrimeMessagingWatchApp.swift */,
+				B9A0381719DFCF881E73A011 /* Prime Messaging Watch App/WatchHomeView.swift */,
+				95CD3983A0D47A8BF618A83C /* Prime Messaging Watch App/Assets.xcassets */,
+			);
+			path = "Prime Messaging Watch App";
+			sourceTree = "<group>";
+		};
+		F80F947CCFE8ED33FF9346F2 /* watchOS */ = {
+			isa = PBXGroup;
+			children = (
+				82826B56B2BF447E248F9F50 /* Foundation.framework */,
+			);
+			name = watchOS;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -102,16 +175,19 @@
 				80C602BB2F6723750062BF0F /* Sources */,
 				80C602BC2F6723750062BF0F /* Frameworks */,
 				80C602BD2F6723750062BF0F /* Resources */,
+				C4A8A7D62F9B30020062BF0F /* Embed Watch Content */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				800B75462F8813D80040319B /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				80C602C12F6723750062BF0F /* Prime Messaging */,
 			);
 			name = "Prime Messaging";
 			packageProductDependencies = (
+				9A1B2C3D4E5F678901234568 /* WebRTC */,
 			);
 			productName = "Prime Messaging";
 			productReference = 80C602BF2F6723750062BF0F /* Prime Messaging.app */;
@@ -134,8 +210,6 @@
 				80C602CF2F6723760062BF0F /* Prime MessagingTests */,
 			);
 			name = "Prime MessagingTests";
-			packageProductDependencies = (
-			);
 			productName = "Prime MessagingTests";
 			productReference = 80C602CC2F6723760062BF0F /* Prime MessagingTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
@@ -157,11 +231,26 @@
 				80C602D92F6723760062BF0F /* Prime MessagingUITests */,
 			);
 			name = "Prime MessagingUITests";
-			packageProductDependencies = (
-			);
 			productName = "Prime MessagingUITests";
 			productReference = 80C602D62F6723760062BF0F /* Prime MessagingUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+		B882FF79105F4D7F23675F3B /* Prime Messaging Watch App */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 396F0A8013423DD7B3ED3EF5 /* Build configuration list for PBXNativeTarget "Prime Messaging Watch App" */;
+			buildPhases = (
+				0B9E1E818FE833D447B01AB7 /* Sources */,
+				9B7E1416295633E6FE6848BC /* Frameworks */,
+				0F3C14D7530D4D5FBB9441D9 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = "Prime Messaging Watch App";
+			productName = "Prime Messaging Watch App";
+			productReference = E4F128DAB2BF4D85101DFEB1 /* Prime Messaging Watch App.app */;
+			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
 
@@ -175,6 +264,11 @@
 				TargetAttributes = {
 					80C602BE2F6723750062BF0F = {
 						CreatedOnToolsVersion = 26.3;
+						SystemCapabilities = {
+							com.apple.Push = {
+								enabled = 1;
+							};
+						};
 					};
 					80C602CB2F6723760062BF0F = {
 						CreatedOnToolsVersion = 26.3;
@@ -184,18 +278,33 @@
 						CreatedOnToolsVersion = 26.3;
 						TestTargetID = 80C602BE2F6723750062BF0F;
 					};
+					B882FF79105F4D7F23675F3B = {
+						CreatedOnToolsVersion = 26.4;
+					};
 				};
 			};
 			buildConfigurationList = 80C602BA2F6723750062BF0F /* Build configuration list for PBXProject "Prime Messaging" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
+				ar,
+				de,
 				en,
+				es,
+				fr,
 				Base,
 				hy,
+				it,
+				ko,
+				pt,
+				ru,
+				uk,
 			);
 			mainGroup = 80C602B62F6723750062BF0F;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				9A1B2C3D4E5F678901234569 /* XCRemoteSwiftPackageReference "WebRTC" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 80C602C02F6723750062BF0F /* Products */;
 			projectDirPath = "";
@@ -204,11 +313,20 @@
 				80C602BE2F6723750062BF0F /* Prime Messaging */,
 				80C602CB2F6723760062BF0F /* Prime MessagingTests */,
 				80C602D52F6723760062BF0F /* Prime MessagingUITests */,
+				B882FF79105F4D7F23675F3B /* Prime Messaging Watch App */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		0F3C14D7530D4D5FBB9441D9 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A8C18286CA07A02932847D9D /* Prime Messaging Watch App/Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		80C602BD2F6723750062BF0F /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -233,6 +351,15 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		0B9E1E818FE833D447B01AB7 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F3EEA511898E39DBF7D624D9 /* Prime Messaging Watch App/PrimeMessagingWatchApp.swift in Sources */,
+				76575B8C661971CDD25CE147 /* Prime Messaging Watch App/WatchHomeView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		80C602BB2F6723750062BF0F /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -257,6 +384,11 @@
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
+		800B75462F8813D80040319B /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = B882FF79105F4D7F23675F3B /* Prime Messaging Watch App */;
+			targetProxy = 800B75452F8813D80040319B /* PBXContainerItemProxy */;
+		};
 		80C602CE2F6723760062BF0F /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			target = 80C602BE2F6723750062BF0F /* Prime Messaging */;
@@ -270,6 +402,40 @@
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
+		0B29BCB5E671FD47F2059B13 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 2;
+				DEVELOPMENT_TEAM = 8HCKMUYNCN;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Prime Messaging";
+				INFOPLIST_KEY_PrimeMessagingServerURL = "$(PRIME_MESSAGING_SERVER_URL)";
+				INFOPLIST_KEY_WKCompanionAppBundleIdentifier = "prime1.prime-Messaging";
+				INFOPLIST_KEY_WKSupportsRunningWithoutiOSApp = YES;
+				MARKETING_VERSION = 1.0;
+				PRIME_MESSAGING_SERVER_URL = "https://prime-messaging-production.up.railway.app";
+				PRODUCT_BUNDLE_IDENTIFIER = "prime1.prime-Messaging.watchkitapp";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "watchos watchsimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				VALIDATE_PRODUCT = YES;
+				WATCHOS_DEPLOYMENT_TARGET = 11.0;
+			};
+			name = Release;
+		};
 		80C602DE2F6723760062BF0F /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -393,13 +559,22 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				"ASSETCATALOG_COMPILER_APPICON_NAME[sdk=appletvos*]" = "Brand Assets";
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
+				CODE_SIGN_ENTITLEMENTS = "Prime Messaging/PrimeMessagingDebug.entitlements";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 4;
 				DEVELOPMENT_TEAM = 8HCKMUYNCN;
 				ENABLE_PREVIEWS = YES;
+				"EXCLUDED_SOURCE_FILE_NAMES[sdk=iphoneos*]" = LaunchScreen.storyboard;
+				"EXCLUDED_SOURCE_FILE_NAMES[sdk=iphonesimulator*]" = LaunchScreen.storyboard;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "PrimeMessaging-Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = "Prime Messaging";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.social-networking";
+				"INFOPLIST_KEY_UILaunchStoryboardName[sdk=appletvos*]" = LaunchScreen;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -409,6 +584,9 @@
 				PRODUCT_BUNDLE_IDENTIFIER = "prime1.prime-Messaging";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -422,13 +600,22 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				"ASSETCATALOG_COMPILER_APPICON_NAME[sdk=appletvos*]" = "Brand Assets";
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
+				CODE_SIGN_ENTITLEMENTS = "Prime Messaging/PrimeMessaging.entitlements";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 4;
 				DEVELOPMENT_TEAM = 8HCKMUYNCN;
 				ENABLE_PREVIEWS = YES;
+				"EXCLUDED_SOURCE_FILE_NAMES[sdk=iphoneos*]" = LaunchScreen.storyboard;
+				"EXCLUDED_SOURCE_FILE_NAMES[sdk=iphonesimulator*]" = LaunchScreen.storyboard;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "PrimeMessaging-Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = "Prime Messaging";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.social-networking";
+				"INFOPLIST_KEY_UILaunchStoryboardName[sdk=appletvos*]" = LaunchScreen;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -438,6 +625,9 @@
 				PRODUCT_BUNDLE_IDENTIFIER = "prime1.prime-Messaging";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -527,9 +717,51 @@
 			};
 			name = Release;
 		};
+		CE85834F511E39F93E9B96C4 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 2;
+				DEVELOPMENT_TEAM = 8HCKMUYNCN;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Prime Messaging";
+				INFOPLIST_KEY_PrimeMessagingServerURL = "$(PRIME_MESSAGING_SERVER_URL)";
+				INFOPLIST_KEY_WKCompanionAppBundleIdentifier = "prime1.prime-Messaging";
+				INFOPLIST_KEY_WKSupportsRunningWithoutiOSApp = YES;
+				MARKETING_VERSION = 1.0;
+				PRIME_MESSAGING_SERVER_URL = "https://prime-messaging-production.up.railway.app";
+				PRODUCT_BUNDLE_IDENTIFIER = "prime1.prime-Messaging.watchkitapp";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "watchos watchsimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 11.0;
+			};
+			name = Debug;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		396F0A8013423DD7B3ED3EF5 /* Build configuration list for PBXNativeTarget "Prime Messaging Watch App" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0B29BCB5E671FD47F2059B13 /* Release */,
+				CE85834F511E39F93E9B96C4 /* Debug */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		80C602BA2F6723750062BF0F /* Build configuration list for PBXProject "Prime Messaging" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -567,6 +799,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		9A1B2C3D4E5F678901234569 /* XCRemoteSwiftPackageReference "WebRTC" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/stasel/WebRTC.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 147.0.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		9A1B2C3D4E5F678901234568 /* WebRTC */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 9A1B2C3D4E5F678901234569 /* XCRemoteSwiftPackageReference "WebRTC" */;
+			productName = WebRTC;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 80C602B72F6723750062BF0F /* Project object */;
 }

@@ -8,6 +8,8 @@ struct NearbyAccessView: View {
     @StateObject private var permissionRequester = NearbyPermissionRequester()
     @State private var statusText = ""
     @State private var isRequestingAccess = false
+    @State private var showsHomeNearbyPeers = true
+    @State private var nearbyPeersOfflineOnly = true
 
     var body: some View {
         List {
@@ -33,8 +35,40 @@ struct NearbyAccessView: View {
                     openURL(url)
                 }
             }
+
+            Section("settings.nearby.visibility".localized) {
+                Toggle("settings.nearby.visibility.show_home".localized, isOn: Binding(
+                    get: { showsHomeNearbyPeers },
+                    set: { newValue in
+                        showsHomeNearbyPeers = newValue
+                        Task {
+                            await NearbyPeersVisibilityStore.shared.setShowHomeCard(newValue, ownerUserID: appState.currentUser.id)
+                        }
+                    }
+                ))
+
+                Toggle("settings.nearby.visibility.offline_only".localized, isOn: Binding(
+                    get: { nearbyPeersOfflineOnly },
+                    set: { newValue in
+                        nearbyPeersOfflineOnly = newValue
+                        Task {
+                            await NearbyPeersVisibilityStore.shared.setOfflineOnly(newValue, ownerUserID: appState.currentUser.id)
+                        }
+                    }
+                ))
+                .disabled(showsHomeNearbyPeers == false)
+
+                Text("settings.nearby.visibility.footer".localized)
+                    .font(.footnote)
+                    .foregroundStyle(PrimeTheme.Colors.textSecondary)
+            }
         }
         .navigationTitle("settings.nearby.access".localized)
+        .task(id: appState.currentUser.id) {
+            let preferences = await NearbyPeersVisibilityStore.shared.preferences(ownerUserID: appState.currentUser.id)
+            showsHomeNearbyPeers = preferences.showHomeCard
+            nearbyPeersOfflineOnly = preferences.offlineOnly
+        }
     }
 
     @MainActor

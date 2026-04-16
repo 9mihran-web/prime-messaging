@@ -1,27 +1,42 @@
 import Foundation
 
 extension String {
-    var localized: String {
+    nonisolated var localized: String {
         LocalizationManager.shared.localizedString(for: self)
     }
 }
 
 enum LocalizationManager {
-    static let shared = LocalizationManagerImpl()
+    nonisolated static let shared = LocalizationManagerImpl()
 }
 
 final class LocalizationManagerImpl {
     private let languageKey = "selected_app_language"
 
-    func localizedString(for key: String) -> String {
-        guard
-            let language = AppLanguage(rawValue: UserDefaults.standard.string(forKey: languageKey) ?? AppLanguage.english.rawValue),
-            let path = Bundle.main.path(forResource: language.rawValue, ofType: "lproj"),
+    nonisolated func localizedString(for key: String) -> String {
+        let selectedLanguage = AppLanguage(rawValue: UserDefaults.standard.string(forKey: languageKey) ?? AppLanguage.english.rawValue)
+
+        if
+            let selectedLanguage,
+            let path = Bundle.main.path(forResource: selectedLanguage.rawValue, ofType: "lproj"),
             let bundle = Bundle(path: path)
-        else {
-            return NSLocalizedString(key, comment: "")
+        {
+            let localized = NSLocalizedString(key, tableName: nil, bundle: bundle, value: key, comment: "")
+            if localized != key {
+                return localized
+            }
         }
 
-        return NSLocalizedString(key, tableName: nil, bundle: bundle, value: key, comment: "")
+        if
+            let englishPath = Bundle.main.path(forResource: AppLanguage.english.rawValue, ofType: "lproj"),
+            let englishBundle = Bundle(path: englishPath)
+        {
+            let englishLocalized = NSLocalizedString(key, tableName: nil, bundle: englishBundle, value: key, comment: "")
+            if englishLocalized != key {
+                return englishLocalized
+            }
+        }
+
+        return NSLocalizedString(key, comment: "")
     }
 }

@@ -12,7 +12,7 @@ struct AppEnvironment {
     let offlineTransport: OfflineTransporting
 
     static func mock() -> AppEnvironment {
-        let store = InMemoryLocalStore()
+        let store = DiskLocalStore(directoryName: "PrimeMessagingMockLocalStore")
         let settingsRepository = MockSettingsRepository(localStore: store)
         let offlineTransport = MockOfflineTransport()
         return AppEnvironment(
@@ -32,7 +32,7 @@ struct AppEnvironment {
 
     @MainActor
     static func live() -> AppEnvironment {
-        let store = InMemoryLocalStore()
+        let store = DiskLocalStore()
         let mockAuth = MockAuthRepository()
         let onlineChat = BackendChatRepository(fallback: MockChatRepository(localStore: store))
         let mockSettings = MockSettingsRepository(localStore: store)
@@ -50,7 +50,7 @@ struct AppEnvironment {
                 fallback: mockSettings
             ),
             localStore: store,
-            pushNotificationService: LocalPushNotificationService(),
+            pushNotificationService: LocalPushNotificationService.shared,
             offlineTransport: offlineTransport
         )
     }

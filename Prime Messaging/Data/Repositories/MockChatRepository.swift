@@ -3,6 +3,30 @@ import Foundation
 struct MockChatRepository: ChatRepository {
     let localStore: LocalStore
 
+    func cachedChats(mode: ChatMode, for userID: UUID) async -> [Chat] {
+        let cached = await localStore.loadChats(for: mode)
+        if cached.isEmpty == false {
+            return cached.map(clearingMockDraft)
+        }
+        return Chat.mock(mode: mode, currentUserID: userID).map(clearingMockDraft)
+    }
+
+    func cachedMessages(chatID: UUID, mode: ChatMode) async -> [Message] {
+        if mode == .online {
+            return []
+        }
+        return Message.mock(chatID: chatID, mode: mode, currentUserID: User.mockCurrentUser.id)
+    }
+
+    func purgeLocalChatArtifacts(chatIDs: [UUID], currentUserID: UUID) async {
+        _ = currentUserID
+        guard chatIDs.isEmpty == false else { return }
+        let chatIDSet = Set(chatIDs)
+        var chats = await localStore.loadChats(for: .online)
+        chats.removeAll { chatIDSet.contains($0.id) }
+        await localStore.saveChats(chats, for: .online)
+    }
+
     func fetchChats(mode: ChatMode, for userID: UUID) async throws -> [Chat] {
         let cached = await localStore.loadChats(for: mode)
         if !cached.isEmpty {
@@ -31,6 +55,10 @@ struct MockChatRepository: ChatRepository {
         try await sendMessage(OutgoingMessageDraft(text: text), in: chatID, mode: mode, senderID: senderID)
     }
 
+    func sendMessage(_ draft: OutgoingMessageDraft, in chat: Chat, senderID: UUID) async throws -> Message {
+        try await sendMessage(draft, in: chat.id, mode: chat.mode, senderID: senderID)
+    }
+
     func sendMessage(_ draft: OutgoingMessageDraft, in chatID: UUID, mode: ChatMode, senderID: UUID) async throws -> Message {
         Message(
             id: UUID(),
@@ -41,13 +69,43 @@ struct MockChatRepository: ChatRepository {
             kind: resolvedKind(for: draft),
             text: draft.normalizedText,
             attachments: draft.attachments,
-            replyToMessageID: nil,
+            replyToMessageID: draft.replyToMessageID,
+            replyPreview: draft.replyPreview,
+            communityContext: draft.communityContext,
+            deliveryOptions: draft.deliveryOptions,
             status: .sent,
             createdAt: .now,
             editedAt: nil,
             deletedForEveryoneAt: nil,
             reactions: [],
             voiceMessage: draft.voiceMessage,
+            liveLocation: nil
+        )
+    }
+
+    func toggleReaction(_ emoji: String, on messageID: UUID, in chatID: UUID, mode: ChatMode, userID: UUID) async throws -> Message {
+        Message(
+            id: messageID,
+            chatID: chatID,
+            senderID: userID,
+            senderDisplayName: userID == User.mockCurrentUser.id ? "Prime User" : "Prime Contact",
+            mode: mode,
+            kind: .text,
+            text: "Mock reaction update",
+            attachments: [],
+            replyToMessageID: nil,
+            status: .sent,
+            createdAt: .now,
+            editedAt: nil,
+            deletedForEveryoneAt: nil,
+            reactions: [
+                MessageReaction(
+                    id: UUID(),
+                    emoji: emoji,
+                    userIDs: [userID]
+                )
+            ],
+            voiceMessage: nil,
             liveLocation: nil
         )
     }
@@ -109,25 +167,72 @@ struct MockChatRepository: ChatRepository {
             isPinned: false,
             draft: nil,
             disappearingPolicy: nil,
-            notificationPreferences: NotificationPreferences(muteState: .active, previewEnabled: true, customSoundName: nil, badgeEnabled: true)
+            notificationPreferences: NotificationPreferences(muteState: .active, previewEnabled: true, customSoundName: nil, badgeEnabled: true),
+            guestRequest: nil
         )
     }
 
-    func createGroupChat(title: String, memberIDs: [UUID], ownerID: UUID, mode: ChatMode) async throws -> Chat {
+    func submitGuestRequest(introText: String, in chatID: UUID, senderID: UUID) async throws -> Chat {
+        try await updateOnlineChat(chatID: chatID) { chat in
+            let recipientID = chat.participantIDs.first(where: { $0 != senderID }) ?? senderID
+            let existingCreatedAt = chat.guestRequest?.createdAt ?? .now
+            chat.guestRequest = GuestRequest(
+                requesterUserID: senderID,
+                recipientUserID: recipientID,
+                status: .pending,
+                introText: introText.trimmingCharacters(in: .whitespacesAndNewlines),
+                createdAt: existingCreatedAt,
+                respondedAt: nil
+            )
+            chat.lastMessagePreview = "Guest request sent"
+            chat.lastActivityAt = .now
+        }
+    }
+
+    func respondToGuestRequest(in chatID: UUID, approve: Bool, responderID: UUID) async throws -> Chat {
+        try await updateOnlineChat(chatID: chatID) { chat in
+            guard var guestRequest = chat.guestRequest else {
+                throw ChatRepositoryError.invalidDirectChat
+            }
+            guard guestRequest.recipientUserID == responderID else {
+                throw ChatRepositoryError.groupPermissionDenied
+            }
+            guestRequest.status = approve ? .approved : .declined
+            guestRequest.respondedAt = .now
+            chat.guestRequest = approve ? nil : guestRequest
+            chat.lastMessagePreview = approve ? nil : "Guest request declined"
+            chat.lastActivityAt = .now
+        }
+    }
+
+    func createGroupChat(
+        title: String,
+        memberIDs: [UUID],
+        ownerID: UUID,
+        mode: ChatMode,
+        communityDetails: CommunityChatDetails?
+    ) async throws -> Chat {
         let groupID = UUID()
+        let participantIDs = Array(Set([ownerID] + memberIDs))
+        let memberCountText: String
+        if communityDetails?.kind == .channel {
+            memberCountText = "\(participantIDs.count) subscribers"
+        } else {
+            memberCountText = "\(participantIDs.count) members"
+        }
         return Chat(
             id: groupID,
             mode: mode,
             type: .group,
             title: title,
-            subtitle: "\(memberIDs.count + 1) members",
-            participantIDs: [ownerID] + memberIDs,
+            subtitle: memberCountText,
+            participantIDs: participantIDs,
             group: Group(
                 id: groupID,
                 title: title,
                 photoURL: nil,
                 ownerID: ownerID,
-                members: ([ownerID] + memberIDs).map { memberID in
+                members: participantIDs.map { memberID in
                     GroupMember(
                         id: UUID(),
                         userID: memberID,
@@ -144,7 +249,10 @@ struct MockChatRepository: ChatRepository {
             isPinned: false,
             draft: nil,
             disappearingPolicy: nil,
-            notificationPreferences: NotificationPreferences(muteState: .active, previewEnabled: true, customSoundName: nil, badgeEnabled: true)
+            notificationPreferences: NotificationPreferences(muteState: .active, previewEnabled: true, customSoundName: nil, badgeEnabled: true),
+            guestRequest: nil,
+            eventDetails: nil,
+            communityDetails: communityDetails
         )
     }
 
@@ -154,6 +262,28 @@ struct MockChatRepository: ChatRepository {
         updatedChat.title = normalizedTitle.isEmpty ? chat.title : normalizedTitle
         updatedChat.group?.title = updatedChat.title
         updatedChat.subtitle = "\(updatedChat.group?.members.count ?? updatedChat.participantIDs.count) members"
+        return updatedChat
+    }
+
+    func deleteGroup(_ chat: Chat, requesterID: UUID) async throws {
+        guard let group = chat.group else {
+            throw ChatRepositoryError.invalidGroupOperation
+        }
+        guard group.ownerID == requesterID else {
+            throw ChatRepositoryError.groupPermissionDenied
+        }
+
+        var chats = await localStore.loadChats(for: .online)
+        guard chats.contains(where: { $0.id == chat.id }) else {
+            throw ChatRepositoryError.chatNotFound
+        }
+        chats.removeAll { $0.id == chat.id }
+        await localStore.saveChats(chats, for: .online)
+    }
+
+    func updateCommunityDetails(_ details: CommunityChatDetails, for chat: Chat, requesterID: UUID) async throws -> Chat {
+        var updatedChat = chat
+        updatedChat.communityDetails = details
         return updatedChat
     }
 
@@ -228,6 +358,155 @@ struct MockChatRepository: ChatRepository {
         return updatedChat
     }
 
+    func transferGroupOwnership(to memberID: UUID, in chat: Chat, requesterID: UUID) async throws -> Chat {
+        var updatedChat = chat
+        guard var group = updatedChat.group else { return updatedChat }
+        guard group.ownerID == requesterID else {
+            throw ChatRepositoryError.groupPermissionDenied
+        }
+        guard let newOwnerIndex = group.members.firstIndex(where: { $0.userID == memberID }) else {
+            throw ChatRepositoryError.userNotFound
+        }
+        guard memberID != requesterID else {
+            throw ChatRepositoryError.invalidGroupOperation
+        }
+
+        if let previousOwnerIndex = group.members.firstIndex(where: { $0.userID == requesterID }) {
+            group.members[previousOwnerIndex].role = .admin
+        }
+        group.ownerID = memberID
+        group.members[newOwnerIndex].role = .owner
+        updatedChat.group = group
+        return updatedChat
+    }
+
+    func leaveGroup(_ chat: Chat, requesterID: UUID) async throws {
+        guard var group = chat.group else { return }
+        guard group.ownerID != requesterID else {
+            throw ChatRepositoryError.invalidGroupOperation
+        }
+
+        group.members.removeAll { $0.userID == requesterID }
+
+        var chats = await localStore.loadChats(for: .online)
+        chats.removeAll { $0.id == chat.id }
+        await localStore.saveChats(chats, for: .online)
+    }
+
+    func searchDiscoverableChats(query: String, mode: ChatMode, currentUserID: UUID) async throws -> [Chat] {
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedQuery.isEmpty == false else { return [] }
+
+        let chats = await localStore.loadChats(for: .online)
+        return chats.filter { chat in
+            guard chat.communityDetails?.isPublic == true else { return false }
+            guard chat.participantIDs.contains(currentUserID) == false else { return true }
+            return chat.displayTitle(for: currentUserID).localizedCaseInsensitiveContains(trimmedQuery)
+                || chat.subtitle.localizedCaseInsensitiveContains(trimmedQuery)
+        }
+    }
+
+    func joinDiscoverableChat(_ chat: Chat, requesterID: UUID) async throws -> Chat {
+        var updatedChat = chat
+        if updatedChat.participantIDs.contains(requesterID) == false {
+            updatedChat.participantIDs.append(requesterID)
+            if var group = updatedChat.group {
+                group.members.append(
+                    GroupMember(
+                        id: UUID(),
+                        userID: requesterID,
+                        displayName: "Prime User",
+                        username: "primeuser",
+                        role: .member,
+                        joinedAt: .now
+                    )
+                )
+                updatedChat.group = group
+                if updatedChat.communityDetails?.kind == .channel {
+                    updatedChat.subtitle = "\(group.members.count) subscribers"
+                } else {
+                    updatedChat.subtitle = "\(group.members.count) members"
+                }
+            }
+        }
+        return updatedChat
+    }
+
+    func joinChat(inviteCode: String, mode: ChatMode, requesterID: UUID) async throws -> Chat {
+        let chats = await localStore.loadChats(for: .online)
+        guard let chat = chats.first(where: { $0.communityDetails?.inviteCode?.caseInsensitiveCompare(inviteCode) == .orderedSame }) else {
+            throw ChatRepositoryError.chatNotFound
+        }
+        return try await joinDiscoverableChat(chat, requesterID: requesterID)
+    }
+
+    func submitJoinRequest(for chat: Chat, requesterID: UUID, answers: [String]) async throws {
+        _ = chat
+        _ = requesterID
+        _ = answers
+    }
+
+    func fetchModerationDashboard(for chat: Chat, requesterID: UUID) async throws -> ModerationDashboard {
+        _ = chat
+        _ = requesterID
+        return ModerationDashboard()
+    }
+
+    func resolveJoinRequest(
+        for requesterUserID: UUID,
+        approve: Bool,
+        in chat: Chat,
+        requesterID: UUID
+    ) async throws -> ModerationDashboard {
+        _ = requesterUserID
+        _ = approve
+        _ = chat
+        _ = requesterID
+        return ModerationDashboard()
+    }
+
+    func reportChatContent(
+        in chat: Chat,
+        requesterID: UUID,
+        targetMessageID: UUID?,
+        targetUserID: UUID?,
+        reason: ModerationReportReason,
+        details: String?
+    ) async throws {
+        _ = chat
+        _ = requesterID
+        _ = targetMessageID
+        _ = targetUserID
+        _ = reason
+        _ = details
+    }
+
+    func banMember(
+        _ memberID: UUID,
+        duration: TimeInterval,
+        reason: String?,
+        in chat: Chat,
+        requesterID: UUID
+    ) async throws -> ModerationDashboard {
+        _ = memberID
+        _ = duration
+        _ = reason
+        _ = chat
+        _ = requesterID
+        return ModerationDashboard()
+    }
+
+    func removeBan(
+        for memberID: UUID,
+        in chat: Chat,
+        requesterID: UUID
+    ) async throws -> ModerationDashboard {
+        _ = memberID
+        _ = chat
+        _ = requesterID
+        return ModerationDashboard()
+    }
+
     func createNearbyChat(with peer: OfflinePeer, currentUser: User) async throws -> Chat {
         Chat(
             id: UUID(),
@@ -243,7 +522,8 @@ struct MockChatRepository: ChatRepository {
             isPinned: false,
             draft: nil,
             disappearingPolicy: nil,
-            notificationPreferences: NotificationPreferences(muteState: .active, previewEnabled: true, customSoundName: nil, badgeEnabled: true)
+            notificationPreferences: NotificationPreferences(muteState: .active, previewEnabled: true, customSoundName: nil, badgeEnabled: true),
+            guestRequest: nil
         )
     }
 
@@ -255,6 +535,16 @@ struct MockChatRepository: ChatRepository {
         var chat = chat
         chat.draft = nil
         return chat
+    }
+
+    private func updateOnlineChat(chatID: UUID, mutate: (inout Chat) throws -> Void) async throws -> Chat {
+        var chats = await localStore.loadChats(for: .online)
+        guard let index = chats.firstIndex(where: { $0.id == chatID }) else {
+            throw ChatRepositoryError.chatNotFound
+        }
+        try mutate(&chats[index])
+        await localStore.saveChats(chats, for: .online)
+        return chats[index]
     }
 
     private func resolvedKind(for draft: OutgoingMessageDraft) -> MessageKind {

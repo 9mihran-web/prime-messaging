@@ -105,6 +105,14 @@ extension InternetCall {
         callerID == currentUserID ? .outgoing : .incoming
     }
 
+    func effectiveState(for currentUserID: UUID) -> InternetCallState {
+        if state == .cancelled, direction(for: currentUserID) == .incoming, answeredAt == nil {
+            return .missed
+        }
+
+        return state
+    }
+
     func otherParticipant(for currentUserID: UUID) -> InternetCallParticipant? {
         participants.first(where: { $0.id != currentUserID })
     }
@@ -120,5 +128,9 @@ extension InternetCall {
         }
 
         return participant.username
+    }
+
+    var activityDate: Date {
+        endedAt ?? answeredAt ?? createdAt
     }
 }

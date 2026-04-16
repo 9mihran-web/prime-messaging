@@ -33,16 +33,42 @@ struct BackendCallRepository: CallRepository {
         }
     }
 
+    func fetchCallHistory(for userID: UUID) async throws -> [InternetCall] {
+        guard let baseURL = BackendConfiguration.currentBaseURL else {
+            return try await fallback.fetchCallHistory(for: userID)
+        }
+
+        let queryItems = [URLQueryItem(name: "user_id", value: userID.uuidString)]
+
+        do {
+            let (data, response) = try await BackendRequestTransport.authorizedRequest(
+                baseURL: baseURL,
+                path: "/calls/history",
+                method: "GET",
+                queryItems: queryItems,
+                userID: userID
+            )
+            try validate(response: response, data: data)
+            return try decoder.decode([InternetCall].self, from: data)
+        } catch {
+            let (data, response) = try await legacyRequest(
+                baseURL: baseURL,
+                path: "/calls/history",
+                method: "GET",
+                queryItems: queryItems
+            )
+            try validate(response: response, data: data)
+            return try decoder.decode([InternetCall].self, from: data)
+        }
+    }
+
     func fetchCall(_ callID: UUID, for userID: UUID) async throws -> InternetCall {
         try await request(
             path: "/calls/\(callID.uuidString)",
             method: "GET",
             body: OptionalRequestBody.none,
             userID: userID,
-            queryItems: [URLQueryItem(name: "user_id", value: userID.uuidString)],
-            fallback: {
-                try await fallback.fetchCall(callID, for: userID)
-            }
+            queryItems: [URLQueryItem(name: "user_id", value: userID.uuidString)]
         )
     }
 
@@ -57,10 +83,7 @@ struct BackendCallRepository: CallRepository {
             path: "/calls",
             method: "POST",
             body: body,
-            userID: callerID,
-            fallback: {
-                try await fallback.startAudioCall(with: calleeID, from: callerID)
-            }
+            userID: callerID
         )
     }
 
@@ -70,8 +93,7 @@ struct BackendCallRepository: CallRepository {
             path: "/calls/\(callID.uuidString)/accept",
             method: "POST",
             body: body,
-            userID: userID,
-            fallback: nil
+            userID: userID
         )
     }
 
@@ -81,8 +103,7 @@ struct BackendCallRepository: CallRepository {
             path: "/calls/\(callID.uuidString)/reject",
             method: "POST",
             body: body,
-            userID: userID,
-            fallback: nil
+            userID: userID
         )
     }
 
@@ -92,8 +113,7 @@ struct BackendCallRepository: CallRepository {
             path: "/calls/\(callID.uuidString)/hangup",
             method: "POST",
             body: body,
-            userID: userID,
-            fallback: nil
+            userID: userID
         )
     }
 
@@ -177,8 +197,7 @@ struct BackendCallRepository: CallRepository {
             path: "/calls/\(callID.uuidString)/\(typePath)",
             method: "POST",
             body: body,
-            userID: userID,
-            fallback: nil
+            userID: userID
         )
     }
 
@@ -187,13 +206,9 @@ struct BackendCallRepository: CallRepository {
         method: String,
         body: Body,
         userID: UUID?,
-        queryItems: [URLQueryItem] = [],
-        fallback: (() async throws -> Response)?
+        queryItems: [URLQueryItem] = []
     ) async throws -> Response {
         guard let baseURL = BackendConfiguration.currentBaseURL else {
-            if let fallback {
-                return try await fallback()
-            }
             throw CallRepositoryError.backendUnavailable
         }
 
@@ -237,6 +252,8 @@ struct BackendCallRepository: CallRepository {
         let serverError = (try? JSONDecoder().decode(ServerErrorResponse.self, from: data))?.error
 
         switch (statusCode, serverError) {
+        case (403, "call_requires_saved_contact"):
+            return CallRepositoryError.callRequiresSavedContact
         case (404, "call_not_found"):
             return CallRepositoryError.callNotFound
         case (404, "user_not_found"):

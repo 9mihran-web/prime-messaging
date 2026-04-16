@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>mirowin.PrimeMessaging.notifications.refresh</string>
+	</array>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleExecutable</key>
@@ -16,6 +20,19 @@
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>mirowin.PrimeMessaging.invites</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>primemessaging</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
@@ -33,14 +50,24 @@
 	<array>
 		<string>_prmsgchat._tcp</string>
 	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>Prime Messaging uses the camera to capture photos and videos for messages.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>Prime Messaging uses your contacts to help you sync and discover people you already know.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Prime Messaging uses Face ID to unlock your protected chats.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Prime Messaging uses the local network to discover nearby devices.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Prime Messaging uses your location to share your current location in chats.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Prime Messaging uses the microphone for audio messages and internet calls.</string>
-	<key>NSFaceIDUsageDescription</key>
-	<string>Prime Messaging uses Face ID to unlock the app quickly and securely.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Prime Messaging saves downloaded photos and videos from chats to your photo library.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Prime Messaging uses your photo library to send photos and choose an avatar.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Prime Messaging uses speech recognition to transcribe voice messages on your device.</string>
 	<key>PrimeMessagingServerURL</key>
 	<string>$(PRIME_MESSAGING_SERVER_URL)</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
@@ -50,9 +77,17 @@
 		<string>bluetooth-central</string>
 		<string>bluetooth-peripheral</string>
 		<string>remote-notification</string>
+		<string>nearby-interaction</string>
+		<string>processing</string>
+		<string>fetch</string>
+		<string>audio</string>
+		<string>voip</string>
+		<string>location</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
+	<key>UIStatusBarStyle</key>
+	<string></string>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
