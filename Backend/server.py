@@ -498,6 +498,8 @@ class RealtimeHub:
         self.presence_broadcast_at_by_user = {}
         self.typing_refresh_interval_seconds = 2.0
         self.typing_state_ttl_seconds = 7.0
+        self.typing_push_cooldown_seconds = 60.0
+        self.typing_push_cooldown_until_by_chat = {}
 
     def register_client(self, user_id, socket_connection):
         client = RealtimeClientState(str(uuid.uuid4()), user_id, socket_connection)
@@ -637,6 +639,32 @@ class RealtimeHub:
                 return True
             if (now - last_broadcast_at).total_seconds() >= float(min_interval_seconds):
                 self.presence_broadcast_at_by_user[normalized_user_id] = now
+                return True
+            return False
+
+    def mark_typing_push_cooldown(self, chat_id, duration_seconds=None):
+        normalized_chat_id = normalized_entity_id(chat_id)
+        if not normalized_chat_id:
+            return
+        cooldown_seconds = float(
+            self.typing_push_cooldown_seconds if duration_seconds is None else duration_seconds
+        )
+        with self.lock:
+            self.typing_push_cooldown_until_by_chat[normalized_chat_id] = (
+                datetime.now(timezone.utc) + timedelta(seconds=max(0.0, cooldown_seconds))
+            )
+
+    def can_emit_typing_push(self, chat_id):
+        normalized_chat_id = normalized_entity_id(chat_id)
+        if not normalized_chat_id:
+            return False
+        with self.lock:
+            cooldown_until = self.typing_push_cooldown_until_by_chat.get(normalized_chat_id)
+            if not cooldown_until:
+                return True
+            now = datetime.now(timezone.utc)
+            if now >= cooldown_until:
+                self.typing_push_cooldown_until_by_chat.pop(normalized_chat_id, None)
                 return True
             return False
 
@@ -7234,6 +7262,15 @@ def log_typing_push_dispatch_attempt(database, chat, actor_user_id):
     if not payload:
         return
 
+    realtime_hub = globals().get("REALTIME_HUB")
+    if realtime_hub and realtime_hub.can_emit_typing_push(chat.get("id")) is False:
+        log_event(
+            "push.typing.skipped_cooldown",
+            chat_id=chat.get("id"),
+            typing_actor_user_id=actor_user_id,
+        )
+        return
+
     device_tokens = device_tokens_for_recipients(database, chat, actor_user_id)
     if not device_tokens:
         return
@@ -12551,6 +12588,9 @@ class Handler(BaseHTTPRequestHandler):
                     if message_status_rank(initial_status) > message_status_rank(existing_message.get("status")):
                         existing_message["status"] = initial_status
                     save_db(database)
+                    realtime_hub = globals().get("REALTIME_HUB")
+                    if realtime_hub and chat.get("type") == "direct" and chat.get("mode") == "online":
+                        realtime_hub.mark_typing_push_cooldown(chat.get("id"))
                     realtime_publish_message_event(
                         database,
                         chat,
@@ -12601,6 +12641,9 @@ class Handler(BaseHTTPRequestHandler):
                 backfill_group_member_snapshots(chat, database)
                 database["messages"].append(message)
                 save_db(database)
+                realtime_hub = globals().get("REALTIME_HUB")
+                if realtime_hub and chat.get("type") == "direct" and chat.get("mode") == "online":
+                    realtime_hub.mark_typing_push_cooldown(chat.get("id"))
                 try:
                     realtime_publish_message_event(
                         database,
