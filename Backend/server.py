@@ -7305,12 +7305,13 @@ def log_reaction_push_dispatch_attempt(database, chat, message, reactor_user_id,
     if not device_tokens:
         return
 
+    emoji_fingerprint = hashlib.sha1(emoji.encode("utf-8")).hexdigest()[:12]
     context = {
         "chat_id": chat["id"],
         "message_id": message["id"],
         "reaction_actor_user_id": reactor_user_id,
         "target_user_id": target_sender_id,
-        "collapse_id": f"reaction-{normalized_entity_id(message.get('id')) or 'unknown'}-{emoji}",
+        "collapse_id": f"reaction-{normalized_entity_id(message.get('id')) or 'unknown'}-{emoji_fingerprint}",
     }
     log_event(
         "push.reaction.queued",
