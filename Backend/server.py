@@ -6609,6 +6609,7 @@ def push_payload_for_message(chat, message, database):
         "message_id": message["id"],
         "mode": chat["mode"],
         "chat_type": chat["type"],
+        "notification_type": "message",
         "title": title,
         "body": message_preview(message) or "New message",
         "sender_id": normalized_optional_string(message.get("senderID")),
@@ -6617,6 +6618,87 @@ def push_payload_for_message(chat, message, database):
         "group_title": group_title,
         "group_photo_url": group_photo_url,
         "community_kind": community_kind,
+    }
+
+
+def push_payload_for_typing(chat, actor_user_id, database):
+    if not chat or chat.get("mode") != "online" or chat.get("type") != "direct":
+        return None
+
+    actor_user_id = normalized_entity_id(actor_user_id)
+    if not actor_user_id:
+        return None
+
+    actor_user = find_user(database, actor_user_id)
+    if not actor_user:
+        return None
+
+    sender_profile = (actor_user.get("profile") or {})
+    sender_name = resolved_user_display_name(actor_user) or "Someone"
+    return {
+        "chat_id": chat["id"],
+        "message_id": None,
+        "mode": chat["mode"],
+        "chat_type": chat["type"],
+        "notification_type": "typing",
+        "title": sender_name,
+        "body": "Typing…",
+        "sender_id": actor_user_id,
+        "sender_name": sender_name,
+        "sender_photo_url": normalized_optional_url_string(sender_profile.get("profilePhotoURL")),
+        "group_title": None,
+        "group_photo_url": None,
+        "community_kind": None,
+    }
+
+
+def push_payload_for_reaction(chat, message, reactor_user_id, emoji, database):
+    if not chat or not message:
+        return None
+
+    reactor_user_id = normalized_entity_id(reactor_user_id)
+    if not reactor_user_id:
+        return None
+
+    reactor = find_user(database, reactor_user_id)
+    if not reactor:
+        return None
+
+    emoji = normalized_optional_string(emoji)
+    if not emoji:
+        return None
+
+    reactor_profile = (reactor.get("profile") or {})
+    reactor_name = resolved_user_display_name(reactor) or "Someone"
+    group = chat.get("group") or {}
+    chat_type = normalized_optional_string(chat.get("type")) or "direct"
+    group_title = normalized_optional_string(group.get("title")) if chat_type == "group" else None
+    group_photo_url = normalized_optional_url_string(group.get("photoURL")) if chat_type == "group" else None
+    title = group_title or reactor_name
+    if chat_type == "group" and group_title:
+        body = f"{reactor_name} reacted {emoji} to your message"
+    else:
+        body = f"{reactor_name} reacted {emoji} to your message"
+
+    community_kind = normalized_optional_string((chat.get("communityDetails") or {}).get("kind"))
+
+    return {
+        "chat_id": chat["id"],
+        "message_id": message["id"],
+        "mode": chat.get("mode") or "online",
+        "chat_type": chat_type,
+        "notification_type": "reaction",
+        "title": title or "Prime Messaging",
+        "body": body,
+        "sender_id": reactor_user_id,
+        "sender_name": reactor_name,
+        "sender_photo_url": normalized_optional_url_string(reactor_profile.get("profilePhotoURL")),
+        "group_title": group_title,
+        "group_photo_url": group_photo_url,
+        "community_kind": community_kind,
+        "reaction_emoji": emoji,
+        "target_message_id": message["id"],
+        "target_message_sender_id": normalized_optional_string(message.get("senderID")),
     }
 
 
@@ -6655,26 +6737,37 @@ def unread_badge_counts_for_users(user_ids):
 
 
 def apns_payload_for_message(payload, badge_count):
-    return {
-        "aps": {
-            "alert": {
-                "title": payload["title"],
-                "body": payload["body"],
-            },
-            "sound": "default",
-            "badge": max(0, int(badge_count or 0)),
-            "mutable-content": 1,
+    notification_type = normalized_optional_string(payload.get("notification_type")) or "message"
+    aps = {
+        "alert": {
+            "title": payload["title"],
+            "body": payload["body"],
         },
+        "badge": max(0, int(badge_count or 0)),
+        "mutable-content": 1,
+    }
+    if notification_type == "typing":
+        aps["interruption-level"] = "passive"
+        aps["content-available"] = 1
+    else:
+        aps["sound"] = "default"
+
+    return {
+        "aps": aps,
         "chat_id": payload["chat_id"],
         "message_id": payload["message_id"],
         "mode": payload["mode"],
         "chat_type": payload["chat_type"],
+        "notification_type": notification_type,
         "sender_id": payload.get("sender_id"),
         "sender_name": payload.get("sender_name"),
         "sender_photo_url": payload.get("sender_photo_url"),
         "group_title": payload.get("group_title"),
         "group_photo_url": payload.get("group_photo_url"),
         "community_kind": payload.get("community_kind"),
+        "reaction_emoji": payload.get("reaction_emoji"),
+        "target_message_id": payload.get("target_message_id"),
+        "target_message_sender_id": payload.get("target_message_sender_id"),
     }
 
 
@@ -6937,15 +7030,17 @@ def dispatch_apns_notifications(dispatch_kind, device_tokens, payload, context):
             if normalized_entity_id(entry.get("userID"))
         }
     )
-    collapse_id = (
-        f"msg-{normalized_entity_id(payload.get('message_id')) or 'unknown'}"
-        if dispatch_kind == "push"
-        else (
-            f"broadcast-{normalized_entity_id(payload.get('broadcast_id')) or 'unknown'}"
-            if dispatch_kind == "broadcast"
-            else f"call-{normalized_entity_id(payload.get('call_id')) or 'unknown'}"
+    collapse_id = normalized_optional_string(context.get("collapse_id"))
+    if not collapse_id:
+        collapse_id = (
+            f"msg-{normalized_entity_id(payload.get('message_id')) or 'unknown'}"
+            if dispatch_kind == "push"
+            else (
+                f"broadcast-{normalized_entity_id(payload.get('broadcast_id')) or 'unknown'}"
+                if dispatch_kind == "broadcast"
+                else f"call-{normalized_entity_id(payload.get('call_id')) or 'unknown'}"
+            )
         )
-    )
 
     for entry in device_tokens:
         if not is_ios_apns_target(entry):
@@ -7129,6 +7224,61 @@ def log_push_dispatch_attempt(database, chat, message):
     log_event(
         "push.dispatch.queued",
         recipient_count=len(device_tokens),
+        **context,
+    )
+    schedule_apns_dispatch("push", device_tokens, payload, context)
+
+
+def log_typing_push_dispatch_attempt(database, chat, actor_user_id):
+    payload = push_payload_for_typing(chat, actor_user_id, database)
+    if not payload:
+        return
+
+    device_tokens = device_tokens_for_recipients(database, chat, actor_user_id)
+    if not device_tokens:
+        return
+
+    context = {
+        "chat_id": chat["id"],
+        "typing_actor_user_id": actor_user_id,
+        "collapse_id": f"typing-{normalized_entity_id(chat.get('id')) or 'unknown'}",
+    }
+    log_event(
+        "push.typing.queued",
+        recipient_count=len(device_tokens),
+        **context,
+    )
+    schedule_apns_dispatch("push", device_tokens, payload, context)
+
+
+def log_reaction_push_dispatch_attempt(database, chat, message, reactor_user_id, emoji):
+    target_sender_id = normalized_entity_id(message.get("senderID"))
+    reactor_user_id = normalized_entity_id(reactor_user_id)
+    emoji = normalized_optional_string(emoji)
+    if not target_sender_id or not reactor_user_id or not emoji:
+        return
+    if ids_equal(target_sender_id, reactor_user_id):
+        return
+
+    payload = push_payload_for_reaction(chat, message, reactor_user_id, emoji, database)
+    if not payload:
+        return
+
+    device_tokens = device_tokens_for_recipients(database, {"participantIDs": [target_sender_id]}, excluding_user_id=None)
+    if not device_tokens:
+        return
+
+    context = {
+        "chat_id": chat["id"],
+        "message_id": message["id"],
+        "reaction_actor_user_id": reactor_user_id,
+        "target_user_id": target_sender_id,
+        "collapse_id": f"reaction-{normalized_entity_id(message.get('id')) or 'unknown'}-{emoji}",
+    }
+    log_event(
+        "push.reaction.queued",
+        recipient_count=len(device_tokens),
+        emoji=emoji,
         **context,
     )
     schedule_apns_dispatch("push", device_tokens, payload, context)
@@ -12544,6 +12694,8 @@ class Handler(BaseHTTPRequestHandler):
                     None,
                 )
 
+                reaction_was_added = False
+
                 if target_reaction:
                     user_ids = [
                         reaction_user_id
@@ -12552,6 +12704,7 @@ class Handler(BaseHTTPRequestHandler):
                     ]
                     if len(user_ids) == len(unique_entity_ids(target_reaction.get("userIDs") or [])):
                         user_ids.append(requester_id)
+                        reaction_was_added = True
                     target_reaction["userIDs"] = user_ids
                     if not user_ids:
                         reactions[:] = [
@@ -12560,6 +12713,7 @@ class Handler(BaseHTTPRequestHandler):
                             if normalized_optional_string(reaction.get("emoji")) != emoji
                         ]
                 else:
+                    reaction_was_added = True
                     reactions.append(
                         {
                             "id": str(uuid.uuid4()),
@@ -12576,6 +12730,20 @@ class Handler(BaseHTTPRequestHandler):
                     event_type="message.updated",
                     actor_user_id=requester_id,
                 )
+                if reaction_was_added:
+                    try:
+                        log_reaction_push_dispatch_attempt(database, chat, message, requester_id, emoji)
+                    except Exception as error:
+                        log_event(
+                            "message.reaction.side_effect_failed",
+                            stage="log_reaction_push_dispatch_attempt",
+                            chat_id=chat.get("id"),
+                            message_id=message.get("id"),
+                            actor_user_id=requester_id,
+                            emoji=emoji,
+                            error=type(error).__name__,
+                            detail=str(error),
+                        )
                 return self.respond(200, serialize_message(message, database))
 
             if method == "PATCH" and parsed.path.startswith("/messages/"):
@@ -12980,6 +13148,18 @@ class Handler(BaseHTTPRequestHandler):
                             client.user_id,
                             is_typing=is_typing,
                         )
+                        if is_typing and typing_transition == "started":
+                            try:
+                                log_typing_push_dispatch_attempt(database, fresh_chat, client.user_id)
+                            except Exception as error:
+                                log_event(
+                                    "typing.side_effect_failed",
+                                    stage="log_typing_push_dispatch_attempt",
+                                    chat_id=fresh_chat.get("id"),
+                                    actor_user_id=client.user_id,
+                                    error=type(error).__name__,
+                                    detail=str(error),
+                                )
             REALTIME_HUB.send_to_connection(
                 client.connection_id,
                 {

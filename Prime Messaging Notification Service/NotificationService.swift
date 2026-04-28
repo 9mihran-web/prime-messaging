@@ -35,6 +35,12 @@ final class NotificationService: UNNotificationServiceExtension {
 
     private static func enrichedContent(from content: UNMutableNotificationContent) async -> UNMutableNotificationContent {
         let userInfo = content.userInfo
+        let notificationType = normalizedString(userInfo["notification_type"]) ?? "message"
+        let conversationIdentifier = normalizedString(userInfo["chat_id"]) ?? UUID().uuidString
+
+        if notificationType == "message" {
+            await clearDeliveredTypingNotifications(for: conversationIdentifier)
+        }
 
         guard
             let senderName = normalizedString(userInfo["sender_name"]) ?? normalizedString(userInfo["title"]) ?? normalizedString(userInfo["display_name"])
@@ -43,7 +49,6 @@ final class NotificationService: UNNotificationServiceExtension {
         }
 
         let senderIdentifier = normalizedString(userInfo["sender_id"]) ?? senderName
-        let conversationIdentifier = normalizedString(userInfo["chat_id"]) ?? UUID().uuidString
         let isGroupConversation = normalizedString(userInfo["chat_type"]) == "group"
         let groupTitle = normalizedString(userInfo["group_title"])
         let senderAvatarURL = normalizedURL(userInfo["sender_photo_url"])
@@ -93,7 +98,9 @@ final class NotificationService: UNNotificationServiceExtension {
 
         let interaction = INInteraction(intent: intent, response: nil)
         interaction.direction = .incoming
-        try? await interaction.donate()
+        if notificationType != "typing" {
+            try? await interaction.donate()
+        }
 
         do {
             let updatedContent = try content.updating(from: intent) as? UNMutableNotificationContent ?? content
@@ -182,5 +189,27 @@ final class NotificationService: UNNotificationServiceExtension {
     private static func normalizedURL(_ value: Any?) -> URL? {
         guard let stringValue = normalizedString(value) else { return nil }
         return URL(string: stringValue)
+    }
+
+    private static func clearDeliveredTypingNotifications(for chatID: String) async {
+        let center = UNUserNotificationCenter.current()
+        let delivered = await deliveredNotifications(from: center)
+        let identifiers = delivered.compactMap { notification -> String? in
+            let userInfo = notification.request.content.userInfo
+            guard normalizedString(userInfo["notification_type"]) == "typing" else { return nil }
+            guard normalizedString(userInfo["chat_id"]) == chatID else { return nil }
+            return notification.request.identifier
+        }
+        if identifiers.isEmpty == false {
+            center.removeDeliveredNotifications(withIdentifiers: identifiers)
+        }
+    }
+
+    private static func deliveredNotifications(from center: UNUserNotificationCenter) async -> [UNNotification] {
+        await withCheckedContinuation { continuation in
+            center.getDeliveredNotifications { notifications in
+                continuation.resume(returning: notifications)
+            }
+        }
     }
 }

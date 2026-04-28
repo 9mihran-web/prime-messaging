@@ -163,6 +163,9 @@ final class LocalPushNotificationService: NSObject, PushNotificationService {
         userInfo: [AnyHashable: Any]? = nil
     ) {
         assertPushRoutingMainThread()
+        Task {
+            await clearTypingNotifications(for: route.chatID)
+        }
         var postedUserInfo = userInfo ?? self.userInfo(for: route)
         if postedUserInfo["chat_id"] == nil {
             postedUserInfo["chat_id"] = route.chatID.uuidString
@@ -222,6 +225,42 @@ final class LocalPushNotificationService: NSObject, PushNotificationService {
                 try? await Task.sleep(for: .seconds(8))
             }
         }
+    }
+
+    private func clearTypingNotifications(for chatID: UUID) async {
+        #if os(tvOS)
+        _ = chatID
+        #else
+        let chatIDString = chatID.uuidString.lowercased()
+
+        let pending = await notificationCenter.pendingNotificationRequests()
+        let pendingIdentifiers = pending.compactMap { request -> String? in
+            guard let notificationType = request.content.userInfo["notification_type"] as? String,
+                  notificationType == "typing",
+                  let rawChatID = request.content.userInfo["chat_id"] as? String,
+                  rawChatID.lowercased() == chatIDString else {
+                return nil
+            }
+            return request.identifier
+        }
+        if pendingIdentifiers.isEmpty == false {
+            notificationCenter.removePendingNotificationRequests(withIdentifiers: pendingIdentifiers)
+        }
+
+        let delivered = await notificationCenter.deliveredNotifications()
+        let deliveredIdentifiers = delivered.compactMap { notification -> String? in
+            guard let notificationType = notification.request.content.userInfo["notification_type"] as? String,
+                  notificationType == "typing",
+                  let rawChatID = notification.request.content.userInfo["chat_id"] as? String,
+                  rawChatID.lowercased() == chatIDString else {
+                return nil
+            }
+            return notification.request.identifier
+        }
+        if deliveredIdentifiers.isEmpty == false {
+            notificationCenter.removeDeliveredNotifications(withIdentifiers: deliveredIdentifiers)
+        }
+        #endif
     }
 
     private var stableDeviceIdentifier: String {
