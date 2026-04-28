@@ -1,6 +1,60 @@
 import Combine
+import OSLog
 import SwiftUI
 import UIKit
+
+private enum ChatMessageGestureDiagnostics {
+    static let logger = Logger(subsystem: "mirowin.Prime-Messaging", category: "MessageGesture")
+    static let isEnabled = ProcessInfo.processInfo.environment["PRIME_CHAT_GESTURE_DIAGNOSTICS"] == "1"
+
+    static func log(_ event: String, messageID: UUID? = nil, details: String = "") {
+        guard isEnabled else { return }
+        let suffix = details.isEmpty ? "" : " \(details)"
+        let payload = "MessageGesture event=\(event) message=\(messageID?.uuidString ?? "nil") main=\(Thread.isMainThread)\(suffix)"
+        logger.notice("\(payload, privacy: .public)")
+    }
+}
+
+private enum ChatCallSummaryCodec {
+    static let prefix = "[prime_call_summary]"
+
+    struct Payload: Equatable {
+        var state: InternetCallState
+        var direction: InternetCallDirection
+        var durationSeconds: Int
+    }
+
+    static func encode(_ payload: Payload) -> String {
+        "\(prefix)state=\(payload.state.rawValue);direction=\(payload.direction.rawValue);duration=\(payload.durationSeconds)"
+    }
+
+    static func decode(_ text: String?) -> Payload? {
+        guard let text, text.hasPrefix(prefix) else { return nil }
+        let serialized = String(text.dropFirst(prefix.count))
+        let parts = serialized.split(separator: ";")
+        var state: InternetCallState?
+        var direction: InternetCallDirection?
+        var durationSeconds = 0
+
+        for part in parts {
+            let tokens = part.split(separator: "=", maxSplits: 1).map(String.init)
+            guard tokens.count == 2 else { continue }
+            switch tokens[0] {
+            case "state":
+                state = InternetCallState(rawValue: tokens[1])
+            case "direction":
+                direction = InternetCallDirection(rawValue: tokens[1])
+            case "duration":
+                durationSeconds = Int(tokens[1]) ?? 0
+            default:
+                continue
+            }
+        }
+
+        guard let state, let direction else { return nil }
+        return Payload(state: state, direction: direction, durationSeconds: max(durationSeconds, 0))
+    }
+}
 
 struct ChatView: View {
     private enum SmartTransportState {
@@ -50,15 +104,19 @@ struct ChatView: View {
     @State private var isShowingOnlinePreviewSendOptions = false
     @State private var clearedThreadCutoff: Date?
     @State private var messageMenuFrames: [UUID: CGRect] = [:]
-    @State private var activeMessageMenuMessage: Message?
-    @State private var pressingMessageMenuID: UUID?
-    @State private var messageMenuActivationTask: Task<Void, Never>?
+    @State private var activeHoldMenuMessage: Message?
+    @State private var activeInlineReactionMessage: Message?
     @State private var reactionPickerMessage: Message?
+    @State private var isChatScrollInteracting = false
+    @State private var holdGestureSuppressionUntil: Date = .distantPast
     @State private var smartTransportState: SmartTransportState = .unknown
     @State private var smartDeliveryConfidence: SmartDeliveryConfidence = .waiting
     @State private var smartPreferredOfflinePath: OfflineTransportPath?
     @State private var smartShouldPreferOnline = false
     @State private var draftPersistenceTask: Task<Void, Never>?
+    @State private var typingStateEvaluationTask: Task<Void, Never>?
+    @State private var lastPersistedDraftText = ""
+    @State private var incomingSharedDraft: OutgoingMessageDraft?
     @State private var unreadAnchorMessageID: UUID?
     @State private var readingAnchorMessageID: UUID?
     @State private var topVisibleMessageID: UUID?
@@ -68,15 +126,145 @@ struct ChatView: View {
     @State private var pendingDeferredSnapshotRefresh = false
     @State private var previousMessageIDs: [UUID] = []
     @State private var lastServerReadMarkAttemptAt: Date?
+    @State private var lastPresenceRefreshUserID: UUID?
+    @State private var lastPresenceRefreshAt: Date = .distantPast
+    @State private var lastCallSummaryRefreshChatID: UUID?
+    @State private var lastCallSummaryRefreshAt: Date = .distantPast
+    @State private var bottomInsetRealignmentTask: Task<Void, Never>?
+    @State private var keyboardOpenRealignmentTask: Task<Void, Never>?
+    @State private var foregroundRefreshTask: Task<Void, Never>?
+    @State private var foregroundInteractionGraceUntil: Date = .distantPast
+    @State private var pendingForegroundRefreshAfterActivation = false
     @State private var selfDestructNow: Date = .now
+    @State private var callSummaryMessages: [Message] = []
+    @State private var realtimeMessageTask: Task<Void, Never>?
+    @State private var remoteTypingResetTask: Task<Void, Never>?
+    @State private var localTypingIdleTask: Task<Void, Never>?
+    @State private var localTypingHeartbeatTask: Task<Void, Never>?
+    @State private var isLocalTypingActive = false
+    @State private var lastTypingSignalState = false
+    @State private var lastTypingSignalAt: Date = .distantPast
+    @State private var prefersNotificationLaunchScroll = false
+    @State private var notificationLaunchAnchorSuppressionUntil: Date = .distantPast
+    @State private var cachedVisibleMessages: [Message] = []
+    @State private var cachedVisibleMessageSignatures: [VisibleMessageSignature] = []
+    @State private var cachedVisibleLookup: [UUID: Message] = [:]
+    @State private var cachedVisibleMessageIDs: [UUID] = []
+    @State private var cachedMergedBaseMessages: [Message] = []
+    @State private var cachedMergedBaseSignatures: [MergedMessageSignature] = []
+    @State private var cachedMergedCallSummaryMessages: [Message] = []
+    @State private var cachedMergedCallSummarySignatures: [MergedMessageSignature] = []
+    @State private var cachedMergedDisplayMessages: [Message] = []
+    @State private var cachedRenderRowInputs: [MessageRenderRowInput] = []
+    @State private var cachedRenderRowSignatures: [MessageRenderRowSignature] = []
+    @State private var cachedRenderRows: [MessageRenderRow] = []
+    @State private var deferredInitialRefreshTask: Task<Void, Never>?
+    @State private var presentationSyncTask: Task<Void, Never>?
+    @State private var initialScrollRecoveryToken = 0
 
     init(chat: Chat) {
         self.chat = chat
         _currentChat = State(initialValue: chat)
     }
 
+    private struct MessageRenderRow: Identifiable {
+        let id: UUID
+        let messageID: UUID
+        let messageCreatedAt: Date
+        let replyMessageID: UUID?
+        let showsDayDivider: Bool
+        let showsIncomingSenderName: Bool
+        let showsIncomingAvatar: Bool
+        let showsTail: Bool
+        let bottomSpacing: CGFloat
+    }
+
+    private struct MessageRenderRowInput: Equatable {
+        let id: UUID
+        let senderID: UUID
+        let createdAt: TimeInterval
+        let replyToMessageID: UUID?
+    }
+
+    private struct MessageRenderRowSignature: Equatable {
+        let id: UUID
+        let senderID: UUID
+        let createdAt: TimeInterval
+        let replyToMessageID: UUID?
+
+        nonisolated init(input: MessageRenderRowInput) {
+            id = input.id
+            senderID = input.senderID
+            createdAt = input.createdAt
+            replyToMessageID = input.replyToMessageID
+        }
+    }
+
+    private struct MergedMessageSignature: Equatable {
+        let id: UUID
+        let clientMessageID: UUID
+        let createdAt: TimeInterval
+        let senderID: UUID
+        let editedAt: TimeInterval?
+        let isDeleted: Bool
+        let textHash: Int
+        let attachmentCount: Int
+        let voiceFingerprint: Int
+
+        nonisolated init(message: Message) {
+            id = message.id
+            clientMessageID = message.clientMessageID
+            createdAt = message.createdAt.timeIntervalSinceReferenceDate
+            senderID = message.senderID
+            editedAt = message.editedAt?.timeIntervalSinceReferenceDate
+            isDeleted = message.isDeleted
+            textHash = message.text?.hashValue ?? 0
+            attachmentCount = message.attachments.count
+            if let voiceMessage = message.voiceMessage {
+                voiceFingerprint = voiceMessage.durationSeconds ^ voiceMessage.waveformSamples.count ^ Int(voiceMessage.byteSize)
+            } else {
+                voiceFingerprint = 0
+            }
+        }
+    }
+
+    private struct VisibleMessageSignature: Equatable {
+        let id: UUID
+        let createdAt: TimeInterval
+        let senderID: UUID
+        let isDeleted: Bool
+        let hiddenDeletedPlaceholder: Bool
+        let expirationBucket: Int
+
+        init(message: Message, relativeTo now: Date) {
+            id = message.id
+            createdAt = message.createdAt.timeIntervalSinceReferenceDate
+            senderID = message.senderID
+            isDeleted = message.isDeleted
+            hiddenDeletedPlaceholder = message.shouldHideDeletedPlaceholder
+            if let expiresAt = message.selfDestructAt() {
+                expirationBucket = Int(expiresAt.timeIntervalSince1970)
+            } else if message.isExpiredForSelfDestruct(relativeTo: now) {
+                expirationBucket = -1
+            } else {
+                expirationBucket = 0
+            }
+        }
+    }
+
     private var visibleMessages: [Message] {
-        let baseMessages = viewModel.messages.filter { message in
+        cachedVisibleMessages
+    }
+
+    private func logSlowChatPhase(_ label: String, startedAt startTime: CFTimeInterval, count: Int) {
+        let duration = CACurrentMediaTime() - startTime
+        guard duration >= 0.008 else { return }
+        guard ProcessInfo.processInfo.environment["PRIME_CHAT_PERF_LOGS"] == "1" else { return }
+        print("PUSHTRACE ChatPerf phase=\(label) durationMs=\(Int((duration * 1000).rounded())) count=\(count)")
+    }
+
+    private func buildVisibleMessages() -> [Message] {
+        let baseMessages = cachedMergedDisplayMessages.filter { message in
             guard hiddenMessageIDs.contains(message.id) == false else { return false }
             guard message.shouldHideDeletedPlaceholder == false else { return false }
             guard message.isExpiredForSelfDestruct(relativeTo: selfDestructNow) == false else { return false }
@@ -210,6 +398,31 @@ struct ChatView: View {
         #endif
     }
 
+    private var chatScrollInteractionGesture: some Gesture {
+        DragGesture(minimumDistance: 6, coordinateSpace: .named("chat-scroll"))
+            .onChanged { value in
+                let horizontal = abs(value.translation.width)
+                let vertical = abs(value.translation.height)
+                guard vertical > 6 else { return }
+                guard vertical > horizontal * 1.1 else { return }
+                holdGestureSuppressionUntil = Date.now.addingTimeInterval(0.28)
+                if isChatScrollInteracting == false {
+                    isChatScrollInteracting = true
+                    ChatMessageGestureDiagnostics.log(
+                        "scroll_begin_drag",
+                        details: "dx=\(Int(value.translation.width)) dy=\(Int(value.translation.height))"
+                    )
+                }
+            }
+            .onEnded { _ in
+                if isChatScrollInteracting {
+                    ChatMessageGestureDiagnostics.log("scroll_end_drag")
+                }
+                isChatScrollInteracting = false
+                holdGestureSuppressionUntil = Date.now.addingTimeInterval(0.16)
+            }
+    }
+
     private var photoAttachmentPresentationBinding: Binding<Attachment?> {
         Binding(
             get: { attachmentPresentation.presentedPhotoAttachment },
@@ -246,131 +459,150 @@ struct ChatView: View {
 
     @ViewBuilder
     private func chatCanvas(geometry: GeometryProxy, proxy: ScrollViewProxy) -> some View {
+        let renderedRows = cachedRenderRows
+        let visibleLookup = cachedVisibleLookup
+        let messageColumn = messageColumnWidth(containerWidth: geometry.size.width)
+
         ZStack {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(visibleMessages.enumerated()), id: \.element.id) { index, message in
-                        if shouldShowDayDivider(at: index) {
-                            ChatDayDivider(text: contextualDayText(for: message.createdAt))
+                    ForEach(renderedRows) { row in
+                        if row.showsDayDivider {
+                            ChatDayDivider(text: contextualDayText(for: row.messageCreatedAt))
                         }
 
-                        MessageBubbleView(
-                            chat: currentChat,
-                            message: message,
-                            replyMessage: replyMessage(for: message),
-                            rowWidth: messageColumnWidth(containerWidth: geometry.size.width),
-                            currentUserID: appState.currentUser.id,
-                            showsIncomingSenderName: shouldShowIncomingSenderName(at: index),
-                            showsIncomingAvatar: shouldShowIncomingAvatar(at: index),
-                            showsTail: shouldShowBubbleTail(at: index),
-                            isActionMenuPresented: activeMessageMenuMessage?.id == message.id,
-                            isPressingActionMenu: pressingMessageMenuID == message.id,
-                            isPinned: pinnedMessageID == message.id,
-                            isOutgoing: message.senderID == appState.currentUser.id,
-                            canEdit: viewModel.canEdit(message, currentUserID: appState.currentUser.id),
-                            canDelete: viewModel.canDelete(message, currentUserID: appState.currentUser.id),
-                            showsCommentsButton: currentChat.communityDetails?.kind == .channel
-                                && currentChat.communityDetails?.commentsEnabled == true
-                                && message.communityParentPostID == nil
-                                && message.isDeleted == false,
-                            commentCount: commentCount(for: message),
-                            onEdit: {
-                                replyingToMessage = nil
-                                viewModel.beginEditing(message)
-                            },
-                            onReply: {
-                                beginReplying(to: message)
-                            },
-                            onOpenReplyTarget: {
-                                if let resolvedReplyMessage = replyMessage(for: message) {
-                                    localFocusedMessageID = resolvedReplyMessage.id
-                                } else if let replyTargetID = message.replyToMessageID {
-                                    localFocusedMessageID = replyTargetID
-                                }
-                            },
-                            onCopy: {
-                                copyMessageContents(message)
-                            },
-                            onOpenActionMenu: {
-                                openMessageActionMenu(for: message)
-                            },
-                            onActionMenuPressingChanged: { isPressing in
-                                if isPressing {
-                                    pressingMessageMenuID = message.id
-                                    scheduleMessageActionMenuOpen(for: message)
-                                } else if pressingMessageMenuID == message.id {
-                                    cancelMessageActionMenuActivation(for: message.id)
-                                }
-                            },
-                            onToggleReaction: { emoji in
-                                Task {
-                                    await toggleReaction(emoji, for: message)
-                                }
-                            },
-                            onOpenComments: {
-                                openComments(for: message)
-                            },
-                            onPin: {
-                                Task {
-                                    await togglePin(for: message)
-                                }
-                            },
-                            onForward: {
-                                forwardingMessage = message
-                                isShowingForwardSheet = true
-                            },
-                            onRequestDeleteOptions: {
-                                pendingDeleteMessage = message
-                            },
-                            onDelete: {
-                                Task {
-                                    await viewModel.deleteMessage(
-                                        message.id,
+                        if let message = visibleLookup[row.messageID] {
+                            MessageBubbleView(
+                                chat: currentChat,
+                                message: message,
+                                replyMessage: row.replyMessageID.flatMap { visibleLookup[$0] },
+                                rowWidth: messageColumn,
+                                currentUserID: appState.currentUser.id,
+                                showsIncomingSenderName: row.showsIncomingSenderName,
+                                showsIncomingAvatar: row.showsIncomingAvatar,
+                                showsTail: row.showsTail,
+                                isActionMenuPresented: activeHoldMenuMessage?.id == message.id,
+                                isReactionPanelPresented: activeInlineReactionMessage?.id == message.id,
+                                isPressingActionMenu: false,
+                                isPinned: pinnedMessageID == message.id,
+                                isOutgoing: message.senderID == appState.currentUser.id,
+                                canEdit: viewModel.canEdit(message, currentUserID: appState.currentUser.id),
+                                canDelete: viewModel.canDelete(message, currentUserID: appState.currentUser.id),
+                                isListInteracting: isChatScrollInteracting,
+                                shouldAllowActionMenuPressing: {
+                                    isChatScrollInteracting == false && Date.now >= holdGestureSuppressionUntil
+                                },
+                                showsCommentsButton: currentChat.communityDetails?.kind == .channel
+                                    && currentChat.communityDetails?.commentsEnabled == true
+                                    && message.communityParentPostID == nil
+                                    && message.isDeleted == false,
+                                commentCount: commentCount(for: message),
+                                onEdit: {
+                                    replyingToMessage = nil
+                                    viewModel.beginEditing(message)
+                                },
+                                onReply: {
+                                    beginReplying(to: message)
+                                },
+                                onOpenReplyTarget: {
+                                    if let resolvedReplyMessageID = row.replyMessageID,
+                                       visibleLookup[resolvedReplyMessageID] != nil {
+                                        localFocusedMessageID = resolvedReplyMessageID
+                                    } else if let replyTargetID = message.replyToMessageID {
+                                        localFocusedMessageID = replyTargetID
+                                    }
+                                },
+                                onCopy: {
+                                    copyMessageContents(message)
+                                },
+                                onOpenActionMenu: {
+                                    openHoldMenu(for: message)
+                                },
+                                onOpenReactionPanelOnly: {
+                                    ChatMessageGestureDiagnostics.log("double_tap_reaction_panel", messageID: message.id)
+                                    openInlineReactionPanel(for: message)
+                                },
+                                onActionMenuPressingChanged: { _ in },
+                                onToggleReaction: { emoji in
+                                    Task {
+                                        await toggleReaction(emoji, for: message)
+                                    }
+                                },
+                                onOpenComments: {
+                                    openComments(for: message)
+                                },
+                                onPin: {
+                                    Task {
+                                        await togglePin(for: message)
+                                    }
+                                },
+                                onForward: {
+                                    forwardingMessage = message
+                                    isShowingForwardSheet = true
+                                },
+                                onRequestDeleteOptions: {
+                                    pendingDeleteMessage = message
+                                },
+                                onDelete: {
+                                    Task {
+                                        await viewModel.deleteMessage(
+                                            message.id,
+                                            chat: currentChat,
+                                            requesterID: appState.currentUser.id,
+                                            repository: environment.chatRepository
+                                        )
+                                    }
+                                },
+                                isFloatingPreview: false
+                            )
+                            .equatable()
+                            .id(row.id)
+                            .onAppear {
+                                guard row.id == renderedRows.first?.id else { return }
+                                Task { @MainActor in
+                                    guard let anchorMessageID = await viewModel.loadOlderMessages(
                                         chat: currentChat,
-                                        requesterID: appState.currentUser.id,
-                                        repository: environment.chatRepository
-                                    )
+                                        currentUserID: appState.currentUser.id
+                                    ) else { return }
+                                    proxy.scrollTo(anchorMessageID, anchor: .top)
                                 }
-                            },
-                            isFloatingPreview: false
-                        )
-                        .id(message.id)
-                        .padding(.bottom, messageRowSpacing(after: index))
-                        .background(
-                            GeometryReader { frameReader in
-                                Color.clear
-                                    .preference(
-                                        key: ChatMessageFramePreferenceKey.self,
-                                        value: [message.id: frameReader.frame(in: .named("chat-scroll"))]
-                                    )
                             }
-                        )
+                            .padding(.bottom, row.bottomSpacing)
+                        }
                     }
 
                     Color.clear
                         .frame(height: max(bottomContentInset(safeAreaBottom: geometry.safeAreaInsets.bottom), 1))
                         .id(scrollBottomAnchorID)
-                        .background(
-                            GeometryReader { frameReader in
-                                Color.clear.preference(
-                                    key: ChatBottomAnchorPreferenceKey.self,
-                                    value: frameReader.frame(in: .named("chat-scroll"))
-                                )
-                            }
-                        )
+                        .onAppear {
+                            updateBottomAnchorVisibility(isVisible: true)
+                        }
+                        .onDisappear {
+                            updateBottomAnchorVisibility(isVisible: false)
+                        }
                 }
                 .padding(.top, topContentInset(safeAreaTop: geometry.safeAreaInsets.top))
                 .padding(.bottom, 4)
-                .frame(width: messageColumnWidth(containerWidth: geometry.size.width), alignment: .leading)
+                .frame(width: messageColumn, alignment: .leading)
                 .padding(.horizontal, PrimeTheme.Spacing.large)
             }
             .coordinateSpace(name: "chat-scroll")
             .scrollDismissesKeyboard(.interactively)
             .background(Color.clear)
+            .simultaneousGesture(chatScrollInteractionGesture)
             .onAppear {
                 scrollToRelevantMessage(using: proxy, animated: false)
             }
-            .onChange(of: viewModel.messages.map(\.id)) { newIDs in
+            .onChange(of: initialScrollRecoveryToken) { _ in
+                guard visibleMessages.isEmpty == false else { return }
+                scrollToRelevantMessage(using: proxy, animated: false)
+                guard prefersNotificationLaunchScroll == false, localFocusedMessageID == nil else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                    guard didInitialScrollToBottom else { return }
+                    proxy.scrollTo(scrollBottomAnchorID, anchor: .bottom)
+                }
+            }
+            .onChange(of: viewModel.messageIDs) { newIDs in
                 handleMessageListChange(using: proxy, oldIDs: previousMessageIDs)
                 previousMessageIDs = newIDs
             }
@@ -380,36 +612,35 @@ struct ChatView: View {
             }
             .onChange(of: localFocusedMessageID) { newValue in
                 guard newValue != nil else { return }
-                _ = scrollToPendingMessageIfNeeded(using: proxy)
+                _ = scrollToPendingMessageIfNeeded(
+                    using: proxy,
+                    animated: !prefersNotificationLaunchScroll,
+                    preferBottomAnchorForRecentNotificationMessage: prefersNotificationLaunchScroll
+                )
             }
             .onChange(of: bottomContentInset(safeAreaBottom: geometry.safeAreaInsets.bottom)) { _ in
                 guard visibleMessages.isEmpty == false else { return }
-                if didInitialScrollToBottom == false {
-                    scrollToRelevantMessage(using: proxy, animated: false)
-                    return
+                guard keyboardHeight <= 0 else { return }
+                bottomInsetRealignmentTask?.cancel()
+                bottomInsetRealignmentTask = Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(120))
+                    guard Task.isCancelled == false else { return }
+                    if didInitialScrollToBottom == false {
+                        scrollToRelevantMessage(using: proxy, animated: false)
+                        return
+                    }
+                    guard isNearBottom || pendingAutoScrollAfterOutgoingMessage else { return }
+                    scrollToBottom(using: proxy, animated: false)
                 }
-                guard isNearBottom || pendingAutoScrollAfterOutgoingMessage else { return }
-                scrollToBottom(using: proxy, animated: false)
-            }
-            .onPreferenceChange(ChatMessageFramePreferenceKey.self) { frames in
-                updateVisibleDay(
-                    from: frames,
-                    viewportHeight: geometry.size.height,
-                    safeAreaTop: geometry.safeAreaInsets.top,
-                    safeAreaBottom: geometry.safeAreaInsets.bottom
-                )
             }
             .onPreferenceChange(ChatMessageMenuFramePreferenceKey.self) { frames in
-                messageMenuFrames = frames
+                if messageMenuFrames != frames {
+                    Task { @MainActor in
+                        guard messageMenuFrames != frames else { return }
+                        messageMenuFrames = frames
+                    }
+                }
             }
-            .onPreferenceChange(ChatBottomAnchorPreferenceKey.self) { frame in
-                updateBottomProximity(
-                    from: frame,
-                    viewportHeight: geometry.size.height,
-                    safeAreaBottom: geometry.safeAreaInsets.bottom
-                )
-            }
-
             topOverlay
                 .background(
                     GeometryReader { proxy in
@@ -422,19 +653,14 @@ struct ChatView: View {
                 .padding(.horizontal, 18)
                 .padding(.top, topOverlayTopPadding(safeAreaTop: geometry.safeAreaInsets.top))
                 .onPreferenceChange(ChatTopOverlayHeightPreferenceKey.self) { height in
-                    topOverlayHeight = max(height, 76)
+                    let nextHeight = max(height, 76)
+                    guard abs(topOverlayHeight - nextHeight) > 0.5 else { return }
+                    Task { @MainActor in
+                        guard abs(topOverlayHeight - nextHeight) > 0.5 else { return }
+                        topOverlayHeight = nextHeight
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-
-            if isShowingFloatingDayChip,
-               let visibleDayText,
-               visibleMessages.isEmpty == false {
-                ChatFloatingDayChip(text: visibleDayText)
-                    .padding(.top, topContentInset(safeAreaTop: geometry.safeAreaInsets.top))
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                    .allowsHitTesting(false)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-            }
 
             bottomOverlay
                 .background(
@@ -449,93 +675,123 @@ struct ChatView: View {
                 .padding(.bottom, bottomOverlayPadding(safeAreaBottom: geometry.safeAreaInsets.bottom))
                 .offset(y: bottomOverlayRestingOffset(safeAreaBottom: geometry.safeAreaInsets.bottom))
                 .onPreferenceChange(ChatBottomOverlayHeightPreferenceKey.self) { height in
-                    bottomOverlayHeight = max(height, 88)
+                    let nextHeight = max(height, 88)
+                    guard abs(bottomOverlayHeight - nextHeight) > 0.5 else { return }
+                    Task { @MainActor in
+                        guard abs(bottomOverlayHeight - nextHeight) > 0.5 else { return }
+                        bottomOverlayHeight = nextHeight
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
 
-            if let activeMessageMenuMessage,
-               let messageFrame = messageMenuFrames[activeMessageMenuMessage.id],
-               let messageIndex = visibleMessages.firstIndex(where: { $0.id == activeMessageMenuMessage.id }) {
-                MessageActionMenuOverlay(
-                    chat: currentChat,
-                    message: activeMessageMenuMessage,
-                    replyMessage: replyMessage(for: activeMessageMenuMessage),
-                    currentUserID: appState.currentUser.id,
-                    showsIncomingSenderName: shouldShowIncomingSenderName(at: messageIndex),
-                    showsTail: shouldShowBubbleTail(at: messageIndex),
+            if let activeInlineReactionMessage,
+               let messageFrame = messageMenuFrames[activeInlineReactionMessage.id] {
+                MessageInlineReactionOverlay(
+                    message: activeInlineReactionMessage,
                     frame: messageFrame,
                     containerSize: geometry.size,
                     safeAreaInsets: geometry.safeAreaInsets,
-                    isOutgoing: activeMessageMenuMessage.senderID == appState.currentUser.id,
-                    isPinned: pinnedMessageID == activeMessageMenuMessage.id,
-                    canEdit: viewModel.canEdit(activeMessageMenuMessage, currentUserID: appState.currentUser.id),
-                    canDelete: viewModel.canDelete(activeMessageMenuMessage, currentUserID: appState.currentUser.id),
-                    showsUndoAction: shouldShowUndoAction(for: activeMessageMenuMessage),
-                    canReport: activeMessageMenuMessage.senderID != appState.currentUser.id
-                        && activeMessageMenuMessage.isDeleted == false
-                        && currentChat.mode != .offline,
-                    showsCommentsButton: currentChat.communityDetails?.kind == .channel
-                        && currentChat.communityDetails?.commentsEnabled == true
-                        && activeMessageMenuMessage.communityParentPostID == nil
-                        && activeMessageMenuMessage.isDeleted == false,
-                    commentCount: commentCount(for: activeMessageMenuMessage),
-                    onDismiss: closeMessageActionMenu,
+                    onDismiss: closeInlineReactionPanel,
                     onOpenExpandedPicker: {
-                        let message = activeMessageMenuMessage
-                        closeMessageActionMenu()
+                        let message = activeInlineReactionMessage
+                        closeInlineReactionPanel()
                         reactionPickerMessage = message
                     },
                     onSelectReaction: { emoji in
-                        let message = activeMessageMenuMessage
-                        closeMessageActionMenu()
+                        let message = activeInlineReactionMessage
+                        closeInlineReactionPanel()
+                        Task {
+                            await toggleReaction(emoji, for: message)
+                        }
+                    }
+                )
+                .transition(.opacity)
+                .zIndex(99)
+            }
+
+            if let activeHoldMenuMessage,
+               let messageFrame = messageMenuFrames[activeHoldMenuMessage.id],
+               let renderedRow = renderedRows.first(where: { $0.id == activeHoldMenuMessage.id }) {
+                MessageActionMenuOverlay(
+                    chat: currentChat,
+                    message: activeHoldMenuMessage,
+                    replyMessage: renderedRow.replyMessageID.flatMap { visibleLookup[$0] },
+                    currentUserID: appState.currentUser.id,
+                    showsIncomingSenderName: renderedRow.showsIncomingSenderName,
+                    showsTail: renderedRow.showsTail,
+                    frame: messageFrame,
+                    containerSize: geometry.size,
+                    safeAreaInsets: geometry.safeAreaInsets,
+                    isOutgoing: activeHoldMenuMessage.senderID == appState.currentUser.id,
+                    isPinned: pinnedMessageID == activeHoldMenuMessage.id,
+                    canEdit: viewModel.canEdit(activeHoldMenuMessage, currentUserID: appState.currentUser.id),
+                    canDelete: viewModel.canDelete(activeHoldMenuMessage, currentUserID: appState.currentUser.id),
+                    showsUndoAction: shouldShowUndoAction(for: activeHoldMenuMessage),
+                    canReport: activeHoldMenuMessage.senderID != appState.currentUser.id
+                        && activeHoldMenuMessage.isDeleted == false
+                        && currentChat.mode != .offline,
+                    showsCommentsButton: currentChat.communityDetails?.kind == .channel
+                        && currentChat.communityDetails?.commentsEnabled == true
+                        && activeHoldMenuMessage.communityParentPostID == nil
+                        && activeHoldMenuMessage.isDeleted == false,
+                    commentCount: commentCount(for: activeHoldMenuMessage),
+                    onDismiss: closeHoldMenu,
+                    onOpenExpandedPicker: {
+                        let message = activeHoldMenuMessage
+                        closeHoldMenu()
+                        reactionPickerMessage = message
+                    },
+                    onSelectReaction: { emoji in
+                        let message = activeHoldMenuMessage
+                        closeHoldMenu()
                         Task {
                             await toggleReaction(emoji, for: message)
                         }
                     },
                     onEdit: {
-                        let message = activeMessageMenuMessage
-                        closeMessageActionMenu()
+                        let message = activeHoldMenuMessage
+                        closeHoldMenu()
                         replyingToMessage = nil
                         viewModel.beginEditing(message)
                     },
                     onReply: {
-                        let message = activeMessageMenuMessage
-                        closeMessageActionMenu()
+                        let message = activeHoldMenuMessage
+                        closeHoldMenu()
                         beginReplying(to: message)
                     },
                     onForward: {
-                        let message = activeMessageMenuMessage
-                        closeMessageActionMenu()
+                        let message = activeHoldMenuMessage
+                        closeHoldMenu()
                         forwardingMessage = message
                         isShowingForwardSheet = true
                     },
                     onCopy: {
-                        let message = activeMessageMenuMessage
-                        closeMessageActionMenu()
+                        let message = activeHoldMenuMessage
+                        closeHoldMenu()
                         copyMessageContents(message)
                     },
                     onPin: {
-                        let message = activeMessageMenuMessage
-                        closeMessageActionMenu()
+                        let message = activeHoldMenuMessage
+                        closeHoldMenu()
                         Task {
                             await togglePin(for: message)
                         }
                     },
                     onReport: {
-                        let message = activeMessageMenuMessage
-                        closeMessageActionMenu()
+                        let message = activeHoldMenuMessage
+                        closeHoldMenu()
                         pendingReportMessage = message
                     },
                     onUndo: {
-                        let message = activeMessageMenuMessage
-                        closeMessageActionMenu()
+                        let message = activeHoldMenuMessage
+                        closeHoldMenu()
                         Task {
                             await undoMessageFromMenu(message)
                         }
                     },
                     onDelete: {
-                        let message = activeMessageMenuMessage
-                        closeMessageActionMenu()
+                        let message = activeHoldMenuMessage
+                        closeHoldMenu()
                         pendingDeleteMessage = message
                     }
                 )
@@ -630,17 +886,46 @@ struct ChatView: View {
             Text("online.preview.send.message".localized)
         }
         .onAppear {
+            applyNotificationLaunchContextIfNeeded()
             appState.selectedChat = currentChat
+            consumeIncomingShareDraftIfNeeded()
+            refreshVisibleMessages(force: true)
         }
         .onDisappear {
-            if appState.selectedChat?.id == currentChat.id {
+            let shouldPreserveSelection =
+                appState.hasPendingNotificationLaunchRoute(for: currentChat.id)
+                || appState.pendingNotificationRoute?.chatID == currentChat.id
+                || appState.pendingResolvedNotificationChat?.id == currentChat.id
+
+            if shouldPreserveSelection == false,
+               appState.selectedChat?.id == currentChat.id {
                 appState.selectedChat = nil
             }
+            isChatScrollInteracting = false
+            bottomInsetRealignmentTask?.cancel()
+            keyboardOpenRealignmentTask?.cancel()
+            foregroundRefreshTask?.cancel()
+            presentationSyncTask?.cancel()
             attachmentPresentation.dismissAll()
             VideoPlaybackControllerRegistry.shared.stopAll()
             VoicePlaybackControllerRegistry.shared.stopAll()
             dayChipHideTask?.cancel()
             draftPersistenceTask?.cancel()
+            typingStateEvaluationTask?.cancel()
+            deferredInitialRefreshTask?.cancel()
+            realtimeMessageTask?.cancel()
+            remoteTypingResetTask?.cancel()
+            localTypingIdleTask?.cancel()
+            localTypingHeartbeatTask?.cancel()
+            localTypingHeartbeatTask = nil
+            notificationLaunchAnchorSuppressionUntil = .distantPast
+            Task {
+                await stopLocalTypingIfNeeded(force: true)
+                await ChatRealtimeService.shared.unsubscribe(
+                    chatID: currentChat.id,
+                    userID: appState.currentUser.id
+                )
+            }
             Task { @MainActor in
                 await persistDraftImmediately()
                 await persistReadingAnchorImmediately()
@@ -648,26 +933,31 @@ struct ChatView: View {
         }
         .onChange(of: currentChat) { newValue in
             appState.selectedChat = newValue
+            consumeIncomingShareDraftIfNeeded()
+        }
+        .onChange(of: appState.incomingShareDraftRevision) { _ in
+            consumeIncomingShareDraftIfNeeded()
         }
         .onChange(of: viewModel.draftText) { _ in
             scheduleDraftPersistence()
+            scheduleTypingStateEvaluation()
         }
         .onChange(of: viewModel.editingMessage?.id) { _ in
             scheduleDraftPersistence()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .primeMessagingReachabilityChanged)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .primeMessagingReachabilityChanged).receive(on: RunLoop.main)) { _ in
             if isSmartDirectChat {
-                Task {
+                Task { @MainActor in
                     await refreshSmartTransportState(forceStartScanning: false)
                 }
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .primeMessagingChatSnapshotsChanged)) { _ in
-            Task {
+        .onReceive(NotificationCenter.default.publisher(for: .primeMessagingChatSnapshotsChanged).receive(on: RunLoop.main)) { _ in
+            Task { @MainActor in
                 await refreshLocalSnapshotIfAppropriate()
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .primeMessagingIncomingChatPush)) { notification in
+        .onReceive(NotificationCenter.default.publisher(for: .primeMessagingIncomingChatPush).receive(on: RunLoop.main)) { notification in
             guard
                 let userInfo = notification.userInfo,
                 let route = NotificationChatRoute(userInfo: userInfo),
@@ -677,23 +967,53 @@ struct ChatView: View {
                 return
             }
 
-            Task {
+            Task { @MainActor in
+                if await ChatRealtimeService.shared.isLikelyConnected(userID: appState.currentUser.id) {
+                    return
+                }
                 await refreshMessagesIfAppropriate(force: true)
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
-            Task {
-                await refreshMessagesIfAppropriate(force: true)
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification).receive(on: RunLoop.main)) { _ in
+            Task { @MainActor in
+                pendingForegroundRefreshAfterActivation = true
+                foregroundInteractionGraceUntil = Date().addingTimeInterval(1.35)
+                guard appState.isSceneActive else { return }
+                pendingForegroundRefreshAfterActivation = false
+                foregroundRefreshTask?.cancel()
+                foregroundRefreshTask = Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(1350))
+                    guard Task.isCancelled == false else { return }
+                    foregroundInteractionGraceUntil = .distantPast
+                    await runDeferredRefreshesIfNeeded()
+                    await refreshMessagesIfAppropriate(force: true)
+                }
+            }
+        }
+        .onChange(of: appState.isSceneActive) { isSceneActive in
+            guard isSceneActive, pendingForegroundRefreshAfterActivation else { return }
+            Task { @MainActor in
+                pendingForegroundRefreshAfterActivation = false
+                foregroundInteractionGraceUntil = Date().addingTimeInterval(1.35)
+                foregroundRefreshTask?.cancel()
+                foregroundRefreshTask = Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(1350))
+                    guard Task.isCancelled == false else { return }
+                    foregroundInteractionGraceUntil = .distantPast
+                    await runDeferredRefreshesIfNeeded()
+                    await refreshMessagesIfAppropriate(force: true)
+                }
             }
         }
         .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { value in
+            guard viewModel.messages.contains(where: { $0.selfDestructSeconds != nil }) else { return }
             selfDestructNow = value
         }
         #if !os(tvOS)
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { notification in
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification).receive(on: RunLoop.main)) { notification in
             updateKeyboardHeight(from: notification)
         }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification).receive(on: RunLoop.main)) { _ in
             let shouldRealignBottom = isNearBottom || pendingAutoScrollAfterOutgoingMessage
             withAnimation(.easeOut(duration: 0.22)) {
                 keyboardHeight = 0
@@ -701,12 +1021,17 @@ struct ChatView: View {
             if shouldRealignBottom {
                 keyboardRealignmentRequest += 1
             }
+            Task { @MainActor in
+                await runDeferredRefreshesIfNeeded()
+            }
         }
         #endif
         .task(id: currentChat.id) {
             attachmentPresentation.dismissAll()
             VideoPlaybackControllerRegistry.shared.stopAll()
             VoicePlaybackControllerRegistry.shared.stopAll()
+            deferredInitialRefreshTask?.cancel()
+            presentationSyncTask?.cancel()
             didInitialScrollToBottom = false
             visibleDayText = nil
             isShowingFloatingDayChip = false
@@ -717,17 +1042,52 @@ struct ChatView: View {
             topVisibleMessageID = nil
             isNearBottom = true
             isOfflineBannerVisible = true
-            activeMessageMenuMessage = nil
+            activeHoldMenuMessage = nil
+            activeInlineReactionMessage = nil
             reactionPickerMessage = nil
             previousMessageIDs = []
             lastServerReadMarkAttemptAt = nil
+            lastPresenceRefreshUserID = nil
+            lastPresenceRefreshAt = .distantPast
+            lastCallSummaryRefreshChatID = nil
+            lastCallSummaryRefreshAt = .distantPast
+            bottomInsetRealignmentTask?.cancel()
+            keyboardOpenRealignmentTask?.cancel()
+            foregroundRefreshTask?.cancel()
+            foregroundInteractionGraceUntil = .distantPast
             replyingToMessage = nil
             pendingDeleteMessage = nil
             pendingReportMessage = nil
             forwardingMessage = nil
+            contactProfile = nil
+            isShowingContactProfile = false
             selectedCommunityTopicID = nil
             selectedCommentPostID = nil
+            callSummaryMessages = []
+            cachedVisibleMessages = []
+            cachedVisibleMessageSignatures = []
+            cachedVisibleLookup = [:]
+            cachedVisibleMessageIDs = []
+            cachedMergedBaseMessages = []
+            cachedMergedBaseSignatures = []
+            cachedMergedCallSummaryMessages = []
+            cachedMergedCallSummarySignatures = []
+            cachedMergedDisplayMessages = []
+            cachedRenderRowInputs = []
+            cachedRenderRowSignatures = []
+            cachedRenderRows = []
+            remoteTypingResetTask?.cancel()
+            localTypingIdleTask?.cancel()
+            localTypingHeartbeatTask?.cancel()
+            typingStateEvaluationTask?.cancel()
+            localTypingHeartbeatTask = nil
+            isLocalTypingActive = false
+            lastTypingSignalState = false
+            lastTypingSignalAt = .distantPast
+            prefersNotificationLaunchScroll = false
+            notificationLaunchAnchorSuppressionUntil = .distantPast
             await loadLocalPresentationState()
+            applyNotificationLaunchContextIfNeeded()
             dayChipHideTask?.cancel()
             if isSmartDirectChat {
                 await refreshSmartTransportState(forceStartScanning: true)
@@ -737,31 +1097,39 @@ struct ChatView: View {
                 smartPreferredOfflinePath = nil
                 smartShouldPreferOnline = false
             }
+            await refreshDirectContactProfileIfNeeded()
             await viewModel.hydrateMessages(
                 chat: currentChat,
                 repository: environment.chatRepository,
                 localStore: environment.localStore,
                 currentUserID: appState.currentUser.id
             )
-            previousMessageIDs = viewModel.messages.map(\.id)
+            refreshVisibleMessages(force: true)
+            lastPersistedDraftText = viewModel.draftText
+            previousMessageIDs = viewModel.messageIDs
             unreadAnchorMessageID = await ChatReadStateStore.shared.firstUnreadMessageID(
                 for: currentChat,
                 messages: viewModel.messages,
                 currentUserID: appState.currentUser.id
             )
-            await refreshCurrentChatMetadataIfNeeded()
-            await syncChatPresentationAndReadState()
-            await refreshPresenceIfNeeded()
-            await refreshMessagesIfAppropriate(force: true)
+            initialScrollRecoveryToken &+= 1
+            await startRealtimeSubscriptionIfNeeded()
+            deferredInitialRefreshTask = Task { @MainActor in
+                await Task.yield()
+                guard Task.isCancelled == false else { return }
+                await syncChatPresentationAndReadState()
+                await refreshMessagesIfAppropriate(force: true)
+                initialScrollRecoveryToken &+= 1
+            }
             var lastSmartTransportRefreshAt = Date()
             while !Task.isCancelled {
+                try? await Task.sleep(for: openChatSafetyRefreshInterval)
                 await refreshMessagesIfAppropriate()
                 if isSmartDirectChat,
                    Date().timeIntervalSince(lastSmartTransportRefreshAt) >= 60 {
                     await refreshSmartTransportState(forceStartScanning: false)
                     lastSmartTransportRefreshAt = Date()
                 }
-                try? await Task.sleep(for: openChatRefreshInterval)
             }
         }
         .fullScreenCover(item: photoAttachmentPresentationBinding) { attachment in
@@ -794,13 +1162,16 @@ struct ChatView: View {
                 await runDeferredRefreshesIfNeeded()
             }
         }
-        .onChange(of: viewModel.messages.map(\.id)) { _ in
-            Task {
-                await syncChatPresentationAndReadState()
+        .onChange(of: viewModel.messageRevision) { _ in
+            refreshVisibleMessages()
+            scheduleChatPresentationSync()
+            if let activeHoldMenuMessage,
+               visibleMessages.contains(where: { $0.id == activeHoldMenuMessage.id }) == false {
+                closeHoldMenu()
             }
-            if let activeMessageMenuMessage,
-               visibleMessages.contains(where: { $0.id == activeMessageMenuMessage.id }) == false {
-                closeMessageActionMenu()
+            if let activeInlineReactionMessage,
+               visibleMessages.contains(where: { $0.id == activeInlineReactionMessage.id }) == false {
+                closeInlineReactionPanel()
             }
             if let selectedCommentPostID,
                viewModel.messages.contains(where: { $0.id == selectedCommentPostID }) == false {
@@ -810,6 +1181,30 @@ struct ChatView: View {
                communityTopics.contains(where: { $0.id == selectedCommunityTopicID }) == false {
                 self.selectedCommunityTopicID = nil
             }
+        }
+        .onChange(of: hiddenMessageIDs) { _ in
+            refreshVisibleMessages()
+        }
+        .onChange(of: selfDestructNow) { _ in
+            refreshVisibleMessages()
+        }
+        .onChange(of: clearedThreadCutoff) { _ in
+            refreshVisibleMessages(force: true)
+        }
+        .onChange(of: callSummaryMessages) { _ in
+            refreshVisibleMessages(force: true)
+        }
+        .onChange(of: selectedCommunityTopicID) { _ in
+            refreshVisibleMessages(force: true)
+        }
+        .onChange(of: selectedCommentPostID) { _ in
+            refreshVisibleMessages(force: true)
+        }
+        .onChange(of: currentChat.type) { _ in
+            refreshCachedRenderRows(force: true)
+        }
+        .onChange(of: currentChat.communityDetails?.kind) { _ in
+            refreshVisibleMessages(force: true)
         }
         .sheet(isPresented: $isShowingGroupInfo) {
             NavigationStack {
@@ -956,11 +1351,86 @@ struct ChatView: View {
         "chat-bottom-\(currentChat.id.uuidString)"
     }
 
-    private var openChatRefreshInterval: Duration {
+    private var openChatSafetyRefreshInterval: Duration {
         if AudioRecorderController.hasActiveRecording() {
-            return .seconds(18)
+            return .seconds(24)
         }
-        return currentChat.mode == .offline ? .seconds(6) : .seconds(12)
+        return currentChat.mode == .offline ? .seconds(10) : .seconds(110)
+    }
+
+    @MainActor
+    private func startRealtimeSubscriptionIfNeeded() async {
+        realtimeMessageTask?.cancel()
+        realtimeMessageTask = nil
+
+        guard currentChat.mode == .online else { return }
+
+        await ChatRealtimeService.shared.subscribe(
+            chatID: currentChat.id,
+            userID: appState.currentUser.id,
+            mode: currentChat.mode
+        )
+        await ChatRealtimeService.shared.sendPresenceHeartbeat(
+            userID: appState.currentUser.id,
+            mode: currentChat.mode,
+            force: true
+        )
+
+        let stream = await ChatRealtimeService.shared.stream(
+            for: appState.currentUser.id,
+            mode: currentChat.mode
+        )
+        realtimeMessageTask = Task { @MainActor in
+            for await event in stream {
+                guard Task.isCancelled == false else { return }
+                await handleRealtimeEvent(event)
+            }
+        }
+    }
+
+    @MainActor
+    private func handleRealtimeEvent(_ event: RealtimeChatEvent) async {
+        guard currentChat.mode == .online else { return }
+        if let eventMode = event.mode, eventMode != .online {
+            return
+        }
+        if let eventChatID = event.chatID, eventChatID != currentChat.id {
+            return
+        }
+
+        if event.type == "typing.started"
+            || event.type == "typing.stopped"
+            || event.type == "presence.updated" {
+            await applyRealtimePresenceEvent(event)
+        }
+
+        if let eventChat = event.chat, eventChat.id == currentChat.id {
+            currentChat = eventChat
+            await ChatSnapshotStore.shared.upsertChat(
+                eventChat,
+                userID: appState.currentUser.id,
+                mode: eventChat.mode
+            )
+        }
+        if let message = event.message, message.chatID == currentChat.id {
+            viewModel.replaceOrAppend(message)
+            await ChatSnapshotStore.shared.upsertMessage(
+                message,
+                in: currentChat,
+                userID: appState.currentUser.id,
+                mode: currentChat.mode
+            )
+            await ChatMessagePageStore.shared.upsertMessages(
+                [message],
+                chatID: currentChat.id,
+                userID: appState.currentUser.id,
+                mode: currentChat.mode
+            )
+            scheduleChatPresentationSync(delay: .milliseconds(90))
+        }
+        if event.type == "chat.resync_required" {
+            await refreshMessagesIfAppropriate(force: true)
+        }
     }
 
     @MainActor
@@ -989,6 +1459,10 @@ struct ChatView: View {
             pendingDeferredMessageRefresh = true
             return
         }
+        if keyboardHeight > 0 || Date() < foregroundInteractionGraceUntil {
+            pendingDeferredMessageRefresh = true
+            return
+        }
         if force == false, mediaPlaybackActivity.shouldDeferChatRefresh(gracePeriod: 2.0) {
             pendingDeferredMessageRefresh = true
             return
@@ -1003,6 +1477,7 @@ struct ChatView: View {
         await refreshCurrentChatMetadataIfNeeded()
         await syncChatPresentationAndReadState()
         await refreshPresenceIfNeeded()
+        await refreshCallSummaries()
     }
 
     @MainActor
@@ -1016,6 +1491,104 @@ struct ChatView: View {
         if pendingDeferredMessageRefresh {
             await refreshMessagesIfAppropriate(force: true)
         }
+    }
+
+    @MainActor
+    private func refreshCallSummaries() async {
+        guard currentChat.mode != .offline else {
+            if callSummaryMessages.isEmpty == false {
+                callSummaryMessages = []
+            }
+            return
+        }
+
+        guard currentChat.type == .direct || currentChat.type == .group else {
+            callSummaryMessages = []
+            return
+        }
+
+        let now = Date()
+        if lastCallSummaryRefreshChatID == currentChat.id,
+           now.timeIntervalSince(lastCallSummaryRefreshAt) < 12 {
+            return
+        }
+        lastCallSummaryRefreshChatID = currentChat.id
+        lastCallSummaryRefreshAt = now
+
+        guard let callHistory = try? await environment.callRepository.fetchCallHistory(for: appState.currentUser.id) else {
+            return
+        }
+
+        let relevantCalls = callHistory.filter { call in
+            call.chatID == currentChat.id
+                && (call.state == .ended || call.state == .cancelled || call.state == .rejected || call.state == .missed)
+        }
+
+        let mappedMessages = relevantCalls.map { call in
+            makeCallSummaryMessage(from: call)
+        }
+        .sorted { lhs, rhs in
+            if lhs.createdAt != rhs.createdAt {
+                return lhs.createdAt < rhs.createdAt
+            }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+
+        if mappedMessages != callSummaryMessages {
+            callSummaryMessages = mappedMessages
+        }
+    }
+
+    private func makeCallSummaryMessage(from call: InternetCall) -> Message {
+        let direction = call.direction(for: appState.currentUser.id)
+        let effectiveState = call.effectiveState(for: appState.currentUser.id)
+        let durationSeconds = resolvedCallDurationSeconds(for: call)
+        let payload = ChatCallSummaryCodec.Payload(
+            state: effectiveState,
+            direction: direction,
+            durationSeconds: durationSeconds
+        )
+
+        let summaryText = ChatCallSummaryCodec.encode(payload)
+        let senderID: UUID
+        if call.isGroupCall {
+            senderID = call.callerID
+        } else {
+            senderID = direction == .outgoing
+                ? appState.currentUser.id
+                : (call.otherParticipant(for: appState.currentUser.id)?.id ?? call.callerID)
+        }
+
+        return Message(
+            id: call.id,
+            chatID: currentChat.id,
+            senderID: senderID,
+            clientMessageID: call.id,
+            senderDisplayName: nil,
+            mode: currentChat.mode,
+            deliveryState: .online,
+            deliveryRoute: .online,
+            kind: .system,
+            text: summaryText,
+            attachments: [],
+            replyToMessageID: nil,
+            replyPreview: nil,
+            communityContext: nil,
+            deliveryOptions: MessageDeliveryOptions(),
+            status: .sent,
+            createdAt: call.activityDate,
+            editedAt: nil,
+            deletedForEveryoneAt: nil,
+            reactions: [],
+            voiceMessage: nil,
+            liveLocation: nil
+        )
+    }
+
+    private func resolvedCallDurationSeconds(for call: InternetCall) -> Int {
+        guard let answeredAt = call.answeredAt else { return 0 }
+        let endDate = call.endedAt ?? Date.now
+        return max(Int(endDate.timeIntervalSince(answeredAt)), 0)
     }
 
     private func topOverlayTopPadding(safeAreaTop: CGFloat) -> CGFloat {
@@ -1069,16 +1642,38 @@ struct ChatView: View {
         bottomOverlayHeight + bottomOverlayPadding(safeAreaBottom: safeAreaBottom) + 10
     }
 
+    @MainActor
+    private func applyNotificationLaunchContextIfNeeded() {
+        guard let route = appState.consumeNotificationLaunchRoute(for: currentChat.id) else { return }
+        prefersNotificationLaunchScroll = true
+        notificationLaunchAnchorSuppressionUntil = Date().addingTimeInterval(2.4)
+        unreadAnchorMessageID = nil
+        readingAnchorMessageID = nil
+        localFocusedMessageID = route.messageID
+    }
+
     private func scrollToRelevantMessage(using proxy: ScrollViewProxy, animated: Bool) {
+        if prefersNotificationLaunchScroll {
+            if scrollToPendingMessageIfNeeded(
+                using: proxy,
+                animated: false,
+                preferBottomAnchorForRecentNotificationMessage: true
+            ) {
+                didInitialScrollToBottom = true
+                notificationLaunchAnchorSuppressionUntil = Date().addingTimeInterval(1.2)
+                prefersNotificationLaunchScroll = false
+                return
+            }
+
+            guard visibleMessages.isEmpty == false else { return }
+            didInitialScrollToBottom = true
+            notificationLaunchAnchorSuppressionUntil = Date().addingTimeInterval(1.2)
+            prefersNotificationLaunchScroll = false
+            scrollToBottom(using: proxy, animated: false)
+            return
+        }
+
         if scrollToPendingMessageIfNeeded(using: proxy, animated: animated) {
-            return
-        }
-
-        if scrollToUnreadAnchorIfNeeded(using: proxy, animated: animated) {
-            return
-        }
-
-        if scrollToReadingAnchorIfNeeded(using: proxy, animated: animated) {
             return
         }
 
@@ -1089,7 +1684,11 @@ struct ChatView: View {
         scrollToBottom(using: proxy, animated: animated)
     }
 
-    private func scrollToPendingMessageIfNeeded(using proxy: ScrollViewProxy, animated: Bool = true) -> Bool {
+    private func scrollToPendingMessageIfNeeded(
+        using proxy: ScrollViewProxy,
+        animated: Bool = true,
+        preferBottomAnchorForRecentNotificationMessage: Bool = false
+    ) -> Bool {
         if localFocusedMessageID == nil {
             localFocusedMessageID = appState.consumeFocusedMessageID(for: currentChat.id)
         }
@@ -1102,13 +1701,22 @@ struct ChatView: View {
             return false
         }
 
+        let scrollAnchor: UnitPoint
+        if preferBottomAnchorForRecentNotificationMessage,
+           let targetIndex = visibleMessages.firstIndex(where: { $0.id == targetMessageID }),
+           targetIndex >= max(0, visibleMessages.count - 8) {
+            scrollAnchor = .bottom
+        } else {
+            scrollAnchor = .center
+        }
+
         DispatchQueue.main.async {
             if animated {
                 withAnimation(.easeInOut(duration: 0.22)) {
-                    proxy.scrollTo(targetMessageID, anchor: .center)
+                    proxy.scrollTo(targetMessageID, anchor: scrollAnchor)
                 }
             } else {
-                proxy.scrollTo(targetMessageID, anchor: .center)
+                proxy.scrollTo(targetMessageID, anchor: scrollAnchor)
             }
 
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
@@ -1121,6 +1729,9 @@ struct ChatView: View {
     }
 
     private func scrollToUnreadAnchorIfNeeded(using proxy: ScrollViewProxy, animated: Bool = true) -> Bool {
+        if Date() < notificationLaunchAnchorSuppressionUntil {
+            return false
+        }
         guard let targetMessageID = unreadAnchorMessageID else { return false }
         guard visibleMessages.contains(where: { $0.id == targetMessageID }) else {
             unreadAnchorMessageID = nil
@@ -1142,6 +1753,9 @@ struct ChatView: View {
     }
 
     private func scrollToReadingAnchorIfNeeded(using proxy: ScrollViewProxy, animated: Bool = true) -> Bool {
+        if Date() < notificationLaunchAnchorSuppressionUntil {
+            return false
+        }
         guard let targetMessageID = readingAnchorMessageID else { return false }
         guard visibleMessages.contains(where: { $0.id == targetMessageID }) else {
             readingAnchorMessageID = nil
@@ -1182,7 +1796,15 @@ struct ChatView: View {
     }
 
     private func handleMessageListChange(using proxy: ScrollViewProxy, oldIDs: [UUID]) {
-        if scrollToPendingMessageIfNeeded(using: proxy) {
+        if scrollToPendingMessageIfNeeded(
+            using: proxy,
+            animated: !prefersNotificationLaunchScroll,
+            preferBottomAnchorForRecentNotificationMessage: prefersNotificationLaunchScroll
+        ) {
+            if prefersNotificationLaunchScroll {
+                didInitialScrollToBottom = true
+                prefersNotificationLaunchScroll = false
+            }
             return
         }
 
@@ -1191,7 +1813,7 @@ struct ChatView: View {
             return
         }
 
-        let newIDs = viewModel.messages.map(\.id)
+        let newIDs = viewModel.messageIDs
         let oldIDSet = Set(oldIDs)
         let hasInsertedMessages = newIDs.contains(where: { oldIDSet.contains($0) == false })
 
@@ -1208,111 +1830,213 @@ struct ChatView: View {
         }
     }
 
-    private func shouldShowDayDivider(at index: Int) -> Bool {
-        guard index > 0 else { return true }
-        let currentDate = visibleMessages[index].createdAt
-        let previousDate = visibleMessages[index - 1].createdAt
-        return Calendar.autoupdatingCurrent.isDate(currentDate, inSameDayAs: previousDate) == false
+    private func messageRenderRows(from inputs: [MessageRenderRowInput]) -> [MessageRenderRow] {
+        guard inputs.isEmpty == false else { return [] }
+
+        return inputs.enumerated().map { index, input in
+            let previousInput = index > 0 ? inputs[index - 1] : nil
+            let nextInput = index + 1 < inputs.count ? inputs[index + 1] : nil
+            let isOutgoing = input.senderID == appState.currentUser.id
+
+            let isGroupedWithPrevious: Bool = {
+                guard let previousInput else { return false }
+                return isGroupedMessage(input, with: previousInput)
+            }()
+
+            let isGroupedWithNext: Bool = {
+                guard let nextInput else { return false }
+                return isGroupedMessage(input, with: nextInput)
+            }()
+
+            let messageDate = Date(timeIntervalSinceReferenceDate: input.createdAt)
+            let showsDayDivider: Bool = {
+                guard let previousInput else { return true }
+                let previousDate = Date(timeIntervalSinceReferenceDate: previousInput.createdAt)
+                return Calendar.autoupdatingCurrent.isDate(messageDate, inSameDayAs: previousDate) == false
+            }()
+
+            let showsIncomingSenderName = currentChat.type == .group
+                && currentChat.communityDetails?.kind != .channel
+                && isOutgoing == false
+                && isGroupedWithPrevious == false
+
+            let showsIncomingAvatar = currentChat.type == .group
+                && currentChat.communityDetails?.kind != .channel
+                && isOutgoing == false
+                && isGroupedWithNext == false
+
+            return MessageRenderRow(
+                id: input.id,
+                messageID: input.id,
+                messageCreatedAt: messageDate,
+                replyMessageID: input.replyToMessageID,
+                showsDayDivider: showsDayDivider,
+                showsIncomingSenderName: showsIncomingSenderName,
+                showsIncomingAvatar: showsIncomingAvatar,
+                showsTail: isGroupedWithNext == false,
+                bottomSpacing: isGroupedWithNext
+                    ? PrimeTheme.Spacing.medium / 4
+                    : PrimeTheme.Spacing.medium / 2
+            )
+        }
     }
 
-    private func shouldShowIncomingSenderName(at index: Int) -> Bool {
-        guard currentChat.type == .group else { return false }
-        let message = visibleMessages[index]
-        guard message.senderID != appState.currentUser.id else { return false }
-        guard let previousMessage = previousVisibleMessage(at: index) else { return true }
-        return isGroupedMessage(message, with: previousMessage) == false
+    private func messageRenderRowInputs(from messages: [Message]) -> [MessageRenderRowInput] {
+        messages.map { message in
+            MessageRenderRowInput(
+                id: message.id,
+                senderID: message.senderID,
+                createdAt: message.createdAt.timeIntervalSinceReferenceDate,
+                replyToMessageID: message.replyToMessageID
+            )
+        }
     }
 
-    private func shouldShowIncomingAvatar(at index: Int) -> Bool {
-        guard currentChat.type == .group else { return false }
-        let message = visibleMessages[index]
-        guard message.senderID != appState.currentUser.id else { return false }
-        guard let nextMessage = nextVisibleMessage(at: index) else { return true }
-        return isGroupedMessage(message, with: nextMessage) == false
+    private func refreshVisibleMessages(force: Bool = false) {
+        let startTime = CACurrentMediaTime()
+        refreshMergedDisplayMessages(force: force)
+        let nextVisibleMessages = buildVisibleMessages()
+        let nextVisibleSignatures = nextVisibleMessages.map { VisibleMessageSignature(message: $0, relativeTo: selfDestructNow) }
+        guard force || nextVisibleSignatures != cachedVisibleMessageSignatures else { return }
+
+        cachedVisibleMessages = nextVisibleMessages
+        cachedVisibleMessageSignatures = nextVisibleSignatures
+        cachedVisibleLookup = Dictionary(uniqueKeysWithValues: nextVisibleMessages.map { ($0.id, $0) })
+        cachedVisibleMessageIDs = nextVisibleMessages.map(\.id)
+        refreshCachedRenderRows(force: true)
+        logSlowChatPhase("refreshVisibleMessages", startedAt: startTime, count: nextVisibleMessages.count)
     }
 
-    private func shouldShowBubbleTail(at index: Int) -> Bool {
-        let message = visibleMessages[index]
-        guard let nextMessage = nextVisibleMessage(at: index) else { return true }
-        return isGroupedMessage(message, with: nextMessage) == false
-    }
-
-    private func messageRowSpacing(after index: Int) -> CGFloat {
-        guard let nextMessage = nextVisibleMessage(at: index) else { return PrimeTheme.Spacing.medium / 2 }
-        let currentMessage = visibleMessages[index]
-        return isGroupedMessage(currentMessage, with: nextMessage)
-            ? PrimeTheme.Spacing.medium / 4
-            : PrimeTheme.Spacing.medium / 2
-    }
-
-    private func previousVisibleMessage(at index: Int) -> Message? {
-        guard index > 0 else { return nil }
-        return visibleMessages[index - 1]
-    }
-
-    private func nextVisibleMessage(at index: Int) -> Message? {
-        guard index + 1 < visibleMessages.count else { return nil }
-        return visibleMessages[index + 1]
-    }
-
-    private func isGroupedMessage(_ lhs: Message, with rhs: Message) -> Bool {
-        lhs.senderID == rhs.senderID
-            && Calendar.autoupdatingCurrent.isDate(lhs.createdAt, inSameDayAs: rhs.createdAt)
-    }
-
-    private func updateBottomProximity(from frame: CGRect, viewportHeight: CGFloat, safeAreaBottom: CGFloat) {
-        let distanceFromVisibleBottom = frame.maxY - viewportHeight
-        let nextValue: Bool
-
-        if isNearBottom {
-            nextValue = distanceFromVisibleBottom <= max(bottomContentInset(safeAreaBottom: safeAreaBottom) * 0.24, 96)
-        } else {
-            nextValue = distanceFromVisibleBottom <= 72
+    private func refreshMergedDisplayMessages(force: Bool = false) {
+        let startTime = CACurrentMediaTime()
+        let baseMessages = viewModel.messages
+        let summaryMessages = callSummaryMessages
+        let baseSignatures = baseMessages.map(MergedMessageSignature.init)
+        let summarySignatures = summaryMessages.map(MergedMessageSignature.init)
+        guard force || baseSignatures != cachedMergedBaseSignatures || summarySignatures != cachedMergedCallSummarySignatures else {
+            return
         }
 
-        isNearBottom = nextValue
-        if nextValue {
-            topVisibleMessageID = nil
+        cachedMergedBaseMessages = baseMessages
+        cachedMergedBaseSignatures = baseSignatures
+        cachedMergedCallSummaryMessages = summaryMessages
+        cachedMergedCallSummarySignatures = summarySignatures
+
+        guard summaryMessages.isEmpty == false else {
+            cachedMergedDisplayMessages = baseMessages
+            logSlowChatPhase("refreshMergedDisplayMessages", startedAt: startTime, count: baseMessages.count)
+            return
+        }
+
+        var byClientMessageID = Dictionary(uniqueKeysWithValues: baseMessages.map { ($0.clientMessageID, $0) })
+        for callSummary in summaryMessages {
+            byClientMessageID[callSummary.clientMessageID] = callSummary
+        }
+
+        cachedMergedDisplayMessages = byClientMessageID.values.sorted { lhs, rhs in
+            if lhs.createdAt != rhs.createdAt {
+                return lhs.createdAt < rhs.createdAt
+            }
+            if lhs.id != rhs.id {
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+            return lhs.clientMessageID.uuidString < rhs.clientMessageID.uuidString
+        }
+        logSlowChatPhase("refreshMergedDisplayMessages", startedAt: startTime, count: cachedMergedDisplayMessages.count)
+    }
+
+    private func refreshCachedRenderRows(force: Bool = false) {
+        let startTime = CACurrentMediaTime()
+        let inputs = messageRenderRowInputs(from: visibleMessages)
+        let signatures = inputs.map(MessageRenderRowSignature.init)
+        guard force || signatures != cachedRenderRowSignatures else { return }
+        cachedRenderRowInputs = inputs
+        cachedRenderRowSignatures = signatures
+        cachedRenderRows = messageRenderRows(from: inputs)
+        logSlowChatPhase("refreshCachedRenderRows", startedAt: startTime, count: inputs.count)
+    }
+
+    private func isGroupedMessage(_ lhs: MessageRenderRowInput, with rhs: MessageRenderRowInput) -> Bool {
+        lhs.senderID == rhs.senderID
+            && Calendar.autoupdatingCurrent.isDate(
+                Date(timeIntervalSinceReferenceDate: lhs.createdAt),
+                inSameDayAs: Date(timeIntervalSinceReferenceDate: rhs.createdAt)
+            )
+    }
+
+    private func updateBottomAnchorVisibility(isVisible: Bool) {
+        if isNearBottom != isVisible {
+            isNearBottom = isVisible
+        }
+        if isVisible {
+            if topVisibleMessageID != nil {
+                topVisibleMessageID = nil
+            }
             dayChipHideTask?.cancel()
-            withAnimation(.easeOut(duration: 0.18)) {
-                isShowingFloatingDayChip = false
+            if isShowingFloatingDayChip {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    isShowingFloatingDayChip = false
+                }
             }
         }
     }
 
-    private func updateVisibleDay(from frames: [UUID: CGRect], viewportHeight: CGFloat, safeAreaTop: CGFloat, safeAreaBottom: CGFloat) {
+    private func updateVisibleDay(
+        from frames: [UUID: CGRect],
+        rows: [MessageRenderRow],
+        viewportHeight: CGFloat,
+        safeAreaTop: CGFloat,
+        safeAreaBottom: CGFloat
+    ) {
         let visibleTop = max(topContentInset(safeAreaTop: safeAreaTop) - 8, 0)
         let visibleBottom = max(
             viewportHeight - bottomContentInset(safeAreaBottom: safeAreaBottom) + 18,
             visibleTop + 1
         )
 
-        guard let visibleMessage = visibleMessages.first(where: { message in
-            guard let frame = frames[message.id] else { return false }
+        guard let visibleRow = rows.first(where: { row in
+            guard let frame = frames[row.id] else { return false }
             return frame.maxY >= visibleTop && frame.minY <= visibleBottom
         }) else {
-            visibleDayText = nil
-            topVisibleMessageID = nil
+            if visibleDayText != nil {
+                visibleDayText = nil
+            }
+            if topVisibleMessageID != nil {
+                topVisibleMessageID = nil
+            }
             dayChipHideTask?.cancel()
-            isShowingFloatingDayChip = false
-            return
-        }
-
-        topVisibleMessageID = visibleMessage.id
-        visibleDayText = contextualDayText(for: visibleMessage.createdAt)
-
-        guard isNearBottom == false else {
-            dayChipHideTask?.cancel()
-            withAnimation(.easeOut(duration: 0.18)) {
+            if isShowingFloatingDayChip {
                 isShowingFloatingDayChip = false
             }
             return
         }
 
-        withAnimation(.easeOut(duration: 0.18)) {
-            isShowingFloatingDayChip = true
+        let topVisibleChanged = topVisibleMessageID != visibleRow.id
+        if topVisibleChanged {
+            topVisibleMessageID = visibleRow.id
         }
-        scheduleDayChipHide()
+
+        let nextVisibleDayText = contextualDayText(for: visibleRow.messageCreatedAt)
+        if visibleDayText != nextVisibleDayText {
+            visibleDayText = nextVisibleDayText
+        }
+
+        guard isNearBottom == false else {
+            dayChipHideTask?.cancel()
+            if isShowingFloatingDayChip {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    isShowingFloatingDayChip = false
+                }
+            }
+            return
+        }
+
+        if isShowingFloatingDayChip == false || topVisibleChanged {
+            withAnimation(.easeOut(duration: 0.18)) {
+                isShowingFloatingDayChip = true
+            }
+            scheduleDayChipHide()
+        }
     }
 
     private func scheduleDayChipHide() {
@@ -1327,24 +2051,7 @@ struct ChatView: View {
     }
 
     private func contextualDayText(for date: Date) -> String {
-        let calendar = Calendar.autoupdatingCurrent
-        let formatter = DateFormatter()
-        formatter.locale = .autoupdatingCurrent
-
-        if calendar.isDateInToday(date) || calendar.isDateInYesterday(date) {
-            formatter.doesRelativeDateFormatting = true
-            formatter.dateStyle = .medium
-            return formatter.string(from: date)
-        }
-
-        if let currentWeek = calendar.dateInterval(of: .weekOfYear, for: Date.now),
-           currentWeek.contains(date) {
-            formatter.setLocalizedDateFormatFromTemplate("EEEE")
-            return formatter.string(from: date).capitalized
-        }
-
-        formatter.setLocalizedDateFormatFromTemplate("d MMMM yyyy")
-        return formatter.string(from: date)
+        ChatDayTextFormatter.string(for: date)
     }
 
     @MainActor
@@ -1362,18 +2069,7 @@ struct ChatView: View {
             mode: currentChat.mode,
             chatID: currentChat.id
         )
-        readingAnchorMessageID = await ChatNavigationStateStore.shared.readingAnchorMessageID(
-            ownerUserID: appState.currentUser.id,
-            chatID: currentChat.id,
-            mode: currentChat.mode
-        )
-    }
-
-    private func replyMessage(for message: Message) -> Message? {
-        guard let replyToMessageID = message.replyToMessageID else { return nil }
-        return viewModel.messages.first(where: {
-            $0.id == replyToMessageID && $0.shouldHideDeletedPlaceholder == false
-        })
+        readingAnchorMessageID = nil
     }
 
     private func beginReplying(to message: Message) {
@@ -1389,11 +2085,14 @@ struct ChatView: View {
         return Date.now.timeIntervalSince(message.createdAt) <= Message.hiddenDeletePlaceholderWindow
     }
 
-    private func openMessageActionMenu(for message: Message) {
-        guard activeMessageMenuMessage?.id != message.id else { return }
-        messageMenuActivationTask?.cancel()
-        messageMenuActivationTask = nil
-        pressingMessageMenuID = nil
+    private func openHoldMenu(for message: Message) {
+        guard activeHoldMenuMessage?.id != message.id else { return }
+        activeInlineReactionMessage = nil
+        ChatMessageGestureDiagnostics.log(
+            "hold_activated",
+            messageID: message.id,
+            details: "menu=hold"
+        )
         #if !os(tvOS)
         UIApplication.shared.sendAction(
             #selector(UIResponder.resignFirstResponder),
@@ -1403,38 +2102,51 @@ struct ChatView: View {
         )
         #endif
         withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
-            activeMessageMenuMessage = message
+            activeHoldMenuMessage = message
         }
         #if !os(tvOS)
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         #endif
     }
 
-    private func closeMessageActionMenu() {
-        messageMenuActivationTask?.cancel()
-        messageMenuActivationTask = nil
-        pressingMessageMenuID = nil
+    private func openInlineReactionPanel(for message: Message) {
+        guard activeInlineReactionMessage?.id != message.id else { return }
+        activeHoldMenuMessage = nil
+        ChatMessageGestureDiagnostics.log(
+            "inline_reaction_panel_opened",
+            messageID: message.id
+        )
+        withAnimation(.spring(response: 0.22, dampingFraction: 0.9)) {
+            activeInlineReactionMessage = message
+        }
+        #if !os(tvOS)
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        #endif
+    }
+
+    private func closeHoldMenu() {
+        if let activeHoldMenuMessage {
+            ChatMessageGestureDiagnostics.log(
+                "message_menu_closed",
+                messageID: activeHoldMenuMessage.id,
+                details: "menu=hold"
+            )
+        }
         withAnimation(.spring(response: 0.24, dampingFraction: 0.88)) {
-            activeMessageMenuMessage = nil
+            activeHoldMenuMessage = nil
         }
     }
 
-    private func scheduleMessageActionMenuOpen(for message: Message) {
-        messageMenuActivationTask?.cancel()
-        let messageID = message.id
-        messageMenuActivationTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(220))
-            guard Task.isCancelled == false else { return }
-            guard pressingMessageMenuID == messageID else { return }
-            openMessageActionMenu(for: message)
+    private func closeInlineReactionPanel() {
+        if let activeInlineReactionMessage {
+            ChatMessageGestureDiagnostics.log(
+                "message_menu_closed",
+                messageID: activeInlineReactionMessage.id,
+                details: "menu=inline_reactions"
+            )
         }
-    }
-
-    private func cancelMessageActionMenuActivation(for messageID: UUID) {
-        messageMenuActivationTask?.cancel()
-        messageMenuActivationTask = nil
-        if activeMessageMenuMessage?.id != messageID, pressingMessageMenuID == messageID {
-            pressingMessageMenuID = nil
+        withAnimation(.spring(response: 0.2, dampingFraction: 0.92)) {
+            activeInlineReactionMessage = nil
         }
     }
 
@@ -1784,6 +2496,7 @@ struct ChatView: View {
                     replyMessage: replyingToMessage,
                     communityContextTitle: communityComposeContextTitle,
                     communityContext: communityComposeContext,
+                    incomingSharedDraft: incomingSharedDraft,
                     onCancelEditing: {
                         viewModel.cancelEditing()
                     },
@@ -1792,6 +2505,9 @@ struct ChatView: View {
                     },
                     onCancelCommunityContext: communityComposeContextTitle == nil ? nil : {
                         clearCommunityComposeContext()
+                    },
+                    onConsumeIncomingSharedDraft: {
+                        incomingSharedDraft = nil
                     },
                     onSend: { draft in
                         if isOfflineOnlineChat {
@@ -2157,8 +2873,8 @@ struct ChatView: View {
                         Image(systemName: "magnifyingglass")
                             .font(.system(size: 16, weight: .bold))
                             .foregroundStyle(PrimeTheme.Colors.textPrimary)
-                    } else if let groupPhotoURL = currentChat.group?.photoURL {
-                        CachedRemoteImage(url: groupPhotoURL) { image in
+                    } else if let headerAvatarURL {
+                        CachedRemoteImage(url: headerAvatarURL, maxPixelSize: 256) { image in
                             image
                                 .resizable()
                                 .scaledToFill()
@@ -2313,6 +3029,22 @@ struct ChatView: View {
         return initials.isEmpty ? String(title.prefix(2)).uppercased() : initials.uppercased()
     }
 
+    private var headerAvatarURL: URL? {
+        if currentChat.type == .group {
+            return currentChat.group?.photoURL
+        }
+
+        guard currentChat.type == .direct else { return nil }
+        if let contactProfileURL = contactProfile?.profile.profilePhotoURL {
+            return contactProfileURL
+        }
+        if let directParticipant = currentChat.directParticipant(for: appState.currentUser.id),
+           let directPhotoURL = directParticipant.photoURL {
+            return directPhotoURL
+        }
+        return currentChat.participants.first(where: { $0.id != appState.currentUser.id })?.photoURL
+    }
+
     private var headerBadgePlaceholder: some View {
         Text(headerBadgeText)
             .font(.system(.footnote, design: .rounded).weight(.bold))
@@ -2423,6 +3155,18 @@ struct ChatView: View {
     }
 
     @MainActor
+    private func scheduleChatPresentationSync(delay: Duration = .milliseconds(140)) {
+        presentationSyncTask?.cancel()
+        presentationSyncTask = Task { @MainActor in
+            if delay > .zero {
+                try? await Task.sleep(for: delay)
+            }
+            guard Task.isCancelled == false else { return }
+            await syncChatPresentationAndReadState()
+        }
+    }
+
+    @MainActor
     private func refreshCurrentChatMetadataIfNeeded() async {
         guard supportsServerBackedFeatures, currentChat.type == .direct else { return }
         guard currentChat.guestRequest != nil || appState.currentUser.isGuest else { return }
@@ -2441,15 +3185,34 @@ struct ChatView: View {
     private func scheduleDraftPersistence() {
         draftPersistenceTask?.cancel()
         draftPersistenceTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(280))
+            try? await Task.sleep(for: .milliseconds(820))
             guard Task.isCancelled == false else { return }
             await persistDraftImmediately()
         }
     }
 
     @MainActor
+    private func scheduleTypingStateEvaluation() {
+        typingStateEvaluationTask?.cancel()
+        let snapshot = viewModel.draftText
+        typingStateEvaluationTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(130))
+            guard Task.isCancelled == false else { return }
+            guard snapshot == viewModel.draftText else { return }
+            await handleDraftTypingStateChange()
+        }
+    }
+
+    @MainActor
+    private func consumeIncomingShareDraftIfNeeded() {
+        guard incomingSharedDraft == nil else { return }
+        incomingSharedDraft = appState.consumeIncomingShareDraft(for: currentChat.id)
+    }
+
+    @MainActor
     private func persistDraftImmediately() async {
         guard viewModel.editingMessage == nil else { return }
+        guard viewModel.draftText != lastPersistedDraftText else { return }
 
         let trimmedText = viewModel.draftText.trimmingCharacters(in: .whitespacesAndNewlines)
         let nextDraft: Draft?
@@ -2468,6 +3231,7 @@ struct ChatView: View {
             await environment.localStore.saveDraft(draft)
         }
 
+        lastPersistedDraftText = viewModel.draftText
         currentChat.draft = nextDraft
         await ChatSnapshotStore.shared.updateDraft(
             nextDraft,
@@ -2475,14 +3239,17 @@ struct ChatView: View {
             userID: appState.currentUser.id,
             mode: currentChat.mode
         )
-        NotificationCenter.default.post(name: .primeMessagingDraftsChanged, object: nil)
+
+        // Avoid expensive chat-feed hydration churn while user is actively typing in this chat.
+        if appState.selectedChat?.id != currentChat.id {
+            NotificationCenter.default.post(name: .primeMessagingDraftsChanged, object: nil)
+        }
     }
 
     @MainActor
     private func persistReadingAnchorImmediately() async {
-        let anchorMessageID = isNearBottom ? nil : (topVisibleMessageID ?? visibleMessages.first?.id)
         await ChatNavigationStateStore.shared.saveReadingAnchorMessageID(
-            anchorMessageID,
+            nil,
             ownerUserID: appState.currentUser.id,
             chatID: currentChat.id,
             mode: currentChat.mode
@@ -2506,11 +3273,178 @@ struct ChatView: View {
             return
         }
 
+        let now = Date()
+        if lastPresenceRefreshUserID == otherUserID,
+           now.timeIntervalSince(lastPresenceRefreshAt) < 6 {
+            return
+        }
+        lastPresenceRefreshUserID = otherUserID
+        lastPresenceRefreshAt = now
+
         do {
-            currentPresence = try await environment.presenceRepository.fetchPresence(for: otherUserID)
+            var fetchedPresence = try await environment.presenceRepository.fetchPresence(for: otherUserID)
+            if currentPresence?.userID == fetchedPresence.userID, currentPresence?.isTyping == true {
+                fetchedPresence.isTyping = true
+            }
+            currentPresence = fetchedPresence
         } catch {
             if currentPresence?.userID != otherUserID {
                 currentPresence = nil
+            }
+        }
+    }
+
+    @MainActor
+    private func handleDraftTypingStateChange() async {
+        guard currentChat.mode == .online, currentChat.type == .direct else {
+            await stopLocalTypingIfNeeded(force: true)
+            return
+        }
+
+        let hasMeaningfulText = viewModel.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        if hasMeaningfulText {
+            await sendTypingState(true, force: false)
+            scheduleLocalTypingHeartbeat()
+            scheduleLocalTypingIdleStop()
+        } else {
+            await stopLocalTypingIfNeeded(force: false)
+        }
+    }
+
+    @MainActor
+    private func scheduleLocalTypingIdleStop() {
+        localTypingIdleTask?.cancel()
+        localTypingIdleTask = Task {
+            try? await Task.sleep(for: .seconds(4.2))
+            guard Task.isCancelled == false else { return }
+            await stopLocalTypingIfNeeded(force: false)
+        }
+    }
+
+    @MainActor
+    private func stopLocalTypingIfNeeded(force: Bool) async {
+        localTypingIdleTask?.cancel()
+        localTypingIdleTask = nil
+        localTypingHeartbeatTask?.cancel()
+        localTypingHeartbeatTask = nil
+
+        guard currentChat.mode == .online, currentChat.type == .direct else {
+            isLocalTypingActive = false
+            lastTypingSignalState = false
+            return
+        }
+
+        if force == false, isLocalTypingActive == false {
+            return
+        }
+        await sendTypingState(false, force: true)
+    }
+
+    @MainActor
+    private func scheduleLocalTypingHeartbeat() {
+        guard localTypingHeartbeatTask == nil else { return }
+        localTypingHeartbeatTask = Task { @MainActor in
+            while Task.isCancelled == false {
+                try? await Task.sleep(for: .seconds(2.4))
+                guard Task.isCancelled == false else { return }
+
+                let hasMeaningfulText = viewModel.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                guard hasMeaningfulText, currentChat.mode == .online, currentChat.type == .direct else {
+                    localTypingHeartbeatTask = nil
+                    return
+                }
+
+                await sendTypingState(true, force: true)
+            }
+        }
+    }
+
+    @MainActor
+    private func sendTypingState(_ isTyping: Bool, force: Bool) async {
+        guard currentChat.mode == .online, currentChat.type == .direct else { return }
+
+        let now = Date()
+        let minRepeatInterval: TimeInterval = isTyping ? 1.0 : 0.2
+        if force == false,
+           lastTypingSignalState == isTyping,
+           now.timeIntervalSince(lastTypingSignalAt) < minRepeatInterval {
+            return
+        }
+
+        lastTypingSignalState = isTyping
+        lastTypingSignalAt = now
+        isLocalTypingActive = isTyping
+
+        await ChatRealtimeService.shared.sendTyping(
+            chatID: currentChat.id,
+            userID: appState.currentUser.id,
+            mode: currentChat.mode,
+            isTyping: isTyping
+        )
+    }
+
+    @MainActor
+    private func applyRealtimePresenceEvent(_ event: RealtimeChatEvent) async {
+        guard currentChat.type == .direct else { return }
+        guard let otherUserID = currentChat.participantIDs.first(where: { $0 != appState.currentUser.id }) else { return }
+
+        if let actorUserID = event.actorUserID, actorUserID != otherUserID {
+            return
+        }
+
+        switch event.type {
+        case "typing.started":
+            var nextPresence = event.presence ?? currentPresence ?? Presence(
+                userID: otherUserID,
+                state: .online,
+                lastSeenAt: .now,
+                isTyping: false
+            )
+            guard nextPresence.userID == otherUserID else { return }
+            nextPresence.isTyping = true
+            if nextPresence.state == .offline || nextPresence.state == .recently || nextPresence.state == .lastSeen {
+                nextPresence.state = .online
+            }
+            if nextPresence.lastSeenAt == nil {
+                nextPresence.lastSeenAt = .now
+            }
+            currentPresence = nextPresence
+            scheduleRemoteTypingReset(userID: otherUserID)
+        case "typing.stopped":
+            var nextPresence = event.presence ?? currentPresence ?? Presence(
+                userID: otherUserID,
+                state: .recently,
+                lastSeenAt: .now,
+                isTyping: false
+            )
+            guard nextPresence.userID == otherUserID else { return }
+            nextPresence.isTyping = false
+            currentPresence = nextPresence
+            remoteTypingResetTask?.cancel()
+        case "presence.updated":
+            guard let nextPresence = event.presence else { return }
+            guard nextPresence.userID == otherUserID else { return }
+            currentPresence = nextPresence
+            if nextPresence.isTyping {
+                scheduleRemoteTypingReset(userID: otherUserID)
+            } else {
+                remoteTypingResetTask?.cancel()
+            }
+        default:
+            return
+        }
+    }
+
+    @MainActor
+    private func scheduleRemoteTypingReset(userID: UUID) {
+        remoteTypingResetTask?.cancel()
+        remoteTypingResetTask = Task {
+            try? await Task.sleep(for: .seconds(5.2))
+            guard Task.isCancelled == false else { return }
+            await MainActor.run {
+                guard currentPresence?.userID == userID else { return }
+                guard currentPresence?.isTyping == true else { return }
+                currentPresence?.isTyping = false
             }
         }
     }
@@ -2576,6 +3510,23 @@ struct ChatView: View {
         } else {
             smartTransportState = .waiting
         }
+    }
+
+    @MainActor
+    private func refreshDirectContactProfileIfNeeded() async {
+        guard currentChat.type == .direct else { return }
+        guard let otherUserID = currentChat.participantIDs.first(where: { $0 != appState.currentUser.id }) else { return }
+
+        do {
+            let remoteProfile = try await environment.authRepository.userProfile(userID: otherUserID)
+            guard currentChat.type == .direct else { return }
+            contactProfile = remoteProfile
+            if let participantIndex = currentChat.participants.firstIndex(where: { $0.id == otherUserID }) {
+                currentChat.participants[participantIndex].displayName = remoteProfile.profile.displayName
+                currentChat.participants[participantIndex].username = remoteProfile.profile.username
+                currentChat.participants[participantIndex].photoURL = remoteProfile.profile.profilePhotoURL
+            }
+        } catch { }
     }
 
     @MainActor
@@ -2737,6 +3688,10 @@ struct ChatView: View {
             return "presence.recently".localized
         }
 
+        if currentPresence.isTyping {
+            return "Typing…"
+        }
+
         switch currentPresence.state {
         case .online:
             return "presence.online".localized
@@ -2751,6 +3706,7 @@ struct ChatView: View {
         }
     }
 
+    @MainActor
     private func updateKeyboardHeight(from notification: Notification) {
         #if os(tvOS)
         keyboardHeight = 0
@@ -2762,9 +3718,24 @@ struct ChatView: View {
 
         let overlap = max(UIScreen.main.bounds.height - frame.minY, 0)
         let duration = (notification.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.22
+        let previousKeyboardHeight = keyboardHeight
+
+        if overlap > 0, Date() < foregroundInteractionGraceUntil {
+            foregroundInteractionGraceUntil = Date().addingTimeInterval(1.1)
+        }
 
         withAnimation(.easeOut(duration: duration)) {
             keyboardHeight = overlap
+        }
+        if previousKeyboardHeight <= 0, overlap > 0, (isNearBottom || pendingAutoScrollAfterOutgoingMessage) {
+            keyboardOpenRealignmentTask?.cancel()
+            keyboardOpenRealignmentTask = Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(180))
+                guard Task.isCancelled == false else { return }
+                keyboardRealignmentRequest += 1
+            }
+        } else if overlap <= 0 {
+            keyboardOpenRealignmentTask?.cancel()
         }
         #endif
     }
@@ -2798,6 +3769,43 @@ struct OfflineSessionBanner: View {
     }
 }
 
+private enum ChatDayTextFormatter {
+    private static let relativeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.doesRelativeDateFormatting = true
+        formatter.dateStyle = .medium
+        return formatter
+    }()
+
+    private static let weekdayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.setLocalizedDateFormatFromTemplate("EEEE")
+        return formatter
+    }()
+
+    private static let fullDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.setLocalizedDateFormatFromTemplate("d MMMM yyyy")
+        return formatter
+    }()
+
+    static func string(for date: Date) -> String {
+        let calendar = Calendar.autoupdatingCurrent
+        if calendar.isDateInToday(date) || calendar.isDateInYesterday(date) {
+            return relativeFormatter.string(from: date)
+        }
+
+        if let currentWeek = calendar.dateInterval(of: .weekOfYear, for: .now), currentWeek.contains(date) {
+            return weekdayFormatter.string(from: date).capitalized
+        }
+
+        return fullDateFormatter.string(from: date)
+    }
+}
+
 private struct ChatMessageFramePreferenceKey: PreferenceKey {
     static var defaultValue: [UUID: CGRect] = [:]
 
@@ -2814,14 +3822,6 @@ private struct ChatMessageMenuFramePreferenceKey: PreferenceKey {
     }
 }
 
-private struct ChatBottomAnchorPreferenceKey: PreferenceKey {
-    static var defaultValue: CGRect = .zero
-
-    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
-        value = nextValue()
-    }
-}
-
 private struct ChatTopOverlayHeightPreferenceKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
 
@@ -2835,6 +3835,40 @@ private struct ChatBottomOverlayHeightPreferenceKey: PreferenceKey {
 
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func chatMessageFrameReporter(rowID: UUID, isEnabled: Bool) -> some View {
+        if isEnabled {
+            background(
+                GeometryReader { frameReader in
+                    Color.clear.preference(
+                        key: ChatMessageFramePreferenceKey.self,
+                        value: [rowID: frameReader.frame(in: .named("chat-scroll"))]
+                    )
+                }
+            )
+        } else {
+            self
+        }
+    }
+
+    @ViewBuilder
+    func chatMessageMenuFrameReporter(messageID: UUID, isEnabled: Bool) -> some View {
+        if isEnabled {
+            background(
+                GeometryReader { geometry in
+                    Color.clear.preference(
+                        key: ChatMessageMenuFramePreferenceKey.self,
+                        value: [messageID: geometry.frame(in: .named("chat-root"))]
+                    )
+                }
+            )
+        } else {
+            self
+        }
     }
 }
 
@@ -3238,6 +4272,115 @@ private struct ChatMessageSearchSheet: View {
     }
 }
 
+private struct MessageInlineReactionOverlay: View {
+    let message: Message
+    let frame: CGRect
+    let containerSize: CGSize
+    let safeAreaInsets: EdgeInsets
+    let onDismiss: () -> Void
+    let onOpenExpandedPicker: () -> Void
+    let onSelectReaction: (String) -> Void
+
+    @State private var hasAnimatedIn = false
+
+    private let primaryReactions = ["❤️", "👎", "👍", "🔥", "🥰", "👏", "😁", "😮", "😢", "🙏"]
+
+    var body: some View {
+        ZStack {
+            Color.clear
+                .contentShape(Rectangle())
+                .ignoresSafeArea()
+                .onTapGesture(perform: dismissAnimated)
+
+            reactionBar(primaryReactions)
+                .frame(width: reactionBarWidth)
+                .position(x: reactionBarCenterX, y: reactionBarCenterY)
+                .offset(y: hasAnimatedIn ? 0 : 10)
+                .opacity(hasAnimatedIn ? 1 : 0)
+                .zIndex(2)
+        }
+        .onAppear {
+            DispatchQueue.main.async {
+                withAnimation(.spring(response: 0.24, dampingFraction: 0.9)) {
+                    hasAnimatedIn = true
+                }
+            }
+        }
+    }
+
+    private func reactionBar(_ emojis: [String]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 14) {
+                ForEach(emojis, id: \.self) { emoji in
+                    Button {
+                        onSelectReaction(emoji)
+                    } label: {
+                        Text(emoji)
+                            .font(.system(size: 30))
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Button(action: onOpenExpandedPicker) {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 32, height: 32)
+                        .background(
+                            Circle()
+                                .fill(Color.white.opacity(0.12))
+                        )
+                        .overlay(
+                            Circle()
+                                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 16)
+        }
+        .frame(height: reactionBarHeight)
+        .background(
+            Capsule(style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay(
+                    Capsule(style: .continuous)
+                        .fill(Color.black.opacity(0.42))
+                )
+        )
+        .overlay(
+            Capsule(style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(0.14), radius: 14, y: 8)
+    }
+
+    private var reactionBarHeight: CGFloat {
+        64
+    }
+
+    private var reactionBarWidth: CGFloat {
+        min(containerSize.width - 28, max(228, frame.width + 28))
+    }
+
+    private var reactionBarCenterX: CGFloat {
+        min(max(frame.midX, reactionBarWidth / 2 + 14), containerSize.width - reactionBarWidth / 2 - 14)
+    }
+
+    private var reactionBarCenterY: CGFloat {
+        let desired = frame.minY - 12 - reactionBarHeight / 2
+        let minimum = safeAreaInsets.top + 10 + reactionBarHeight / 2
+        return max(desired, minimum)
+    }
+
+    private func dismissAnimated() {
+        withAnimation(.spring(response: 0.2, dampingFraction: 0.94)) {
+            hasAnimatedIn = false
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: onDismiss)
+    }
+}
+
 private struct MessageActionMenuOverlay: View {
     let chat: Chat
     let message: Message
@@ -3416,11 +4559,14 @@ private struct MessageActionMenuOverlay: View {
             showsIncomingAvatar: false,
             showsTail: showsTail,
             isActionMenuPresented: false,
+            isReactionPanelPresented: false,
             isPressingActionMenu: false,
             isPinned: isPinned,
             isOutgoing: isOutgoing,
             canEdit: canEdit,
             canDelete: canDelete,
+            isListInteracting: false,
+            shouldAllowActionMenuPressing: { false },
             showsCommentsButton: showsCommentsButton,
             commentCount: commentCount,
             onEdit: {},
@@ -3428,6 +4574,7 @@ private struct MessageActionMenuOverlay: View {
             onOpenReplyTarget: {},
             onCopy: {},
             onOpenActionMenu: {},
+            onOpenReactionPanelOnly: {},
             onActionMenuPressingChanged: { _ in },
             onToggleReaction: { _ in },
             onOpenComments: {},
@@ -3437,7 +4584,9 @@ private struct MessageActionMenuOverlay: View {
             onDelete: {},
             isFloatingPreview: true
         )
-        .frame(width: previewBubbleWidth)
+        .equatable()
+        .fixedSize(horizontal: true, vertical: false)
+        .frame(maxWidth: previewBubbleWidth, alignment: isOutgoing ? .trailing : .leading)
         .shadow(color: Color.black.opacity(0.24), radius: 28, y: 16)
     }
 
@@ -3688,13 +4837,16 @@ private struct AttachmentTransitionPreviewCard: View {
         ZStack {
             switch attachment.type {
             case .photo:
-                if let localURL = attachment.localURL,
-                   let uiImage = UIImage(contentsOfFile: localURL.path) {
-                    Image(uiImage: uiImage)
-                        .resizable()
-                        .scaledToFit()
+                if let localURL = attachment.localURL {
+                    LocalAttachmentImage(url: localURL, maxPixelSize: 1600) { image in
+                        image
+                            .resizable()
+                            .scaledToFit()
+                    } placeholder: {
+                        transitionPlaceholder
+                    }
                 } else if let remoteURL = attachment.remoteURL {
-                    CachedRemoteImage(url: remoteURL) { image in
+                    CachedRemoteImage(url: remoteURL, maxPixelSize: 1600) { image in
                         image
                             .resizable()
                             .scaledToFit()
@@ -3831,11 +4983,14 @@ struct MessageBubbleView: View {
     let showsIncomingAvatar: Bool
     let showsTail: Bool
     let isActionMenuPresented: Bool
+    let isReactionPanelPresented: Bool
     let isPressingActionMenu: Bool
     let isPinned: Bool
     let isOutgoing: Bool
     let canEdit: Bool
     let canDelete: Bool
+    let isListInteracting: Bool
+    let shouldAllowActionMenuPressing: () -> Bool
     let showsCommentsButton: Bool
     let commentCount: Int
     let onEdit: () -> Void
@@ -3843,6 +4998,7 @@ struct MessageBubbleView: View {
     let onOpenReplyTarget: () -> Void
     let onCopy: () -> Void
     let onOpenActionMenu: () -> Void
+    let onOpenReactionPanelOnly: () -> Void
     let onActionMenuPressingChanged: (Bool) -> Void
     let onToggleReaction: (String) -> Void
     let onOpenComments: () -> Void
@@ -3854,13 +5010,13 @@ struct MessageBubbleView: View {
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var swipeOffset: CGFloat = 0
-    @State private var bubbleWidth: CGFloat = 0
     @State private var isTrackingReplySwipe = false
 
     private enum BubbleBodyStyle {
         case standard
         case attachmentOnly
         case voiceOnly
+        case callSummary
     }
 
     var body: some View {
@@ -3872,13 +5028,17 @@ struct MessageBubbleView: View {
         MessageBubbleRowLayout(
             isOutgoing: isOutgoing,
             rowWidth: effectiveRowWidth,
-            contentMaxWidth: rowContentMaxWidth
+            contentMaxWidth: rowContentMaxWidth,
+            usesFixedRowWidth: isFloatingPreview == false
         ) {
             rowBubbleContent
         }
-        .padding(.leading, isOutgoing ? rowOppositeSideInset : 0)
-        .padding(.trailing, isOutgoing ? 0 : rowOppositeSideInset)
-        .frame(width: rowWidth, alignment: .leading)
+        .padding(.leading, isFloatingPreview ? 0 : (isOutgoing ? rowOppositeSideInset : 0))
+        .padding(.trailing, isFloatingPreview ? 0 : (isOutgoing ? 0 : rowOppositeSideInset))
+        .frame(
+            width: isFloatingPreview ? nil : rowWidth,
+            alignment: .leading
+        )
     }
 
     @ViewBuilder
@@ -3908,33 +5068,26 @@ struct MessageBubbleView: View {
             bubbleShell {
                 voiceBubble
             }
+        case .callSummary:
+            bubbleShell {
+                callSummaryBubble
+            }
         }
     }
 
     @ViewBuilder
     private func bubbleShell<Content: View>(@ViewBuilder content: () -> Content) -> some View {
         let shell = content()
-            .frame(minWidth: bubbleMinimumFrameWidth, alignment: .leading)
+            .fixedSize(horizontal: isFloatingPreview, vertical: isFloatingPreview)
             .offset(x: swipeOffset)
             .opacity(isActionMenuPresented && isFloatingPreview == false ? 0 : 1)
-            .scaleEffect(isActionMenuPresented ? 0.948 : (isPressingActionMenu ? 0.972 : 1), anchor: isOutgoing ? .trailing : .leading)
-            .offset(y: isActionMenuPresented ? -8 : (isPressingActionMenu ? -3 : 0))
+            .scaleEffect(isActionMenuPresented ? 0.948 : 1, anchor: isOutgoing ? .trailing : .leading)
+            .offset(y: isActionMenuPresented ? -8 : 0)
             .brightness(isActionMenuPresented ? -0.02 : 0)
             .saturation(isActionMenuPresented ? 0.96 : 1)
-            .background(
-                GeometryReader { geometry in
-                    Color.clear
-                        .onAppear {
-                            bubbleWidth = geometry.size.width
-                        }
-                        .onChange(of: geometry.size.width) { newValue in
-                            bubbleWidth = newValue
-                        }
-                        .preference(
-                            key: ChatMessageMenuFramePreferenceKey.self,
-                            value: isFloatingPreview ? [:] : [message.id: geometry.frame(in: .named("chat-root"))]
-                        )
-                }
+            .chatMessageMenuFrameReporter(
+                messageID: message.id,
+                isEnabled: shouldReportMenuFrame
             )
             .overlay(alignment: isOutgoing ? .leading : .trailing) {
                 if isFloatingPreview == false {
@@ -3945,52 +5098,84 @@ struct MessageBubbleView: View {
                 }
             }
             .shadow(
-                color: isOutgoing ? Color.clear : Color.black.opacity(0.06),
-                radius: 10,
-                y: 4
+                color: isOutgoing || isListInteracting ? Color.clear : Color.black.opacity(0.06),
+                radius: isListInteracting ? 0 : 10,
+                y: isListInteracting ? 0 : 4
             )
             .contentShape(Rectangle())
             .animation(.spring(response: 0.26, dampingFraction: 0.84), value: isActionMenuPresented)
-            .animation(.spring(response: 0.22, dampingFraction: 0.82), value: isPressingActionMenu)
 
         if isFloatingPreview {
             shell
         } else {
             #if os(tvOS)
             shell
+            #elseif targetEnvironment(macCatalyst)
+            shell
                 .simultaneousGesture(replySwipeGesture)
+                .contextMenu {
+                    Button("Reply", action: onReply)
+                    Button("Copy", action: onCopy)
+                    Button("Forward", action: onForward)
+                    if canEdit {
+                        Button("Edit", action: onEdit)
+                    }
+                    if canDelete {
+                        Button("Delete", role: .destructive, action: onRequestDeleteOptions)
+                    }
+                }
             #else
             shell
                 .simultaneousGesture(replySwipeGesture)
-                .onLongPressGesture(
-                    minimumDuration: 0.34,
-                    maximumDistance: 12,
-                    perform: {
-                        guard isTrackingReplySwipe == false else { return }
-                        onOpenActionMenu()
-                    },
-                    onPressingChanged: { isPressing in
-                        if isTrackingReplySwipe {
-                            onActionMenuPressingChanged(false)
-                        } else {
-                            onActionMenuPressingChanged(isPressing)
+                .simultaneousGesture(actionMenuHoldGesture)
+                .simultaneousGesture(
+                    TapGesture(count: 2)
+                        .onEnded {
+                            guard isTrackingReplySwipe == false else { return }
+                            guard isListInteracting == false else { return }
+                            guard abs(swipeOffset) < 2 else { return }
+                            onOpenReactionPanelOnly()
                         }
-                    }
                 )
             #endif
         }
+    }
+
+    private var actionMenuHoldGesture: some Gesture {
+        LongPressGesture(minimumDuration: 0.5, maximumDistance: 10)
+            .onEnded { _ in
+                guard isFloatingPreview == false else { return }
+                guard isActionMenuPresented == false else { return }
+                guard isReactionPanelPresented == false else { return }
+                guard isTrackingReplySwipe == false else { return }
+                guard abs(swipeOffset) < 2 else { return }
+                guard isListInteracting == false else { return }
+                guard shouldAllowActionMenuPressing() else { return }
+                ChatMessageGestureDiagnostics.log("hold_activated", messageID: message.id, details: "menu=hold")
+                onOpenActionMenu()
+            }
     }
 
     private var replySwipeGesture: some Gesture {
         #if os(tvOS)
         TapGesture()
         #else
-        DragGesture(minimumDistance: 8, coordinateSpace: .local)
+        DragGesture(minimumDistance: 12, coordinateSpace: .local)
             .onChanged { value in
                 if isTrackingReplySwipe == false {
                     guard shouldBeginReplySwipe(translation: value.translation) else { return }
                     isTrackingReplySwipe = true
-                    onActionMenuPressingChanged(false)
+                    ChatMessageGestureDiagnostics.log(
+                        "pan_swipe_start",
+                        messageID: message.id,
+                        details: "dx=\(Int(value.translation.width)) dy=\(Int(value.translation.height))"
+                    )
+                }
+
+                if abs(value.translation.height) > 18 {
+                    isTrackingReplySwipe = false
+                    swipeOffset = 0
+                    return
                 }
 
                 if isOutgoing {
@@ -4004,7 +5189,6 @@ struct MessageBubbleView: View {
             .onEnded { value in
                 defer {
                     isTrackingReplySwipe = false
-                    onActionMenuPressingChanged(false)
                     withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
                         swipeOffset = 0
                     }
@@ -4012,9 +5196,9 @@ struct MessageBubbleView: View {
 
                 guard isTrackingReplySwipe else { return }
                 if isOutgoing {
-                    guard value.translation.width < -42 else { return }
+                    guard value.translation.width < -54 else { return }
                 } else {
-                    guard value.translation.width > 42 else { return }
+                    guard value.translation.width > 54 else { return }
                 }
                 onReply()
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -4043,13 +5227,12 @@ struct MessageBubbleView: View {
                 if usesInlineMetadata {
                     inlineTextMessageBody(messageText)
                 } else {
-                    Text(messageText)
-                        .font(.system(size: 13.5, weight: .regular))
-                        .foregroundStyle(primaryBubbleTextColor)
-                        .layoutPriority(1)
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
+                    bubbleTextBody(messageText)
                 }
+            }
+
+            if let linkPreviewURL, message.isDeleted == false {
+                RichLinkPreviewCard(url: linkPreviewURL, usesLightForeground: usesLightBubbleForeground)
             }
 
             if message.isDeleted == false && message.attachments.isEmpty == false {
@@ -4057,7 +5240,8 @@ struct MessageBubbleView: View {
                     attachments: message.attachments,
                     alignment: mediaHorizontalAlignment,
                     presentationContext: attachmentPresentationContext,
-                    isInteractionEnabled: attachmentInteractionsEnabled
+                    isInteractionEnabled: attachmentInteractionsEnabled,
+                    defersHeavyMediaLoading: isListInteracting
                 )
                 .frame(maxWidth: .infinity, alignment: mediaFrameAlignment)
             }
@@ -4093,7 +5277,8 @@ struct MessageBubbleView: View {
                     attachments: message.attachments,
                     alignment: mediaHorizontalAlignment,
                     presentationContext: attachmentPresentationContext,
-                    isInteractionEnabled: attachmentInteractionsEnabled
+                    isInteractionEnabled: attachmentInteractionsEnabled,
+                    defersHeavyMediaLoading: isListInteracting
                 )
                 .frame(maxWidth: .infinity, alignment: mediaFrameAlignment)
             }
@@ -4145,54 +5330,111 @@ struct MessageBubbleView: View {
     }
 
     @ViewBuilder
-    private var replyPreviewView: some View {
-        if message.isDeleted == false, let replyPreviewText {
-            Button(action: onOpenReplyTarget) {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "arrowshape.turn.up.left.fill")
-                            .font(.system(size: 11, weight: .semibold))
-                        Text(replyPreviewTitle)
-                            .font(.caption.weight(.semibold))
-                        Spacer(minLength: 0)
+    private var callSummaryBubble: some View {
+        if let payload = callSummaryPayload {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 10) {
+                    ZStack {
+                        Circle()
+                            .fill(callSummaryAccentColor(for: payload).opacity(0.16))
+                            .frame(width: 30, height: 30)
+                        Image(systemName: callSummaryIconName(for: payload))
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(callSummaryAccentColor(for: payload))
                     }
-                    .foregroundStyle(replyAccentColor)
 
-                    HStack(alignment: .top, spacing: 10) {
-                        RoundedRectangle(cornerRadius: 3, style: .continuous)
-                            .fill(replyAccentColor)
-                            .frame(width: 3)
-
-                        Text(replyPreviewText)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(callSummaryTitle(for: payload))
+                            .font(.system(size: 13.5, weight: .semibold))
+                            .foregroundStyle(primaryBubbleTextColor)
+                            .lineLimit(1)
+                        Text(callSummarySubtitle(for: payload))
                             .font(.caption)
                             .foregroundStyle(secondaryBubbleTextColor)
-                            .lineLimit(2)
-                            .fixedSize(horizontal: false, vertical: true)
+                            .lineLimit(1)
                     }
-                    .padding(.horizontal, 11)
-                    .padding(.vertical, 10)
-                    .background(
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .fill(replyNestedBubbleFill)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .stroke(replyNestedBubbleStroke, lineWidth: 1)
-                    )
+
+                    Spacer(minLength: 0)
+
+                    if payload.durationSeconds > 0 {
+                        Text(formattedCallDuration(payload.durationSeconds))
+                            .font(.system(size: 11, weight: .semibold, design: .rounded).monospacedDigit())
+                            .foregroundStyle(secondaryBubbleTextColor)
+                    }
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 10)
-                .background(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .fill(replyContainerFill)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(replyContainerStroke, lineWidth: 1)
-                )
+
+                messageMetadata
             }
-            .buttonStyle(.plain)
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+            .padding(.bottom, 8)
+            .background(
+                bubbleSurface(cornerRadius: 20, includeTail: true)
+            )
+            .frame(maxWidth: maximumCallSummaryBubbleWidth, alignment: .leading)
         }
+    }
+
+    @ViewBuilder
+    private var replyPreviewView: some View {
+        if message.isDeleted == false, let replyPreviewText {
+            if isFloatingPreview {
+                replyPreviewCard(replyPreviewText, expandsToAvailableWidth: false)
+            } else {
+                Button(action: onOpenReplyTarget) {
+                    replyPreviewCard(replyPreviewText, expandsToAvailableWidth: true)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private func replyPreviewCard(_ replyPreviewText: String, expandsToAvailableWidth: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "arrowshape.turn.up.left.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(replyPreviewTitle)
+                    .font(.caption.weight(.semibold))
+                if expandsToAvailableWidth {
+                    Spacer(minLength: 0)
+                }
+            }
+            .foregroundStyle(replyAccentColor)
+
+            HStack(alignment: .top, spacing: 10) {
+                RoundedRectangle(cornerRadius: 3, style: .continuous)
+                    .fill(replyAccentColor)
+                    .frame(width: 3)
+
+                Text(replyPreviewText)
+                    .font(.caption)
+                    .foregroundStyle(secondaryBubbleTextColor)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, 11)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(replyNestedBubbleFill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(replyNestedBubbleStroke, lineWidth: 1)
+            )
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(replyContainerFill)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(replyContainerStroke, lineWidth: 1)
+        )
+        .fixedSize(horizontal: expandsToAvailableWidth == false, vertical: false)
     }
 
     private var messageMetadata: some View {
@@ -4434,12 +5676,8 @@ struct MessageBubbleView: View {
     }
 
     private func inlineTextMessageBody(_ text: String) -> some View {
-        Text(text)
-            .font(.system(size: 13.5, weight: .regular))
-            .foregroundStyle(primaryBubbleTextColor)
+        bubbleTextBody(text)
             .layoutPriority(1)
-            .multilineTextAlignment(.leading)
-            .fixedSize(horizontal: false, vertical: true)
             .padding(.trailing, inlineMetadataReservedWidth)
             .overlay(alignment: .bottomTrailing) {
                 metadataContent
@@ -4454,8 +5692,30 @@ struct MessageBubbleView: View {
             }
     }
 
+    @ViewBuilder
+    private func bubbleTextBody(_ text: String) -> some View {
+        if RichMessageText.containsExplicitMarkup(text) {
+            RichBubbleTextView(
+                rawText: text,
+                fontSize: 13.5,
+                textColor: primaryBubbleTextColor
+            )
+        } else {
+            Text(text)
+                .font(.system(size: 13.5, weight: .regular))
+                .foregroundStyle(primaryBubbleTextColor)
+                .multilineTextAlignment(.leading)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     private var bubbleBodyStyle: BubbleBodyStyle {
         guard message.isDeleted == false else { return .standard }
+
+        if callSummaryPayload != nil {
+            return .callSummary
+        }
 
         if message.voiceMessage != nil,
            message.attachments.isEmpty,
@@ -4493,6 +5753,13 @@ struct MessageBubbleView: View {
             return nil
         }
         return text
+    }
+
+    private var linkPreviewURL: URL? {
+        guard message.isDeleted == false else { return nil }
+        guard message.attachments.isEmpty, message.voiceMessage == nil else { return nil }
+        guard message.linkPreview?.isDisabled != true else { return nil }
+        return message.linkPreview?.resolvedURL(in: message.text)
     }
 
     @ViewBuilder
@@ -4553,38 +5820,13 @@ struct MessageBubbleView: View {
             return maximumTextBubbleWidth
         case .attachmentOnly, .voiceOnly:
             return maximumMediaBubbleWidth
+        case .callSummary:
+            return maximumCallSummaryBubbleWidth
         }
     }
 
     private var maximumTextBubbleWidth: CGFloat {
         min(effectiveRowWidth, UIScreen.main.bounds.width * (prefersSeparatedMetadata ? 0.88 : 0.82))
-    }
-
-    private var bubbleMinimumFrameWidth: CGFloat? {
-        switch bubbleBodyStyle {
-        case .standard:
-            return minimumTextBubbleWidth > 0 ? minimumTextBubbleWidth : nil
-        case .attachmentOnly, .voiceOnly:
-            return nil
-        }
-    }
-
-    private var minimumTextBubbleWidth: CGFloat {
-        guard bubbleBodyStyle == .standard, let messageText else { return 0 }
-        guard messageText.contains(" ") else { return 0 }
-        guard prefersSeparatedMetadata else { return 0 }
-
-        let wordCount = messageText.split(whereSeparator: \.isWhitespace).count
-        switch wordCount {
-        case 0...2:
-            return 0
-        case 3...4:
-            return min(maximumTextBubbleWidth, 170)
-        case 5...6:
-            return min(maximumTextBubbleWidth, 210)
-        default:
-            return min(maximumTextBubbleWidth, 246)
-        }
     }
 
     private var maximumMediaBubbleWidth: CGFloat {
@@ -4593,6 +5835,10 @@ struct MessageBubbleView: View {
 
     private var maximumVoiceBubbleWidth: CGFloat {
         min(UIScreen.main.bounds.width * 0.68, 262)
+    }
+
+    private var maximumCallSummaryBubbleWidth: CGFloat {
+        min(UIScreen.main.bounds.width * 0.72, 276)
     }
 
     private var incomingAvatarSize: CGFloat {
@@ -4754,6 +6000,72 @@ struct MessageBubbleView: View {
         usesLightBubbleForeground ? Color.white.opacity(0.94) : PrimeTheme.Colors.accent
     }
 
+    private var callSummaryPayload: ChatCallSummaryCodec.Payload? {
+        guard message.kind == .system else { return nil }
+        return ChatCallSummaryCodec.decode(message.text)
+    }
+
+    private func callSummaryTitle(for payload: ChatCallSummaryCodec.Payload) -> String {
+        switch payload.state {
+        case .ended:
+            return "Call ended"
+        case .cancelled:
+            return "Call canceled"
+        case .rejected:
+            return "Call rejected"
+        case .missed:
+            return "Missed call"
+        case .ringing:
+            return payload.direction == .incoming ? "Incoming call" : "Outgoing call"
+        case .active:
+            return "Call in progress"
+        }
+    }
+
+    private func callSummarySubtitle(for payload: ChatCallSummaryCodec.Payload) -> String {
+        if payload.durationSeconds > 0 {
+            return payload.direction == .incoming ? "Incoming audio call" : "Outgoing audio call"
+        }
+        return payload.direction == .incoming ? "Incoming call" : "Outgoing call"
+    }
+
+    private func callSummaryIconName(for payload: ChatCallSummaryCodec.Payload) -> String {
+        switch payload.state {
+        case .missed:
+            return "phone.badge.xmark.fill"
+        case .rejected, .cancelled:
+            return "phone.down.fill"
+        case .ended:
+            return payload.direction == .incoming ? "phone.arrow.down.left.fill" : "phone.arrow.up.right.fill"
+        case .ringing:
+            return payload.direction == .incoming ? "phone.badge.plus.fill" : "phone.fill"
+        case .active:
+            return "phone.connection.fill"
+        }
+    }
+
+    private func callSummaryAccentColor(for payload: ChatCallSummaryCodec.Payload) -> Color {
+        switch payload.state {
+        case .missed, .rejected:
+            return PrimeTheme.Colors.warning
+        case .cancelled, .ended:
+            return PrimeTheme.Colors.accent
+        case .ringing, .active:
+            return PrimeTheme.Colors.smartAccent
+        }
+    }
+
+    private func formattedCallDuration(_ duration: Int) -> String {
+        let safeDuration = max(duration, 0)
+        let hours = safeDuration / 3600
+        let minutes = (safeDuration % 3600) / 60
+        let seconds = safeDuration % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+        }
+        return "\(minutes):" + String(format: "%02d", seconds)
+    }
+
     private var senderDisplayNameForBubble: String? {
         guard isOutgoing == false else { return nil }
 
@@ -4848,7 +6160,8 @@ struct MessageBubbleView: View {
             if let structuredContent = StructuredChatMessageContent.parse(replyMessage.text) {
                 return structuredContent.previewText
             }
-            if let text = replyMessage.text?.trimmingCharacters(in: .whitespacesAndNewlines), text.isEmpty == false {
+            let text = RichMessageText.plainText(from: replyMessage.text).trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty == false {
                 return text
             }
             if replyMessage.voiceMessage != nil {
@@ -4900,12 +6213,17 @@ struct MessageBubbleView: View {
         min(max(abs(swipeOffset) / 24, 0), 1)
     }
 
+    private var shouldReportMenuFrame: Bool {
+        isFloatingPreview == false && (isActionMenuPresented || isReactionPanelPresented || isPressingActionMenu)
+    }
+
     private func shouldBeginReplySwipe(translation: CGSize) -> Bool {
         let horizontal = abs(translation.width)
         let vertical = abs(translation.height)
 
-        guard horizontal > 8 else { return false }
-        guard horizontal > vertical * 1.05 else { return false }
+        guard horizontal > 16 else { return false }
+        guard horizontal > vertical * 1.45 else { return false }
+        guard vertical < 14 else { return false }
 
         if isOutgoing {
             return translation.width < 0
@@ -4945,6 +6263,30 @@ struct MessageBubbleView: View {
 
     private var reactionNeutralStroke: Color {
         Color.white.opacity(0.12)
+    }
+}
+
+extension MessageBubbleView: Equatable {
+    static func == (lhs: MessageBubbleView, rhs: MessageBubbleView) -> Bool {
+        lhs.chat == rhs.chat
+            && lhs.message == rhs.message
+            && lhs.replyMessage == rhs.replyMessage
+            && lhs.rowWidth == rhs.rowWidth
+            && lhs.currentUserID == rhs.currentUserID
+            && lhs.showsIncomingSenderName == rhs.showsIncomingSenderName
+            && lhs.showsIncomingAvatar == rhs.showsIncomingAvatar
+            && lhs.showsTail == rhs.showsTail
+            && lhs.isActionMenuPresented == rhs.isActionMenuPresented
+            && lhs.isReactionPanelPresented == rhs.isReactionPanelPresented
+            && lhs.isPressingActionMenu == rhs.isPressingActionMenu
+            && lhs.isPinned == rhs.isPinned
+            && lhs.isOutgoing == rhs.isOutgoing
+            && lhs.canEdit == rhs.canEdit
+            && lhs.canDelete == rhs.canDelete
+            && lhs.isListInteracting == rhs.isListInteracting
+            && lhs.showsCommentsButton == rhs.showsCommentsButton
+            && lhs.commentCount == rhs.commentCount
+            && lhs.isFloatingPreview == rhs.isFloatingPreview
     }
 }
 
@@ -5198,6 +6540,7 @@ private struct MessageBubbleRowLayout: Layout {
     let isOutgoing: Bool
     let rowWidth: CGFloat
     let contentMaxWidth: CGFloat
+    let usesFixedRowWidth: Bool
 
     struct Cache {
         var bubbleSize: CGSize = .zero
@@ -5213,14 +6556,17 @@ private struct MessageBubbleRowLayout: Layout {
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) -> CGSize {
         guard let subview = subviews.first else {
-            return CGSize(width: rowWidth, height: 0)
+            return CGSize(width: usesFixedRowWidth ? rowWidth : 0, height: 0)
         }
 
         let measuredSize = subview.sizeThatFits(
             ProposedViewSize(width: contentMaxWidth, height: proposal.height)
         )
         cache.bubbleSize = measuredSize
-        return CGSize(width: rowWidth, height: measuredSize.height)
+        return CGSize(
+            width: usesFixedRowWidth ? rowWidth : measuredSize.width,
+            height: measuredSize.height
+        )
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) {
@@ -5395,7 +6741,21 @@ private struct ChatWallpaperBackground: View {
                         .frame(width: geometry.size.width, height: geometry.size.height)
                         .clipped()
                 } else {
-                    ChatWallpaperPatternLayer(size: geometry.size, isDark: colorScheme == .dark)
+                    LinearGradient(
+                        colors: colorScheme == .dark
+                            ? [
+                                PrimeTheme.Colors.chatWallpaperBase,
+                                PrimeTheme.Colors.chatWallpaperBase.opacity(0.92),
+                                PrimeTheme.Colors.chatWallpaperOverlay.opacity(0.38)
+                            ]
+                            : [
+                                PrimeTheme.Colors.chatWallpaperBase,
+                                PrimeTheme.Colors.chatWallpaperBase.opacity(0.97),
+                                PrimeTheme.Colors.chatWallpaperOverlay.opacity(0.18)
+                            ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
                 }
 
                 LinearGradient(
@@ -5536,8 +6896,19 @@ private extension View {
     }
 }
 
+@MainActor
 final class ChatViewModel: ObservableObject {
+    private enum Paging {
+        static let initialPageSize = 50
+        static let olderPageSize = 100
+        static let refreshWindowLimit = 250
+    }
+
     @Published private(set) var messages: [Message] = []
+    @Published private(set) var messageIDs: [UUID] = []
+    @Published private(set) var messageRevision: Int = 0
+    @Published private(set) var hasOlderMessages = false
+    @Published private(set) var isLoadingOlderMessages = false
     @Published var draftText = ""
     @Published private(set) var isSending = false
     @Published private(set) var editingMessage: Message?
@@ -5548,8 +6919,31 @@ final class ChatViewModel: ObservableObject {
     @MainActor
     func hydrateMessages(chat: Chat, repository: ChatRepository, localStore: LocalStore, currentUserID: UUID) async {
         soundCurrentUserID = currentUserID
-        let cachedMessages = await repository.cachedMessages(chatID: chat.id, mode: chat.mode)
-        applyFetchedMessages(cachedMessages, preserveExistingWhenEmpty: true)
+        var initialMessages = await ChatMessagePageStore.shared.latestPage(
+            chatID: chat.id,
+            userID: currentUserID,
+            mode: chat.mode,
+            limit: Paging.initialPageSize
+        )
+        if initialMessages.isEmpty {
+            let cachedMessages = await repository.cachedMessages(chatID: chat.id, mode: chat.mode)
+            if cachedMessages.isEmpty == false {
+                await ChatMessagePageStore.shared.replaceMessages(
+                    cachedMessages,
+                    chatID: chat.id,
+                    userID: currentUserID,
+                    mode: chat.mode
+                )
+                initialMessages = await ChatMessagePageStore.shared.latestPage(
+                    chatID: chat.id,
+                    userID: currentUserID,
+                    mode: chat.mode,
+                    limit: Paging.initialPageSize
+                )
+            }
+        }
+        applyFetchedMessages(initialMessages, preserveExistingWhenEmpty: true)
+        await refreshOlderAvailability(chat: chat, currentUserID: currentUserID)
         if let savedDraft = await localStore.loadDraft(chatID: chat.id, mode: chat.mode) {
             self.draftText = savedDraft.text
         } else {
@@ -5561,16 +6955,73 @@ final class ChatViewModel: ObservableObject {
     func refreshMessages(chat: Chat, repository: ChatRepository, currentUserID: UUID) async {
         soundCurrentUserID = currentUserID
         do {
-            let fetchedMessages = try await repository.fetchMessages(chatID: chat.id, mode: chat.mode)
-            applyFetchedMessages(fetchedMessages, preserveExistingWhenEmpty: true)
+            _ = try await repository.fetchMessages(chatID: chat.id, mode: chat.mode)
+            let latestMessages = await ChatMessagePageStore.shared.latestPage(
+                chatID: chat.id,
+                userID: currentUserID,
+                mode: chat.mode,
+                limit: min(max(Paging.initialPageSize, messages.count), Paging.refreshWindowLimit)
+            )
+            applyFetchedMessages(latestMessages, preserveExistingWhenEmpty: true)
+            await refreshOlderAvailability(chat: chat, currentUserID: currentUserID)
         } catch { }
     }
 
     @MainActor
     func refreshLocalSnapshot(chat: Chat, repository: ChatRepository, currentUserID: UUID) async {
         soundCurrentUserID = currentUserID
-        let cachedMessages = await repository.cachedMessages(chatID: chat.id, mode: chat.mode)
-        applyFetchedMessages(cachedMessages, preserveExistingWhenEmpty: true)
+        var latestMessages = await ChatMessagePageStore.shared.latestPage(
+            chatID: chat.id,
+            userID: currentUserID,
+            mode: chat.mode,
+            limit: min(max(Paging.initialPageSize, messages.count), Paging.refreshWindowLimit)
+        )
+        if latestMessages.isEmpty {
+            let cachedMessages = await repository.cachedMessages(chatID: chat.id, mode: chat.mode)
+            if cachedMessages.isEmpty == false {
+                await ChatMessagePageStore.shared.replaceMessages(
+                    cachedMessages,
+                    chatID: chat.id,
+                    userID: currentUserID,
+                    mode: chat.mode
+                )
+                latestMessages = await ChatMessagePageStore.shared.latestPage(
+                    chatID: chat.id,
+                    userID: currentUserID,
+                    mode: chat.mode,
+                    limit: min(max(Paging.initialPageSize, messages.count), Paging.refreshWindowLimit)
+                )
+            }
+        }
+        applyFetchedMessages(latestMessages, preserveExistingWhenEmpty: true)
+        await refreshOlderAvailability(chat: chat, currentUserID: currentUserID)
+    }
+
+    @MainActor
+    func loadOlderMessages(chat: Chat, currentUserID: UUID) async -> UUID? {
+        guard isLoadingOlderMessages == false else { return nil }
+        guard let anchorMessage = messages.first else { return nil }
+        guard hasOlderMessages else { return nil }
+
+        isLoadingOlderMessages = true
+        defer { isLoadingOlderMessages = false }
+
+        let olderMessages = await ChatMessagePageStore.shared.page(
+            before: anchorMessage,
+            chatID: chat.id,
+            userID: currentUserID,
+            mode: chat.mode,
+            limit: Paging.olderPageSize
+        )
+        guard olderMessages.isEmpty == false else {
+            hasOlderMessages = false
+            return nil
+        }
+
+        let anchorMessageID = anchorMessage.id
+        applyFetchedMessages(olderMessages + messages, preserveExistingWhenEmpty: false)
+        await refreshOlderAvailability(chat: chat, currentUserID: currentUserID)
+        return anchorMessageID
     }
 
     @MainActor
@@ -5634,16 +7085,81 @@ final class ChatViewModel: ObservableObject {
     }
 
     func canEdit(_ message: Message, currentUserID: UUID) -> Bool {
-        message.senderID == currentUserID && message.canEditText
+        guard message.kind != .system else { return false }
+        return message.senderID == currentUserID && message.canEditText
     }
 
     func canDelete(_ message: Message, currentUserID: UUID) -> Bool {
-        message.senderID == currentUserID && message.isDeleted == false
+        guard message.kind != .system else { return false }
+        return message.senderID == currentUserID && message.isDeleted == false
     }
 
     @MainActor
     func replaceOrAppend(_ message: Message) {
         applyFetchedMessages([message], preserveExistingWhenEmpty: false)
+    }
+
+    @MainActor
+    private func refreshOlderAvailability(chat: Chat, currentUserID: UUID) async {
+        guard let oldestMessage = messages.first else {
+            hasOlderMessages = false
+            return
+        }
+        hasOlderMessages = await ChatMessagePageStore.shared.hasMessages(
+            before: oldestMessage,
+            chatID: chat.id,
+            userID: currentUserID,
+            mode: chat.mode
+        )
+    }
+
+    @MainActor
+    private func commitMessages(_ nextMessages: [Message]) {
+        guard nextMessages != messages else {
+            return
+        }
+
+        messages = nextMessages
+        messageIDs = nextMessages.map(\.id)
+        messageRevision &+= 1
+    }
+
+    @MainActor
+    private func mergeSingleMessage(_ message: Message) -> Bool {
+        if let existingIndex = messages.firstIndex(where: { $0.clientMessageID == message.clientMessageID }) {
+            let existing = messages[existingIndex]
+            let merged = message.mergingLocalObjectState(from: existing)
+
+            guard merged != existing else {
+                return true
+            }
+
+            if merged.createdAt == existing.createdAt {
+                var nextMessages = messages
+                nextMessages[existingIndex] = merged
+                commitMessages(nextMessages)
+                return true
+            }
+
+            return false
+        }
+
+        guard let lastMessage = messages.last else {
+            commitMessages([message])
+            return true
+        }
+
+        let shouldAppendAtEnd = message.createdAt > lastMessage.createdAt
+            || (message.createdAt == lastMessage.createdAt && message.id.uuidString >= lastMessage.id.uuidString)
+
+        guard shouldAppendAtEnd else {
+            return false
+        }
+
+        var nextMessages = messages
+        nextMessages.append(message)
+        commitMessages(nextMessages)
+        return true
     }
 
     @MainActor
@@ -5661,7 +7177,15 @@ final class ChatViewModel: ObservableObject {
         }
 
         guard messages.isEmpty == false else {
-            messages = normalizedIncoming
+            commitMessages(normalizedIncoming)
+            return
+        }
+
+        if normalizedIncoming.count == 1, let singleMessage = normalizedIncoming.first,
+           mergeSingleMessage(singleMessage) {
+            if shouldPlayIncomingSound, AudioRecorderController.hasActiveRecording() == false {
+                MessageSoundEffectPlayer.shared.playReceive()
+            }
             return
         }
 
@@ -5697,7 +7221,7 @@ final class ChatViewModel: ObservableObject {
             return
         }
 
-        messages = mergedMessages
+        commitMessages(mergedMessages)
 
         if shouldPlayIncomingSound, AudioRecorderController.hasActiveRecording() == false {
             MessageSoundEffectPlayer.shared.playReceive()
@@ -5706,7 +7230,9 @@ final class ChatViewModel: ObservableObject {
 
     @MainActor
     func removeMessageLocally(clientMessageID: UUID) {
-        messages.removeAll(where: { $0.clientMessageID == clientMessageID })
+        var nextMessages = messages
+        nextMessages.removeAll(where: { $0.clientMessageID == clientMessageID })
+        commitMessages(nextMessages)
         if editingMessage?.clientMessageID == clientMessageID {
             cancelEditing()
         }

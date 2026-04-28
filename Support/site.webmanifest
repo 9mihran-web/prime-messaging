@@ -1,0 +1,23 @@
+{
+  "name": "Prime Messaging",
+  "short_name": "Prime",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#111111",
+  "theme_color": "#971b23",
+  "lang": "en",
+  "icons": [
+    {
+      "src": "/favicon-256.png?v=20260419c",
+      "sizes": "256x256",
+      "type": "image/png"
+    },
+    {
+      "src": "/prime-favicon.svg?v=20260419c",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

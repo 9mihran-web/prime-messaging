@@ -34,15 +34,18 @@ struct AuthSessionPayload: Codable, Hashable {
 struct AuthenticatedSessionResponse: Decodable {
     let user: User
     let session: AuthSessionPayload?
+    let isNewUser: Bool?
 
     enum CodingKeys: String, CodingKey {
         case user
         case session
+        case isNewUser = "is_new_user"
     }
 
-    init(user: User, session: AuthSessionPayload?) {
+    init(user: User, session: AuthSessionPayload?, isNewUser: Bool? = nil) {
         self.user = user
         self.session = session
+        self.isNewUser = isNewUser
     }
 
     init(from decoder: any Decoder) throws {
@@ -50,11 +53,13 @@ struct AuthenticatedSessionResponse: Decodable {
            container.contains(.user) {
             user = try container.decode(User.self, forKey: .user)
             session = try container.decodeIfPresent(AuthSessionPayload.self, forKey: .session)
+            isNewUser = try container.decodeIfPresent(Bool.self, forKey: .isNewUser)
             return
         }
 
         user = try User(from: decoder)
         session = nil
+        isNewUser = nil
     }
 
     func authSession() -> AuthSession? {

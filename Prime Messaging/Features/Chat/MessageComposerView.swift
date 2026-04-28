@@ -1,4 +1,4 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import AVKit
 import Combine
 import CoreTransferable
@@ -17,6 +17,14 @@ import SwiftUI
 import UniformTypeIdentifiers
 import UIKit
 
+private final class ComposerUncheckedSendableBox<Value>: @unchecked Sendable {
+    nonisolated(unsafe) let value: Value
+
+    nonisolated init(_ value: Value) {
+        self.value = value
+    }
+}
+
 struct MessageComposerView: View {
     @Binding var draftText: String
     let chatTitle: String
@@ -26,9 +34,11 @@ struct MessageComposerView: View {
     let replyMessage: Message?
     let communityContextTitle: String?
     let communityContext: CommunityMessageContext?
+    let incomingSharedDraft: OutgoingMessageDraft?
     let onCancelEditing: () -> Void
     let onCancelReply: () -> Void
     let onCancelCommunityContext: (() -> Void)?
+    let onConsumeIncomingSharedDraft: () -> Void
     let onSend: (OutgoingMessageDraft) async throws -> Void
 
     @Environment(\.colorScheme) private var colorScheme
@@ -38,10 +48,10 @@ struct MessageComposerView: View {
     @State private var selectedGalleryItems: [ComposerPhotoPickerItem] = []
     @State private var attachments: [Attachment] = []
     @State private var voiceMessage: VoiceMessage?
+    @State private var composerDraftText = ""
     @State private var composerError = ""
     @State private var isHoldRecording = false
     @State private var isShowingAttachmentMenu = false
-    @State private var attachmentButtonFrame: CGRect = .zero
     @State private var isShowingGalleryPicker = false
     @State private var isShowingFileImporter = false
     @State private var cameraMode: ComposerCameraCaptureMode?
@@ -53,9 +63,16 @@ struct MessageComposerView: View {
     @State private var pendingMediaEditor: ComposerPendingMedia?
     @State private var deliveryOptions = MessageDeliveryOptions()
     @State private var isShowingDeliveryOptionsMenu = false
+    @State private var composerSelectionRange = NSRange(location: 0, length: 0)
+    @State private var composerMeasuredHeight: CGFloat = 22
+    @State private var linkPreview = MessageLinkPreview()
+    @State private var isShowingCustomLinkSheet = false
+    @State private var customLinkDisplayText = ""
+    @State private var customLinkURLString = ""
     @State private var micTouchBeganAt: Date?
     @State private var isHoldActivationPending = false
     @State private var holdRecordingStartedFromGesture = false
+    @State private var draftBindingSyncTask: Task<Void, Never>?
 
     private let composerControlSize: CGFloat = 50
     private let holdRecordingActivationDelay: TimeInterval = 0.14
@@ -205,17 +222,6 @@ struct MessageComposerView: View {
                                 foregroundColor: PrimeTheme.Colors.accent
                             )
                         }
-                        .background(
-                            GeometryReader { geometry in
-                                Color.clear
-                                    .onAppear {
-                                        attachmentButtonFrame = geometry.frame(in: .global)
-                                    }
-                                    .onChange(of: geometry.frame(in: .global)) { newValue in
-                                        attachmentButtonFrame = newValue
-                                    }
-                            }
-                        )
                         .buttonStyle(.plain)
                         .disabled(editingMessage != nil || isSending || recorder.isRecording)
                     }
@@ -227,14 +233,14 @@ struct MessageComposerView: View {
                 .padding(.vertical, 6)
                 .background(
                     Capsule(style: .continuous)
-                        .fill(Color.black.opacity(0.38))
+                        .fill(composerContainerFillColor)
                 )
                 .overlay(
                     Capsule(style: .continuous)
-                        .stroke(PrimeTheme.Colors.accentSoft.opacity(0.84), lineWidth: 1.35)
+                        .stroke(composerContainerStrokeColor, lineWidth: 1.35)
                 )
-                .shadow(color: PrimeTheme.Colors.accent.opacity(0.28), radius: 14, y: 0)
-                .shadow(color: PrimeTheme.Colors.accentSoft.opacity(0.18), radius: 28, y: 0)
+                .shadow(color: colorScheme == .light ? Color.black.opacity(0.06) : PrimeTheme.Colors.accent.opacity(0.28), radius: 14, y: 0)
+                .shadow(color: colorScheme == .light ? Color.black.opacity(0.04) : PrimeTheme.Colors.accentSoft.opacity(0.18), radius: 28, y: 0)
                 .padding(.horizontal, PrimeTheme.Spacing.large)
                 .padding(.top, 8)
                 .padding(.bottom, 10)
@@ -291,11 +297,42 @@ struct MessageComposerView: View {
             }
             .presentationDetents([.medium, .large])
         }
+        .sheet(isPresented: $isShowingCustomLinkSheet) {
+            NavigationStack {
+                Form {
+                    Section("Text") {
+                        TextField("Display text", text: $customLinkDisplayText)
+                            .textInputAutocapitalization(.sentences)
+                    }
+                    Section("Link") {
+                        TextField("https://example.com", text: $customLinkURLString)
+                            .textInputAutocapitalization(.never)
+                            .keyboardType(.URL)
+                            .autocorrectionDisabled()
+                    }
+                }
+                .navigationTitle("Insert Link")
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("common.cancel".localized) {
+                            isShowingCustomLinkSheet = false
+                        }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") {
+                            insertCustomLinkMarkup()
+                        }
+                        .disabled(customLinkURLString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                }
+            }
+            .presentationDetents([.medium])
+        }
         .fullScreenCover(item: $pendingMediaEditor) { item in
             ComposerMediaEditorSheet(
                 chatTitle: chatTitle,
                 media: item,
-                initialCaption: draftText,
+                initialCaption: composerDraftText,
                 initialQualityPreset: item.defaultQualityPreset,
                 onSend: { submission in
                     try await sendPendingMedia(submission)
@@ -361,6 +398,25 @@ struct MessageComposerView: View {
             voiceMessage = nil
             composerError = ""
             deliveryOptions = MessageDeliveryOptions()
+            linkPreview = MessageLinkPreview()
+        }
+        .onAppear {
+            synchronizeComposerDraftText(force: true)
+            applyIncomingSharedDraftIfNeeded()
+            reconcileLinkPreviewState(for: composerDraftText)
+        }
+        .onDisappear {
+            draftBindingSyncTask?.cancel()
+        }
+        .onChange(of: draftText) { _ in
+            synchronizeComposerDraftText()
+        }
+        .onChange(of: composerDraftText) { newValue in
+            scheduleDraftBindingSync(to: newValue)
+            reconcileLinkPreviewState(for: newValue)
+        }
+        .onChange(of: incomingSharedDraft?.clientMessageID) { _ in
+            applyIncomingSharedDraftIfNeeded()
         }
         .onChange(of: chatMode) { _ in
             composerError = ""
@@ -369,8 +425,9 @@ struct MessageComposerView: View {
 
     private var canSend: Bool {
         OutgoingMessageDraft(
-            text: draftText,
+            text: composerDraftText,
             attachments: attachments,
+            linkPreview: resolvedLinkPreviewForDraft,
             voiceMessage: voiceMessage,
             replyToMessageID: replyMessage?.id,
             replyPreview: replyMessage.map(makeReplyPreviewSnapshot(for:)),
@@ -380,7 +437,28 @@ struct MessageComposerView: View {
     }
 
     private var hasTypedText: Bool {
-        draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        composerDraftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    private var composerDetectedLinks: [URL] {
+        RichMessageText.detectedURLs(in: composerDraftText)
+    }
+
+    private var selectedComposerText: String {
+        guard composerSelectionRange.location != NSNotFound else { return "" }
+        let nsText = composerDraftText as NSString
+        let safeRange = NSIntersectionRange(composerSelectionRange, NSRange(location: 0, length: nsText.length))
+        guard safeRange.length > 0 else { return "" }
+        return nsText.substring(with: safeRange)
+    }
+
+    private var resolvedPreviewURL: URL? {
+        linkPreview.resolvedURL(in: composerDraftText)
+    }
+
+    private var resolvedLinkPreviewForDraft: MessageLinkPreview? {
+        guard composerDetectedLinks.isEmpty == false else { return nil }
+        return MessageLinkPreview(selectedURL: resolvedPreviewURL, isDisabled: linkPreview.isDisabled)
     }
 
     @ViewBuilder
@@ -431,11 +509,34 @@ struct MessageComposerView: View {
                 .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
                 .transition(.scale(scale: 0.96, anchor: .center).combined(with: .opacity))
             } else {
-                HStack(spacing: 10) {
-                    TextField("composer.placeholder".localized, text: $draftText, axis: .vertical)
-                        .textFieldStyle(.plain)
-                        .lineLimit(1 ... 5)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                HStack(alignment: .center, spacing: 10) {
+                    ZStack(alignment: .topLeading) {
+                        ComposerRichTextView(
+                            text: $composerDraftText,
+                            selectedRange: $composerSelectionRange,
+                            measuredHeight: $composerMeasuredHeight,
+                            textColor: UIColor(composerTextColor),
+                            tintColor: UIColor(PrimeTheme.Colors.accent),
+                            minimumHeight: 22,
+                            maximumHeight: 22 * 5 + 6,
+                            onApplyMarkup: { openingTag, closingTag, placeholder in
+                                applyMarkup(openingTag: openingTag, closingTag: closingTag, placeholder: placeholder)
+                            },
+                            onInsertLink: {
+                                customLinkDisplayText = selectedComposerText.isEmpty ? "Link" : selectedComposerText
+                                customLinkURLString = ""
+                                isShowingCustomLinkSheet = true
+                            }
+                        )
+                        .frame(maxWidth: .infinity, minHeight: 22, maxHeight: composerMeasuredHeight, alignment: .leading)
+
+                        if composerDraftText.isEmpty {
+                            Text("composer.placeholder".localized)
+                                .foregroundStyle(composerTextColor.opacity(0.58))
+                                .padding(.top, 1)
+                                .allowsHitTesting(false)
+                        }
+                    }
 
                     trailingComposerControl
                 }
@@ -445,13 +546,14 @@ struct MessageComposerView: View {
                 .transition(.scale(scale: 0.96, anchor: .center).combined(with: .opacity))
             }
         }
-        .frame(height: composerControlSize, alignment: .center)
+        .frame(minHeight: composerControlSize, alignment: .center)
         .background(
             Capsule(style: .continuous)
-                .fill(Color.black.opacity(0.5))
+                .fill(composerInputFillColor)
         )
         .frame(maxWidth: .infinity, alignment: .leading)
         .animation(.spring(response: 0.32, dampingFraction: 0.86), value: recorder.isRecording)
+        .animation(.spring(response: 0.24, dampingFraction: 0.9), value: composerDraftText)
     }
 
     @ViewBuilder
@@ -523,7 +625,9 @@ struct MessageComposerView: View {
             .buttonStyle(.plain)
 
             Button {
-                stopTapRecording()
+                Task {
+                    await stopTapRecording()
+                }
             } label: {
                 Image(systemName: "stop.fill")
                     .font(.system(size: isCompact ? 12 : 13, weight: .bold))
@@ -567,7 +671,9 @@ struct MessageComposerView: View {
                         await send()
                     }
                 } else if recorder.isRecording {
-                    stopTapRecording()
+                    Task {
+                        await stopTapRecording()
+                    }
                 }
             } label: {
                 Image(systemName: recorder.isRecording ? "stop.fill" : "arrow.right")
@@ -581,11 +687,29 @@ struct MessageComposerView: View {
     }
 
     private var microphoneTintColor: Color {
-        colorScheme == .light ? Color.white.opacity(0.96) : PrimeTheme.Colors.textSecondary
+        colorScheme == .light ? PrimeTheme.Colors.textSecondary : PrimeTheme.Colors.textSecondary
     }
 
     private var sendControlTintColor: Color {
-        colorScheme == .light ? Color.white.opacity(0.82) : PrimeTheme.Colors.textSecondary.opacity(0.62)
+        colorScheme == .light ? PrimeTheme.Colors.textSecondary.opacity(0.8) : PrimeTheme.Colors.textSecondary.opacity(0.62)
+    }
+
+    private var composerTextColor: Color {
+        colorScheme == .light ? PrimeTheme.Colors.textPrimary : Color.white
+    }
+
+    private var composerInputFillColor: Color {
+        colorScheme == .light ? Color.white.opacity(0.98) : Color.black.opacity(0.5)
+    }
+
+    private var composerContainerFillColor: Color {
+        colorScheme == .light ? Color.white.opacity(0.94) : Color.black.opacity(0.38)
+    }
+
+    private var composerContainerStrokeColor: Color {
+        colorScheme == .light
+            ? PrimeTheme.Colors.bubbleIncomingBorder.opacity(0.96)
+            : PrimeTheme.Colors.accentSoft.opacity(0.84)
     }
 
     private var recordingEqualizerSamples: [CGFloat] {
@@ -693,7 +817,7 @@ struct MessageComposerView: View {
     private func toggleTapRecording() async {
         do {
             if recorder.isRecording {
-                let recordedVoiceMessage = try recorder.stopRecording()
+                let recordedVoiceMessage = try await recorder.stopRecording()
                 voiceMessage = recordedVoiceMessage
                 composerError = recordedVoiceMessage == nil ? "Voice recording was interrupted. Please record again." : ""
             } else {
@@ -705,9 +829,9 @@ struct MessageComposerView: View {
         }
     }
 
-    private func stopTapRecording() {
+    private func stopTapRecording() async {
         do {
-            let recordedVoiceMessage = try recorder.stopRecording()
+            let recordedVoiceMessage = try await recorder.stopRecording()
             voiceMessage = recordedVoiceMessage
             composerError = recordedVoiceMessage == nil ? "Voice recording was interrupted. Please record again." : ""
         } catch {
@@ -784,7 +908,7 @@ struct MessageComposerView: View {
         }
 
         do {
-            guard let recordedVoiceMessage = try recorder.stopRecording() else {
+            guard let recordedVoiceMessage = try await recorder.stopRecording() else {
                 isHoldRecording = false
                 composerError = "Voice recording was interrupted. Please record again."
                 return
@@ -793,6 +917,7 @@ struct MessageComposerView: View {
             let draft = OutgoingMessageDraft(
                 text: "",
                 attachments: [],
+                linkPreview: nil,
                 voiceMessage: recordedVoiceMessage,
                 replyToMessageID: replyMessage?.id,
                 replyPreview: replyMessage.map(makeReplyPreviewSnapshot(for:)),
@@ -822,8 +947,9 @@ struct MessageComposerView: View {
     @MainActor
     private func send() async {
         let draft = OutgoingMessageDraft(
-            text: draftText,
+            text: composerDraftText,
             attachments: attachments,
+            linkPreview: resolvedLinkPreviewForDraft,
             voiceMessage: voiceMessage,
             replyToMessageID: replyMessage?.id,
             replyPreview: replyMessage.map(makeReplyPreviewSnapshot(for:)),
@@ -835,9 +961,11 @@ struct MessageComposerView: View {
 
         do {
             try await onSend(draft)
-            draftText = ""
+            commitComposerDraftText("")
             attachments = []
             voiceMessage = nil
+            linkPreview = MessageLinkPreview()
+            composerSelectionRange = NSRange(location: 0, length: 0)
             deliveryOptions = MessageDeliveryOptions()
             composerError = ""
         } catch {
@@ -859,6 +987,7 @@ struct MessageComposerView: View {
             let draft = OutgoingMessageDraft(
                 text: "",
                 attachments: [attachment],
+                linkPreview: nil,
                 voiceMessage: nil,
                 replyToMessageID: replyMessage?.id,
                 replyPreview: replyMessage.map(makeReplyPreviewSnapshot(for:)),
@@ -882,6 +1011,7 @@ struct MessageComposerView: View {
         let draft = OutgoingMessageDraft(
             text: submission.caption,
             attachments: [attachment],
+            linkPreview: resolvedLinkPreviewForDraft,
             voiceMessage: nil,
             replyToMessageID: replyMessage?.id,
             replyPreview: replyMessage.map(makeReplyPreviewSnapshot(for:)),
@@ -890,8 +1020,63 @@ struct MessageComposerView: View {
         )
 
         try await onSend(draft)
-        draftText = ""
+        commitComposerDraftText("")
         composerError = ""
+    }
+
+    private func reconcileLinkPreviewState(for text: String) {
+        let detectedLinks = RichMessageText.detectedURLs(in: text)
+        guard detectedLinks.isEmpty == false else {
+            linkPreview = MessageLinkPreview()
+            return
+        }
+
+        if let selectedURL = linkPreview.selectedURL,
+           detectedLinks.contains(where: { $0.absoluteString.caseInsensitiveCompare(selectedURL.absoluteString) == .orderedSame }) == false {
+            linkPreview.selectedURL = detectedLinks.first
+        } else if linkPreview.selectedURL == nil {
+            linkPreview.selectedURL = detectedLinks.first
+        }
+    }
+
+    private func applyMarkup(openingTag: String, closingTag: String, placeholder: String) {
+        let nsText = composerDraftText as NSString
+        let fullRange = NSRange(location: 0, length: nsText.length)
+        let safeRange = NSIntersectionRange(composerSelectionRange, fullRange)
+        let selectedText = safeRange.length > 0 ? nsText.substring(with: safeRange) : placeholder
+        let replacement = openingTag + selectedText + closingTag
+        let updatedText = nsText.replacingCharacters(in: safeRange, with: replacement)
+        commitComposerDraftText(updatedText)
+
+        let contentLength = (selectedText as NSString).length
+        composerSelectionRange = NSRange(
+            location: safeRange.location + (openingTag as NSString).length,
+            length: contentLength
+        )
+    }
+
+    private func insertCustomLinkMarkup() {
+        let trimmedURL = customLinkURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedURL.isEmpty == false else { return }
+
+        let normalizedURL: String
+        if trimmedURL.lowercased().hasPrefix("http://") || trimmedURL.lowercased().hasPrefix("https://") {
+            normalizedURL = trimmedURL
+        } else {
+            normalizedURL = "https://" + trimmedURL
+        }
+
+        let displayText = customLinkDisplayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? normalizedURL
+            : customLinkDisplayText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let markup = #"<a href="\#(normalizedURL)">\#(displayText)</a>"#
+
+        let nsText = composerDraftText as NSString
+        let safeRange = NSIntersectionRange(composerSelectionRange, NSRange(location: 0, length: nsText.length))
+        let updatedText = nsText.replacingCharacters(in: safeRange, with: markup)
+        commitComposerDraftText(updatedText)
+        composerSelectionRange = NSRange(location: safeRange.location + (markup as NSString).length, length: 0)
+        isShowingCustomLinkSheet = false
     }
 
     private var deliveryOptionsBanner: some View {
@@ -996,7 +1181,8 @@ struct MessageComposerView: View {
             return structuredContent.previewText
         }
 
-        if let text = message.text?.trimmingCharacters(in: .whitespacesAndNewlines), text.isEmpty == false {
+        let text = RichMessageText.plainText(from: message.text).trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty == false {
             return text
         }
 
@@ -1137,7 +1323,9 @@ struct MessageComposerView: View {
                 .buttonStyle(.plain)
 
                 Button {
-                    stopTapRecording()
+                    Task {
+                        await stopTapRecording()
+                    }
                 } label: {
                     Text("Preview")
                         .font(.caption.weight(.semibold))
@@ -1423,9 +1611,67 @@ struct MessageComposerView: View {
     }
 
     private func composedText(appending newBlock: String) -> String {
-        let trimmedExisting = draftText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedExisting = composerDraftText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmedExisting.isEmpty == false else { return newBlock }
         return "\(trimmedExisting)\n\n\(newBlock)"
+    }
+
+    @MainActor
+    private func synchronizeComposerDraftText(force: Bool = false) {
+        guard force || draftText != composerDraftText else { return }
+        composerDraftText = draftText
+    }
+
+    @MainActor
+    private func scheduleDraftBindingSync(to newValue: String) {
+        draftBindingSyncTask?.cancel()
+        draftBindingSyncTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(260))
+            guard Task.isCancelled == false else { return }
+            guard draftText != newValue else { return }
+            draftText = newValue
+        }
+    }
+
+    @MainActor
+    private func commitComposerDraftText(_ newValue: String) {
+        draftBindingSyncTask?.cancel()
+        composerDraftText = newValue
+        if draftText != newValue {
+            draftText = newValue
+        }
+    }
+
+    @MainActor
+    private func applyIncomingSharedDraftIfNeeded() {
+        guard let incomingSharedDraft else { return }
+
+        if let normalizedText = incomingSharedDraft.normalizedText {
+            commitComposerDraftText(composedText(appending: normalizedText))
+        }
+
+        if incomingSharedDraft.attachments.isEmpty == false {
+            for attachment in incomingSharedDraft.attachments {
+                let alreadyPresent = attachments.contains {
+                    if $0.id == attachment.id {
+                        return true
+                    }
+                    if let lhs = $0.localURL, let rhs = attachment.localURL, lhs == rhs {
+                        return true
+                    }
+                    return $0.fileName == attachment.fileName && $0.byteSize == attachment.byteSize
+                }
+                if alreadyPresent == false {
+                    attachments.append(attachment)
+                }
+            }
+        }
+
+        if voiceMessage == nil, let sharedVoiceMessage = incomingSharedDraft.voiceMessage {
+            voiceMessage = sharedVoiceMessage
+        }
+
+        onConsumeIncomingSharedDraft()
     }
 
     @MainActor
@@ -2819,15 +3065,11 @@ private struct ComposerMediaEditorSheet: View {
         guard isSending == false else { return }
         isSending = true
 
-        do {
-            let submission = await buildSubmission()
-            let sendAction = onSend
-            closeEditor()
-            Task {
-                try? await sendAction(submission)
-            }
-        } catch {
-            errorText = error.localizedDescription.isEmpty ? "Could not send this media." : error.localizedDescription
+        let submission = await buildSubmission()
+        let sendAction = onSend
+        closeEditor()
+        Task {
+            try? await sendAction(submission)
         }
 
         if isSending {
@@ -3015,7 +3257,7 @@ private struct ComposerPhotoCanvas: View {
     }
 }
 
-private func renderEditedPhotoData(
+nonisolated private func renderEditedPhotoData(
     from data: Data,
     cropPreset: ComposerPhotoCropPreset,
     cropRect: CGRect,
@@ -3071,8 +3313,10 @@ private func renderTrimmedVideoSource(
         exportSession.timeRange = CMTimeRange(start: exportStart, duration: exportDuration)
         exportSession.shouldOptimizeForNetworkUse = true
 
+        let exportSessionBox = ComposerUncheckedSendableBox(exportSession)
         return await withCheckedContinuation { continuation in
-            exportSession.exportAsynchronously {
+            exportSession.exportAsynchronously { [exportSessionBox] in
+                let exportSession = exportSessionBox.value
                 switch exportSession.status {
                 case .completed:
                     continuation.resume(
@@ -3276,14 +3520,22 @@ private struct ComposerAVPlayerSurface: UIViewRepresentable {
 
     func makeUIView(context: Context) -> ComposerPlayerContainerView {
         let view = ComposerPlayerContainerView()
-        view.playerLayer.player = player
-        view.playerLayer.videoGravity = videoGravity
+        if let playerLayer = view.playerLayer {
+            playerLayer.player = player
+            playerLayer.videoGravity = videoGravity
+        } else {
+            assertionFailure("Expected AVPlayerLayer backing layer")
+        }
         return view
     }
 
     func updateUIView(_ uiView: ComposerPlayerContainerView, context: Context) {
-        uiView.playerLayer.player = player
-        uiView.playerLayer.videoGravity = videoGravity
+        if let playerLayer = uiView.playerLayer {
+            playerLayer.player = player
+            playerLayer.videoGravity = videoGravity
+        } else {
+            assertionFailure("Expected AVPlayerLayer backing layer")
+        }
     }
 }
 
@@ -3292,11 +3544,8 @@ private final class ComposerPlayerContainerView: UIView {
         AVPlayerLayer.self
     }
 
-    var playerLayer: AVPlayerLayer {
-        guard let layer = layer as? AVPlayerLayer else {
-            fatalError("Expected AVPlayerLayer")
-        }
-        return layer
+    var playerLayer: AVPlayerLayer? {
+        layer as? AVPlayerLayer
     }
 }
 
@@ -3908,7 +4157,7 @@ private extension Color {
 }
 
 private extension UIImage {
-    func cropped(using preset: ComposerPhotoCropPreset, normalizedRect: CGRect) -> UIImage {
+    nonisolated func cropped(using preset: ComposerPhotoCropPreset, normalizedRect: CGRect) -> UIImage {
         let imageSize = size
         let adjustedRect = CGRect(
             x: normalizedRect.minX * imageSize.width,
@@ -3924,7 +4173,7 @@ private extension UIImage {
         return UIImage(cgImage: croppedCGImage, scale: scale, orientation: imageOrientation)
     }
 
-    func applyingAdjustments(_ adjustments: ComposerPhotoAdjustmentValues) -> UIImage {
+    nonisolated func applyingAdjustments(_ adjustments: ComposerPhotoAdjustmentValues) -> UIImage {
         guard let ciImage = CIImage(image: self) else { return self }
         let filter = CIFilter.colorControls()
         filter.inputImage = ciImage
@@ -3940,7 +4189,7 @@ private extension UIImage {
         return UIImage(cgImage: cgImage, scale: scale, orientation: imageOrientation)
     }
 
-    func rendering(strokes: [ComposerPhotoStroke]) -> UIImage {
+    nonisolated func rendering(strokes: [ComposerPhotoStroke]) -> UIImage {
         guard strokes.isEmpty == false else { return self }
         let format = UIGraphicsImageRendererFormat.default()
         format.scale = scale

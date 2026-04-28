@@ -12,6 +12,7 @@ struct Message: Identifiable, Codable, Hashable {
     var kind: MessageKind
     var text: String?
     var attachments: [Attachment]
+    var linkPreview: MessageLinkPreview?
     var replyToMessageID: UUID?
     var replyPreview: ReplyPreviewSnapshot?
     var communityContext: CommunityMessageContext?
@@ -36,6 +37,7 @@ struct Message: Identifiable, Codable, Hashable {
         case kind
         case text
         case attachments
+        case linkPreview
         case replyToMessageID
         case replyPreview
         case communityContext
@@ -61,6 +63,7 @@ struct Message: Identifiable, Codable, Hashable {
         kind: MessageKind,
         text: String?,
         attachments: [Attachment],
+        linkPreview: MessageLinkPreview? = nil,
         replyToMessageID: UUID?,
         replyPreview: ReplyPreviewSnapshot? = nil,
         communityContext: CommunityMessageContext? = nil,
@@ -84,6 +87,7 @@ struct Message: Identifiable, Codable, Hashable {
         self.kind = kind
         self.text = text
         self.attachments = attachments
+        self.linkPreview = linkPreview
         self.replyToMessageID = replyToMessageID
         self.replyPreview = replyPreview
         self.communityContext = communityContext
@@ -111,6 +115,7 @@ struct Message: Identifiable, Codable, Hashable {
         kind = try container.decode(MessageKind.self, forKey: .kind)
         text = try container.decodeIfPresent(String.self, forKey: .text)
         attachments = try container.decodeIfPresent([Attachment].self, forKey: .attachments) ?? []
+        linkPreview = try container.decodeIfPresent(MessageLinkPreview.self, forKey: .linkPreview)
         replyToMessageID = try container.decodeIfPresent(UUID.self, forKey: .replyToMessageID)
         replyPreview = try container.decodeIfPresent(ReplyPreviewSnapshot.self, forKey: .replyPreview)
         communityContext = try container.decodeIfPresent(CommunityMessageContext.self, forKey: .communityContext)
@@ -139,6 +144,7 @@ struct Message: Identifiable, Codable, Hashable {
 struct OutgoingMessageDraft: Codable, Hashable {
     var text: String
     var attachments: [Attachment]
+    var linkPreview: MessageLinkPreview?
     var voiceMessage: VoiceMessage?
     var replyToMessageID: UUID?
     var replyPreview: ReplyPreviewSnapshot?
@@ -151,6 +157,7 @@ struct OutgoingMessageDraft: Codable, Hashable {
     init(
         text: String = "",
         attachments: [Attachment] = [],
+        linkPreview: MessageLinkPreview? = nil,
         voiceMessage: VoiceMessage? = nil,
         replyToMessageID: UUID? = nil,
         replyPreview: ReplyPreviewSnapshot? = nil,
@@ -162,6 +169,7 @@ struct OutgoingMessageDraft: Codable, Hashable {
     ) {
         self.text = text
         self.attachments = attachments
+        self.linkPreview = linkPreview
         self.voiceMessage = voiceMessage
         self.replyToMessageID = replyToMessageID
         self.replyPreview = replyPreview
@@ -184,6 +192,23 @@ struct OutgoingMessageDraft: Codable, Hashable {
     func isScheduledForFuture(relativeTo date: Date = .now) -> Bool {
         guard let scheduledAt = deliveryOptions.scheduledAt else { return false }
         return scheduledAt > date
+    }
+}
+
+struct MessageLinkPreview: Codable, Hashable {
+    var selectedURL: URL?
+    var isDisabled: Bool
+
+    init(selectedURL: URL? = nil, isDisabled: Bool = false) {
+        self.selectedURL = selectedURL
+        self.isDisabled = isDisabled
+    }
+
+    func resolvedURL(in rawText: String?) -> URL? {
+        if let selectedURL {
+            return selectedURL
+        }
+        return RichMessageText.detectedURLs(in: rawText).first
     }
 }
 

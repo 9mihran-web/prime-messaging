@@ -1,7 +1,7 @@
 import Foundation
 
 extension KeyedDecodingContainer {
-    func decodeLossyURLIfPresent(forKey key: Key) -> URL? {
+    nonisolated func decodeLossyURLIfPresent(forKey key: Key) -> URL? {
         if let decodedURL = try? decodeIfPresent(URL.self, forKey: key) {
             return decodedURL
         }

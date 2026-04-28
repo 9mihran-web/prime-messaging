@@ -6,6 +6,63 @@ struct AccountLookupResult: Codable, Hashable {
     var displayName: String?
 }
 
+enum OTPPurpose: String, Codable, Hashable, Sendable {
+    case signup
+    case login
+    case resetPassword = "reset_password"
+}
+
+struct OTPChallenge: Codable, Hashable, Sendable {
+    var challengeID: String
+    var expiresAt: Date
+    var resendAvailableAt: Date
+    var attemptLimit: Int
+    var remainingAttempts: Int
+    var channel: String
+    var destinationMasked: String
+
+    enum CodingKeys: String, CodingKey {
+        case challengeID = "challenge_id"
+        case expiresAt = "expires_at"
+        case resendAvailableAt = "resend_available_at"
+        case attemptLimit = "attempt_limit"
+        case remainingAttempts = "remaining_attempts"
+        case channel
+        case destinationMasked = "destination_masked"
+    }
+}
+
+struct AppleSignInResult: Codable, Equatable, Sendable {
+    var user: User
+    var isNewUser: Bool
+}
+
+struct DeviceContactCandidate: Codable, Hashable, Sendable {
+    var localContactID: String
+    var displayName: String
+    var emails: [String]
+    var phones: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case localContactID = "local_contact_id"
+        case displayName = "display_name"
+        case emails
+        case phones
+    }
+}
+
+struct MatchedDeviceContact: Codable, Equatable, Sendable {
+    var localContactID: String
+    var user: User
+    var matchedBy: String
+
+    enum CodingKeys: String, CodingKey {
+        case localContactID = "local_contact_id"
+        case user
+        case matchedBy = "matched_by"
+    }
+}
+
 struct ChatModeTransitionRequest {
     var fromMode: ChatMode
     var toMode: ChatMode
@@ -19,26 +76,46 @@ struct ChatModeTransitionResult {
 
 protocol AuthRepository {
     func currentUser() async throws -> User
+    func signInWithApple(
+        identityToken: String,
+        authorizationCode: String?,
+        appleUserID: String,
+        email: String?,
+        givenName: String?,
+        familyName: String?
+    ) async throws -> AppleSignInResult
+    func matchDeviceContacts(
+        _ contacts: [DeviceContactCandidate],
+        currentUserID: UUID
+    ) async throws -> [MatchedDeviceContact]
     func signUp(
         displayName: String,
         username: String,
         password: String,
         contactValue: String,
         methodType: IdentityMethodType,
-        accountKind: AccountKind
+        accountKind: AccountKind,
+        otpChallengeID: String?,
+        signupEmail: String?
     ) async throws -> User
     func lookupAccount(identifier: String) async throws -> AccountLookupResult
-    func authenticate(identifier: String, otpCode: String) async throws -> User?
+    func requestOTP(identifier: String, purpose: OTPPurpose) async throws -> OTPChallenge
+    func verifyOTPChallenge(challengeID: String, otpCode: String) async throws -> OTPChallenge
+    func authenticate(identifier: String, otpCode: String, challengeID: String?) async throws -> User?
     func logIn(identifier: String, password: String) async throws -> User
-    func resetPassword(identifier: String, newPassword: String) async throws
+    func resetPassword(identifier: String, newPassword: String, challengeID: String?) async throws
     func refreshUser(userID: UUID) async throws -> User
     func userProfile(userID: UUID) async throws -> User
     func updateProfile(_ profile: Profile, for userID: UUID) async throws -> User
     func uploadAvatar(imageData: Data, for userID: UUID) async throws -> User
     func removeAvatar(for userID: UUID) async throws -> User
     func updatePassword(_ password: String, for userID: UUID) async throws
+    func updatePassword(currentPassword: String?, newPassword: String, for userID: UUID) async throws
     func deleteAccount(userID: UUID) async throws
     func searchUsers(query: String, excluding userID: UUID) async throws -> [User]
+    func fetchBlockedUsers(for userID: UUID) async throws -> [User]
+    func blockUser(_ blockedUserID: UUID, for blockerUserID: UUID) async throws
+    func unblockUser(_ blockedUserID: UUID, for blockerUserID: UUID) async throws
 }
 
 protocol ChatRepository {
@@ -105,6 +182,7 @@ protocol ChatRepository {
         requesterID: UUID
     ) async throws -> ModerationDashboard
     func createNearbyChat(with peer: OfflinePeer, currentUser: User) async throws -> Chat
+    func importExternalHistory(_ messages: [Message], into chat: Chat, currentUser: User) async throws -> Chat
     func saveDraft(_ draft: Draft) async throws
     func prepareModeTransition(_ request: ChatModeTransitionRequest) async throws -> ChatModeTransitionResult
     func retryPendingOutgoingMessages(currentUserID: UUID) async
@@ -121,16 +199,54 @@ protocol CallRepository {
     func fetchCallHistory(for userID: UUID) async throws -> [InternetCall]
     func fetchCall(_ callID: UUID, for userID: UUID) async throws -> InternetCall
     func startAudioCall(with calleeID: UUID, from callerID: UUID) async throws -> InternetCall
+    func fetchActiveGroupCall(in chatID: UUID, userID: UUID) async throws -> InternetCall?
+    func fetchGroupCall(_ callID: UUID, userID: UUID) async throws -> InternetCall
+    func startGroupAudioCall(in chatID: UUID, from callerID: UUID) async throws -> InternetCall
+    func joinGroupCall(_ callID: UUID, userID: UUID) async throws -> InternetCall
+    func leaveGroupCall(_ callID: UUID, userID: UUID) async throws -> InternetCall
     func answerCall(_ callID: UUID, userID: UUID) async throws -> InternetCall
     func rejectCall(_ callID: UUID, userID: UUID) async throws -> InternetCall
     func endCall(_ callID: UUID, userID: UUID) async throws -> InternetCall
     func fetchEvents(callID: UUID, userID: UUID, sinceSequence: Int) async throws -> [InternetCallEvent]
+    func fetchGroupEvents(callID: UUID, userID: UUID, sinceSequence: Int) async throws -> [InternetCallEvent]
     func sendOffer(_ sdp: String, in callID: UUID, userID: UUID) async throws -> InternetCallEvent
+    func sendGroupOffer(
+        _ sdp: String,
+        to targetUserID: UUID,
+        in callID: UUID,
+        userID: UUID
+    ) async throws -> InternetCallEvent
     func sendAnswer(_ sdp: String, in callID: UUID, userID: UUID) async throws -> InternetCallEvent
+    func sendGroupAnswer(
+        _ sdp: String,
+        to targetUserID: UUID,
+        in callID: UUID,
+        userID: UUID
+    ) async throws -> InternetCallEvent
     func sendICECandidate(
         _ candidate: String,
         sdpMid: String?,
         sdpMLineIndex: Int?,
+        in callID: UUID,
+        userID: UUID
+    ) async throws -> InternetCallEvent
+    func sendGroupICECandidate(
+        _ candidate: String,
+        to targetUserID: UUID,
+        sdpMid: String?,
+        sdpMLineIndex: Int?,
+        in callID: UUID,
+        userID: UUID
+    ) async throws -> InternetCallEvent
+    func sendMediaState(
+        isMuted: Bool,
+        isVideoEnabled: Bool,
+        in callID: UUID,
+        userID: UUID
+    ) async throws -> InternetCallEvent
+    func sendGroupMediaState(
+        isMuted: Bool,
+        isVideoEnabled: Bool,
         in callID: UUID,
         userID: UUID
     ) async throws -> InternetCallEvent
@@ -206,6 +322,12 @@ protocol LocalStore {
 }
 
 extension ChatRepository {
+    func importExternalHistory(_ messages: [Message], into chat: Chat, currentUser: User) async throws -> Chat {
+        _ = messages
+        _ = currentUser
+        return chat
+    }
+
     func sendMessage(_ draft: OutgoingMessageDraft, in chat: Chat, senderID: UUID) async throws -> Message {
         try await sendMessage(draft, in: chat.id, mode: chat.mode, senderID: senderID)
     }

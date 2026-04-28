@@ -1,0 +1,18 @@
+{
+  "applinks": {
+    "details": [
+      {
+        "appIDs": ["8HCKMUYNCN.prime1.prime-Messaging"],
+        "components": [
+          { "/": "/@*" },
+          { "/": "/u/*" },
+          { "/": "/user/*" },
+          { "/": "/c/*" },
+          { "/": "/g/*" },
+          { "/": "/join/*" },
+          { "/": "/share" }
+        ]
+      }
+    ]
+  }
+}

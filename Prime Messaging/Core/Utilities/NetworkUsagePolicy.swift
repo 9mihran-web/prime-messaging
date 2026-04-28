@@ -151,10 +151,52 @@ enum NetworkUsagePolicy {
         case mediaDownloads
         case mediaUploads
         case autoDownload(MediaAutoDownloadKind)
+
+        nonisolated var cacheKey: String {
+            switch self {
+            case .general:
+                return "general"
+            case .chatSync:
+                return "chat_sync"
+            case .mediaDownloads:
+                return "media_downloads"
+            case .mediaUploads:
+                return "media_uploads"
+            case let .autoDownload(kind):
+                return "auto_download:\(kind.rawValue)"
+            }
+        }
+
+        nonisolated static func == (lhs: AccessKind, rhs: AccessKind) -> Bool {
+            switch (lhs, rhs) {
+            case (.general, .general), (.chatSync, .chatSync), (.mediaDownloads, .mediaDownloads), (.mediaUploads, .mediaUploads):
+                return true
+            case let (.autoDownload(lhsKind), .autoDownload(rhsKind)):
+                return lhsKind == rhsKind
+            default:
+                return false
+            }
+        }
+
+        nonisolated func hash(into hasher: inout Hasher) {
+            switch self {
+            case .general:
+                hasher.combine(0)
+            case .chatSync:
+                hasher.combine(1)
+            case .mediaDownloads:
+                hasher.combine(2)
+            case .mediaUploads:
+                hasher.combine(3)
+            case let .autoDownload(kind):
+                hasher.combine(4)
+                hasher.combine(kind.rawValue)
+            }
+        }
     }
 
     nonisolated static func allowsCellularSync(defaults: UserDefaults = .standard) -> Bool {
-        defaults.object(forKey: StorageKeys.allowsCellularSync) as? Bool ?? false
+        defaults.object(forKey: StorageKeys.allowsCellularSync) as? Bool ?? true
     }
 
     nonisolated static func setAllowsCellularSync(_ allows: Bool, defaults: UserDefaults = .standard) {
@@ -162,7 +204,7 @@ enum NetworkUsagePolicy {
     }
 
     nonisolated static func allowsCellularMediaDownloads(defaults: UserDefaults = .standard) -> Bool {
-        defaults.object(forKey: StorageKeys.allowsCellularMediaDownloads) as? Bool ?? false
+        defaults.object(forKey: StorageKeys.allowsCellularMediaDownloads) as? Bool ?? true
     }
 
     nonisolated static func setAllowsCellularMediaDownloads(_ allows: Bool, defaults: UserDefaults = .standard) {
@@ -170,7 +212,7 @@ enum NetworkUsagePolicy {
     }
 
     nonisolated static func allowsCellularMediaUploads(defaults: UserDefaults = .standard) -> Bool {
-        defaults.object(forKey: StorageKeys.allowsCellularMediaUploads) as? Bool ?? false
+        defaults.object(forKey: StorageKeys.allowsCellularMediaUploads) as? Bool ?? true
     }
 
     nonisolated static func setAllowsCellularMediaUploads(_ allows: Bool, defaults: UserDefaults = .standard) {
@@ -316,12 +358,8 @@ enum NetworkUsagePolicy {
     }
 
     private nonisolated static func defaultAutoDownloadRule(for kind: MediaAutoDownloadKind) -> MediaAutoDownloadRule {
-        switch kind {
-        case .files:
-            return .never
-        case .photos, .videos, .voiceMessages:
-            return .wifiOnly
-        }
+        _ = kind
+        return .wifiAndCellular
     }
 
     private nonisolated static func defaultUploadQuality(

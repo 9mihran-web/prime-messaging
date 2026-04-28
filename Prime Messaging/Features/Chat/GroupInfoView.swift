@@ -18,6 +18,7 @@ struct GroupInfoView: View {
     @Environment(\.appEnvironment) private var environment
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var appState: AppState
+    @ObservedObject private var groupCallManager = GroupInternetCallManager.shared
 
     @State private var title: String
     @State private var query = ""
@@ -35,6 +36,8 @@ struct GroupInfoView: View {
     @State private var selectedMemberProfile: User?
     @State private var soundMode: ChatMuteState = .active
     @State private var isShowingEditGroupScreen = false
+    @State private var isShowingGroupCallRoom = false
+    @State private var isStartingGroupCall = false
     @State private var moderationSettings = GroupModerationSettings()
     @State private var moderationEntryQuestionsText = ""
     @State private var isSavingModeration = false
@@ -45,6 +48,8 @@ struct GroupInfoView: View {
     @State private var unbanningUserIDs = Set<UUID>()
     @State private var isUpdatingOfficialBadge = false
     @State private var isUpdatingCommunitySettings = false
+    @State private var publicHandleDraft = ""
+    @State private var isSavingPublicHandle = false
     @State private var resolvedGroup: Group?
     @State private var resolvedCommunityDetails: CommunityChatDetails?
 
@@ -168,7 +173,11 @@ struct GroupInfoView: View {
         .onChange(of: chat.communityDetails) { newValue in
             if let newValue {
                 resolvedCommunityDetails = newValue
+                publicHandleDraft = newValue.publicHandle ?? ""
             }
+        }
+        .task {
+            publicHandleDraft = chat.communityDetails?.publicHandle ?? resolvedCommunityDetails?.publicHandle ?? ""
         }
         .sheet(item: $selectedMemberProfile) { user in
             NavigationStack {
@@ -188,6 +197,9 @@ struct GroupInfoView: View {
             } onDelete: {
                 try await deleteGroup()
             }
+        }
+        .navigationDestination(isPresented: $isShowingGroupCallRoom) {
+            GroupCallRoomView(chat: chat)
         }
     }
 
@@ -215,14 +227,17 @@ struct GroupInfoView: View {
 
     private var groupActionRow: some View {
         HStack(spacing: 10) {
-            actionButton(title: "Call", systemName: "phone.fill") {
-                statusMessage = "Direct calls are available from a member profile."
+            actionButton(title: currentGroupCallButtonTitle, systemName: "phone.fill") {
+                Task {
+                    await startOrOpenGroupCall()
+                }
             }
+            .disabled(isStartingGroupCall)
             .frame(maxWidth: .infinity)
 
             soundMenuButton
 
-            actionButton(title: "Search", systemName: "magnifyingglass") {
+            actionButton(title: "common.search".localized, systemName: "magnifyingglass") {
                 onRequestSearch?()
                 if onRequestSearch == nil {
                     statusMessage = "Chat search is only available from the chat screen."
@@ -257,7 +272,7 @@ struct GroupInfoView: View {
             }
         } label: {
             actionButtonLabel(
-                title: "Sound",
+                title: "common.sound".localized,
                 systemName: soundMode == .active ? "bell.fill" : "bell.slash.fill"
             )
         }
@@ -281,6 +296,10 @@ struct GroupInfoView: View {
                 selectedSection = "Media"
             }
 
+            Button("Open call room") {
+                isShowingGroupCallRoom = true
+            }
+
             Button(copyEntityNameTitle) {
                 #if os(tvOS)
                 statusMessage = "Copy is unavailable on Apple TV."
@@ -290,7 +309,7 @@ struct GroupInfoView: View {
                 #endif
             }
         } label: {
-            actionButtonLabel(title: "More", systemName: "ellipsis.circle")
+            actionButtonLabel(title: "common.more".localized, systemName: "ellipsis.circle")
         }
         .buttonStyle(.plain)
         .frame(maxWidth: .infinity)
@@ -298,7 +317,7 @@ struct GroupInfoView: View {
 
     private var groupSettingsCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("\(entityTitle) Settings")
+            Text(String(format: "community.settings_title".localized, entityTitle))
                 .font(.system(.headline, design: .rounded).weight(.semibold))
                 .foregroundStyle(PrimeTheme.Colors.textPrimary)
 
@@ -311,6 +330,9 @@ struct GroupInfoView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     communityInfoRow(title: "Type", value: communityDetails.kind.title, systemName: communityDetails.symbolName)
                     communityInfoRow(title: "Visibility", value: communityDetails.isPublic ? "Public" : "Private", systemName: communityDetails.isPublic ? "globe" : "lock.fill")
+                    if let publicLink {
+                        communityInfoRow(title: "Public link", value: publicLink.absoluteString, systemName: "link")
+                    }
                     communityInfoRow(title: "Threads", value: communityDetails.forumModeEnabled ? "Forum mode enabled" : "Linear chat", systemName: communityDetails.forumModeEnabled ? "text.bubble.fill" : "text.bubble")
                     communityInfoRow(title: "Replies", value: communityDetails.commentsEnabled ? "Comments enabled" : "Comments disabled", systemName: communityDetails.commentsEnabled ? "bubble.left.and.text.bubble.right.fill" : "bubble.left.and.text.bubble.right")
                     if communityDetails.topics.isEmpty == false {
@@ -318,6 +340,50 @@ struct GroupInfoView: View {
                     }
 
                     if canManageGroup {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Public username")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(PrimeTheme.Colors.textSecondary)
+                            TextField("your-group-name", text: $publicHandleDraft)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                                .textFieldStyle(.plain)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 10)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                        .fill(PrimeTheme.Colors.background.opacity(0.45))
+                                )
+                            if let publicLink {
+                                Text(publicLink.absoluteString)
+                                    .font(.caption)
+                                    .foregroundStyle(PrimeTheme.Colors.textSecondary)
+                                    #if !os(tvOS)
+                                    .textSelection(.enabled)
+                                    #endif
+                            }
+                            HStack(spacing: 10) {
+                                Button {
+                                    Task { await savePublicHandle() }
+                                } label: {
+                                    settingsPill(title: isSavingPublicHandle ? "Saving..." : "Save username")
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(isSavingPublicHandle)
+
+                                if publicHandleDraft.isEmpty == false || communityDetails.publicHandle != nil {
+                                    Button {
+                                        publicHandleDraft = ""
+                                        Task { await savePublicHandle() }
+                                    } label: {
+                                        settingsPill(title: "Clear")
+                                    }
+                                    .buttonStyle(.plain)
+                                    .disabled(isSavingPublicHandle)
+                                }
+                            }
+                        }
+
                         VStack(alignment: .leading, spacing: 10) {
                             HStack(spacing: 10) {
                                 Button {
@@ -814,20 +880,20 @@ struct GroupInfoView: View {
 
     @ViewBuilder
     private var inviteCard: some View {
-        if let inviteLink = presentedCommunityDetails?.inviteLink {
+        if let shareLink = publicLink ?? presentedCommunityDetails?.inviteLink {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Invite & QR")
                     .font(.system(.headline, design: .rounded).weight(.semibold))
                     .foregroundStyle(PrimeTheme.Colors.textPrimary)
 
-                Text(inviteLink.absoluteString)
+                Text(shareLink.absoluteString)
                     .font(.footnote)
                     .foregroundStyle(PrimeTheme.Colors.textSecondary)
                     #if !os(tvOS)
                     .textSelection(.enabled)
                     #endif
 
-                if let qrImage = qrCodeImage(for: inviteLink.absoluteString) {
+                if let qrImage = qrCodeImage(for: shareLink.absoluteString) {
                     Image(uiImage: qrImage)
                         .interpolation(.none)
                         .resizable()
@@ -845,7 +911,7 @@ struct GroupInfoView: View {
                         #if os(tvOS)
                         statusMessage = "Copy is unavailable on Apple TV."
                         #else
-                        UIPasteboard.general.string = inviteLink.absoluteString
+                        UIPasteboard.general.string = shareLink.absoluteString
                         statusMessage = "Invite link copied."
                         #endif
                     } label: {
@@ -857,7 +923,7 @@ struct GroupInfoView: View {
                     settingsPill(title: "Share unavailable")
                         .opacity(0.6)
                     #else
-                    ShareLink(item: inviteLink.absoluteString) {
+                    ShareLink(item: shareLink.absoluteString) {
                         settingsPill(title: "Share link")
                     }
                     .buttonStyle(.plain)
@@ -1348,11 +1414,11 @@ struct GroupInfoView: View {
     }
 
     private var sectionTabItems: [String] {
-        var items = ["Users"]
+        var items = ["community.section.users".localized]
         if showsTopicsSection {
-            items.append("Topics")
+            items.append("community.section.topics".localized)
         }
-        items.append(contentsOf: ["Media", "Files", "Voices"])
+        items.append(contentsOf: ["common.media".localized, "common.files".localized, "common.voices".localized])
         return items
     }
 
@@ -1375,18 +1441,30 @@ struct GroupInfoView: View {
     private var communityHeadlineText: String {
         let memberCount = presentedGroup?.members.count ?? max(chat.participantIDs.count, 1)
         guard let communityKind = effectiveCommunityKind else {
-            return "\(memberCount) members"
+            return String(format: "community.headline.member.other".localized, memberCount)
         }
 
-        let noun: String
         switch communityKind {
         case .group, .supergroup, .community:
-            noun = memberCount == 1 ? "member" : "members"
+            let key = memberCount == 1 ? "community.headline.member.one" : "community.headline.member.other"
+            return String(format: key.localized, memberCount)
         case .channel:
-            noun = memberCount == 1 ? "subscriber" : "subscribers"
+            let key = memberCount == 1 ? "community.headline.subscriber.one" : "community.headline.subscriber.other"
+            return String(format: key.localized, memberCount)
         }
+    }
 
-        return "\(memberCount) \(noun)"
+    private var publicLink: URL? {
+        guard presentedCommunityDetails?.isPublic == true,
+              let handle = normalizePublicHandle(presentedCommunityDetails?.publicHandle) else { return nil }
+        let routePrefix: String
+        switch effectiveCommunityKind ?? .group {
+        case .channel:
+            routePrefix = "c"
+        case .group, .supergroup, .community:
+            routePrefix = "g"
+        }
+        return URL(string: "https://primemsg.site/\(routePrefix)/\(handle)")
     }
 
     private var canManageGroup: Bool {
@@ -1402,11 +1480,11 @@ struct GroupInfoView: View {
     }
 
     private var audienceSingularTitle: String {
-        isChannel ? "Subscriber" : "Member"
+        isChannel ? "community.audience.subscriber".localized : "community.audience.member".localized
     }
 
     private var audiencePluralTitle: String {
-        isChannel ? "Subscribers" : "Members"
+        isChannel ? "community.audience.subscribers".localized : "community.audience.members".localized
     }
 
     private var addAudienceTitle: String {
@@ -1763,6 +1841,42 @@ struct GroupInfoView: View {
     }
 
     @MainActor
+    private func savePublicHandle() async {
+        guard var details = presentedCommunityDetails else { return }
+
+        isSavingPublicHandle = true
+        defer { isSavingPublicHandle = false }
+
+        details.publicHandle = normalizePublicHandle(publicHandleDraft)
+
+        do {
+            chat = try await environment.chatRepository.updateCommunityDetails(
+                details,
+                for: chat,
+                requesterID: appState.currentUser.id
+            )
+            resolvedCommunityDetails = chat.communityDetails ?? details
+            publicHandleDraft = resolvedCommunityDetails?.publicHandle ?? ""
+            await CommunityChatMetadataStore.shared.setDetails(
+                chat.communityDetails ?? details,
+                ownerUserID: appState.currentUser.id,
+                chatID: chat.id
+            )
+            statusMessage = "Public username updated."
+        } catch {
+            statusMessage = error.localizedDescription.isEmpty ? "Could not update the public username." : error.localizedDescription
+        }
+    }
+
+    private func normalizePublicHandle(_ rawValue: String?) -> String? {
+        let trimmed = (rawValue ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "@", with: "")
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    @MainActor
     private func refreshCommunityDetailsFromRepository() async {
         guard chat.mode != .offline else { return }
 
@@ -2012,6 +2126,31 @@ struct GroupInfoView: View {
         )
     }
 
+    private var currentGroupCallButtonTitle: String {
+        return "Call"
+    }
+
+    @MainActor
+    private func startOrOpenGroupCall() async {
+        guard isStartingGroupCall == false else { return }
+
+        isStartingGroupCall = true
+        defer { isStartingGroupCall = false }
+
+        do {
+            groupCallManager.configure(
+                currentUserID: appState.currentUser.id,
+                repository: environment.callRepository
+            )
+            try await groupCallManager.startOrJoinCall(in: chat)
+            statusMessage = ""
+        } catch {
+            statusMessage = error.localizedDescription.isEmpty
+                ? "Could not start the group call."
+                : error.localizedDescription
+        }
+    }
+
     @ViewBuilder
     private func actionButton(title: String, systemName: String, action: @escaping () -> Void = {}) -> some View {
         Button(action: action) {
@@ -2138,7 +2277,7 @@ private struct GroupAvatarView: View {
 
     var body: some View {
         if let photoURL {
-            CachedRemoteImage(url: photoURL) { image in
+            CachedRemoteImage(url: photoURL, maxPixelSize: 320) { image in
                 image
                     .resizable()
                     .scaledToFill()

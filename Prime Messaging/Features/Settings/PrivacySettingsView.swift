@@ -8,7 +8,6 @@ struct PrivacySettingsView: View {
     var body: some View {
         Form {
             Toggle("privacy.show_email".localized, isOn: $settings.showEmail)
-            Toggle("privacy.show_phone".localized, isOn: $settings.showPhoneNumber)
             Toggle("privacy.last_seen".localized, isOn: $settings.allowLastSeen)
             Toggle("privacy.profile_photo".localized, isOn: $settings.allowProfilePhoto)
             Toggle("privacy.calls".localized, isOn: $settings.allowCallsFromNonContacts)
@@ -27,7 +26,8 @@ struct PrivacySettingsView: View {
             } catch { }
         }
         .onDisappear {
-            let resolvedSettings = settings
+            var resolvedSettings = settings
+            resolvedSettings.showPhoneNumber = false
             Task {
                 do {
                     try await environment.settingsRepository.updatePrivacySettings(resolvedSettings)

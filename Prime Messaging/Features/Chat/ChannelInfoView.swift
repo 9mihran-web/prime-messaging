@@ -36,6 +36,8 @@ struct ChannelInfoView: View {
     @State private var isLeavingChannel = false
     @State private var isUpdatingOfficialBadge = false
     @State private var isUpdatingChannelSettings = false
+    @State private var publicHandleDraft = ""
+    @State private var isSavingPublicHandle = false
 
     init(
         chat: Binding<Chat>,
@@ -96,7 +98,11 @@ struct ChannelInfoView: View {
         .onChange(of: chat.communityDetails) { newValue in
             if let newValue {
                 resolvedCommunityDetails = newValue
+                publicHandleDraft = newValue.publicHandle ?? ""
             }
+        }
+        .task {
+            publicHandleDraft = chat.communityDetails?.publicHandle ?? resolvedCommunityDetails?.publicHandle ?? ""
         }
         .sheet(item: $selectedMemberProfile) { user in
             NavigationStack {
@@ -170,7 +176,7 @@ struct ChannelInfoView: View {
 
     private var actionRow: some View {
         HStack(spacing: 10) {
-            actionButton(title: "Search", systemName: "magnifyingglass") {
+            actionButton(title: "common.search".localized, systemName: "magnifyingglass") {
                 onRequestSearch?()
                 if onRequestSearch == nil {
                     statusMessage = "Channel search is only available from the chat screen."
@@ -180,7 +186,7 @@ struct ChannelInfoView: View {
 
             soundMenuButton
 
-            actionButton(title: "Invite", systemName: "qrcode") {
+            actionButton(title: "common.invite".localized, systemName: "qrcode") {
                 if inviteLink == nil {
                     statusMessage = "This channel does not have an invite link yet."
                 } else {
@@ -189,7 +195,7 @@ struct ChannelInfoView: View {
             }
             .frame(maxWidth: .infinity)
 
-            actionButton(title: "More", systemName: "ellipsis.circle") {
+            actionButton(title: "common.more".localized, systemName: "ellipsis.circle") {
                 #if os(tvOS)
                 statusMessage = "Copy is unavailable on Apple TV."
                 #else
@@ -224,7 +230,7 @@ struct ChannelInfoView: View {
             }
         } label: {
             actionButtonLabel(
-                title: "Sound",
+                title: "common.sound".localized,
                 systemName: soundMode == .active ? "bell.fill" : "bell.slash.fill"
             )
         }
@@ -234,7 +240,7 @@ struct ChannelInfoView: View {
 
     private var settingsCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Channel Settings")
+            Text("community.channel_settings".localized)
                 .font(.system(.headline, design: .rounded).weight(.semibold))
                 .foregroundStyle(PrimeTheme.Colors.textPrimary)
 
@@ -245,12 +251,59 @@ struct ChannelInfoView: View {
 
             if let details = presentedCommunityDetails {
                 VStack(alignment: .leading, spacing: 10) {
-                    infoRow(title: "Type", value: "Channel", systemName: "megaphone.fill")
-                    infoRow(title: "Visibility", value: details.isPublic ? "Public" : "Private", systemName: details.isPublic ? "globe" : "lock.fill")
-                    infoRow(title: "Comments", value: details.commentsEnabled ? "Enabled" : "Disabled", systemName: "bubble.left.and.text.bubble.right.fill")
-                    infoRow(title: "Threads", value: details.forumModeEnabled ? "Forum mode enabled" : "Linear posts", systemName: details.forumModeEnabled ? "text.bubble.fill" : "text.bubble")
+                    infoRow(title: "common.type".localized, value: "community.kind.channel".localized, systemName: "megaphone.fill")
+                    infoRow(title: "community.visibility".localized, value: details.isPublic ? "common.public".localized : "common.private".localized, systemName: details.isPublic ? "globe" : "lock.fill")
+                    if let publicLink {
+                        infoRow(title: "Public link", value: publicLink.absoluteString, systemName: "link")
+                    }
+                    infoRow(title: "community.comments".localized, value: details.commentsEnabled ? "common.enabled".localized : "common.disabled".localized, systemName: "bubble.left.and.text.bubble.right.fill")
+                    infoRow(title: "community.threads".localized, value: details.forumModeEnabled ? "community.forum_mode_enabled".localized : "community.linear_posts".localized, systemName: details.forumModeEnabled ? "text.bubble.fill" : "text.bubble")
 
                     if canManageChannel {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Public username")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(PrimeTheme.Colors.textSecondary)
+                            TextField("your-channel-name", text: $publicHandleDraft)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                                .textFieldStyle(.plain)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 10)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                        .fill(PrimeTheme.Colors.background.opacity(0.45))
+                                )
+                            if let publicLink {
+                                Text(publicLink.absoluteString)
+                                    .font(.caption)
+                                    .foregroundStyle(PrimeTheme.Colors.textSecondary)
+                                    #if !os(tvOS)
+                                    .textSelection(.enabled)
+                                    #endif
+                            }
+                            HStack(spacing: 10) {
+                                Button {
+                                    Task { await savePublicHandle() }
+                                } label: {
+                                    settingsPill(title: isSavingPublicHandle ? "Saving..." : "Save username")
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(isSavingPublicHandle)
+
+                                if publicHandleDraft.isEmpty == false || details.publicHandle != nil {
+                                    Button {
+                                        publicHandleDraft = ""
+                                        Task { await savePublicHandle() }
+                                    } label: {
+                                        settingsPill(title: "Clear")
+                                    }
+                                    .buttonStyle(.plain)
+                                    .disabled(isSavingPublicHandle)
+                                }
+                            }
+                        }
+
                         VStack(alignment: .leading, spacing: 10) {
                             HStack(spacing: 10) {
                                 Button {
@@ -258,7 +311,7 @@ struct ChannelInfoView: View {
                                         await updateChannelSettings { $0.commentsEnabled.toggle() }
                                     }
                                 } label: {
-                                    settingsPill(title: details.commentsEnabled ? "Disable comments" : "Enable comments")
+                                    settingsPill(title: details.commentsEnabled ? "community.disable_comments".localized : "community.enable_comments".localized)
                                 }
                                 .buttonStyle(.plain)
                                 .disabled(isUpdatingChannelSettings)
@@ -268,7 +321,7 @@ struct ChannelInfoView: View {
                                         await updateChannelSettings { $0.isPublic.toggle() }
                                     }
                                 } label: {
-                                    settingsPill(title: details.isPublic ? "Make private" : "Make public")
+                                    settingsPill(title: details.isPublic ? "community.make_private".localized : "community.make_public".localized)
                                 }
                                 .buttonStyle(.plain)
                                 .disabled(isUpdatingChannelSettings)
@@ -356,20 +409,20 @@ struct ChannelInfoView: View {
 
     @ViewBuilder
     private var inviteCard: some View {
-        if let inviteLink {
+        if let shareLink = publicLink ?? inviteLink {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Invite & QR")
                     .font(.system(.headline, design: .rounded).weight(.semibold))
                     .foregroundStyle(PrimeTheme.Colors.textPrimary)
 
-                Text(inviteLink.absoluteString)
+                Text(shareLink.absoluteString)
                     .font(.footnote)
                     .foregroundStyle(PrimeTheme.Colors.textSecondary)
                     #if !os(tvOS)
                     .textSelection(.enabled)
                     #endif
 
-                if let qrImage = qrCodeImage(for: inviteLink.absoluteString) {
+                if let qrImage = qrCodeImage(for: shareLink.absoluteString) {
                     Image(uiImage: qrImage)
                         .interpolation(.none)
                         .resizable()
@@ -387,7 +440,7 @@ struct ChannelInfoView: View {
                         #if os(tvOS)
                         statusMessage = "Copy is unavailable on Apple TV."
                         #else
-                        UIPasteboard.general.string = inviteLink.absoluteString
+                        UIPasteboard.general.string = shareLink.absoluteString
                         statusMessage = "Invite link copied."
                         #endif
                     } label: {
@@ -399,7 +452,7 @@ struct ChannelInfoView: View {
                     settingsPill(title: "Share unavailable")
                         .opacity(0.6)
                     #else
-                    ShareLink(item: inviteLink.absoluteString) {
+                    ShareLink(item: shareLink.absoluteString) {
                         settingsPill(title: "Share link")
                     }
                     .buttonStyle(.plain)
@@ -683,7 +736,8 @@ struct ChannelInfoView: View {
 
     private var subscriberHeadlineText: String {
         let count = max(presentedGroup?.members.count ?? chat.participantIDs.count, 1)
-        return "\(count) \(count == 1 ? "subscriber" : "subscribers")"
+        let key = count == 1 ? "community.headline.subscriber.one" : "community.headline.subscriber.other"
+        return String(format: key.localized, count)
     }
 
     private var primaryActionTitle: String {
@@ -692,6 +746,12 @@ struct ChannelInfoView: View {
 
     private var inviteLink: URL? {
         presentedCommunityDetails?.inviteLink
+    }
+
+    private var publicLink: URL? {
+        guard presentedCommunityDetails?.isPublic == true,
+              let handle = normalizePublicHandle(presentedCommunityDetails?.publicHandle) else { return nil }
+        return URL(string: "https://primemsg.site/c/\(handle)")
     }
 
     private var sortedMembers: [GroupMember] {
@@ -1083,6 +1143,42 @@ struct ChannelInfoView: View {
     }
 
     @MainActor
+    private func savePublicHandle() async {
+        guard var details = presentedCommunityDetails else { return }
+
+        isSavingPublicHandle = true
+        defer { isSavingPublicHandle = false }
+
+        details.publicHandle = normalizePublicHandle(publicHandleDraft)
+
+        do {
+            chat = try await environment.chatRepository.updateCommunityDetails(
+                details,
+                for: chat,
+                requesterID: appState.currentUser.id
+            )
+            resolvedCommunityDetails = chat.communityDetails ?? details
+            publicHandleDraft = resolvedCommunityDetails?.publicHandle ?? ""
+            await CommunityChatMetadataStore.shared.setDetails(
+                chat.communityDetails ?? details,
+                ownerUserID: appState.currentUser.id,
+                chatID: chat.id
+            )
+            statusMessage = "Public username updated."
+        } catch {
+            statusMessage = error.localizedDescription.isEmpty ? "Could not update the public username." : error.localizedDescription
+        }
+    }
+
+    private func normalizePublicHandle(_ rawValue: String?) -> String? {
+        let trimmed = (rawValue ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "@", with: "")
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    @MainActor
     private func openMemberProfile(_ member: GroupMember) async {
         do {
             selectedMemberProfile = try await environment.authRepository.userProfile(userID: member.userID)
@@ -1234,7 +1330,7 @@ private struct ChannelAvatarView: View {
 
     var body: some View {
         if let photoURL {
-            CachedRemoteImage(url: photoURL) { image in
+            CachedRemoteImage(url: photoURL, maxPixelSize: 320) { image in
                 image
                     .resizable()
                     .scaledToFill()

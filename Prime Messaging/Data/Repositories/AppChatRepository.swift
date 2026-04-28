@@ -42,7 +42,11 @@ struct AppChatRepository: ChatRepository {
         }
 
         let normalizedChats = await CommunityChatMetadataStore.shared.normalize(mergedVisibleChats, ownerUserID: userID)
-        return sanitizeChatsForVisibleMode(normalizedChats, visibleMode: mode)
+        return sanitizeChatsForVisibleMode(
+            normalizedChats,
+            visibleMode: mode,
+            currentUserID: userID
+        )
     }
 
     func cachedMessages(chatID: UUID, mode: ChatMode) async -> [Message] {
@@ -95,7 +99,11 @@ struct AppChatRepository: ChatRepository {
             } catch {
                 let fallbackChats = await fallbackChatsAfterFetchFailure(mode: mode, userID: userID)
                 if fallbackChats.isEmpty == false {
-                    return sanitizeChatsForVisibleMode(fallbackChats, visibleMode: mode)
+                    return sanitizeChatsForVisibleMode(
+                        fallbackChats,
+                        visibleMode: mode,
+                        currentUserID: userID
+                    )
                 }
                 throw error
             }
@@ -110,7 +118,11 @@ struct AppChatRepository: ChatRepository {
                     visibleMode: mode
             )
             let normalizedChats = await CommunityChatMetadataStore.shared.normalize(mergedChats, ownerUserID: userID)
-            let sanitizedChats = sanitizeChatsForVisibleMode(normalizedChats, visibleMode: mode)
+            let sanitizedChats = sanitizeChatsForVisibleMode(
+                normalizedChats,
+                visibleMode: mode,
+                currentUserID: userID
+            )
             await ChatSnapshotStore.shared.saveChats(sanitizedChats, userID: userID, mode: mode)
             await mirrorOfflineContinuitySeedIfNeeded(chats: sanitizedChats, userID: userID, sourceMode: mode)
             return sanitizedChats
@@ -155,6 +167,12 @@ struct AppChatRepository: ChatRepository {
                     fallback: await visibleSnapshotMessages(chatID: chatID, mode: mode, userID: userID)
                 )
                 await ChatSnapshotStore.shared.saveMessages(mergedMessages, chatID: chatID, userID: userID, mode: mode)
+                await ChatMessagePageStore.shared.replaceMessages(
+                    mergedMessages,
+                    chatID: chatID,
+                    userID: userID,
+                    mode: mode
+                )
                 if let sourceChat = await resolvedOfflineContinuitySourceChat(chatID: chatID, mode: mode, userID: userID) {
                     await mirrorOfflineContinuityHistoryIfNeeded(
                         messages: mergedMessages,
@@ -213,7 +231,12 @@ struct AppChatRepository: ChatRepository {
             sentMessage = try await offlineTransport.sendMessage(preparedDraft, in: moderatedChat, senderID: senderID)
         }
 
-        await cacheMessageMutation(sentMessage, in: moderatedChat, userID: senderID, mode: moderatedChat.mode)
+        let mutationChat = await resolveMutationChat(
+            for: sentMessage,
+            fallbackChat: moderatedChat,
+            ownerUserID: senderID
+        )
+        await cacheMessageMutation(sentMessage, in: mutationChat, userID: senderID, mode: moderatedChat.mode)
         await recordModeratedOutgoingMessageIfNeeded(
             draft,
             chat: moderatedChat,
@@ -591,6 +614,92 @@ struct AppChatRepository: ChatRepository {
     func createNearbyChat(with peer: OfflinePeer, currentUser: User) async throws -> Chat {
         let chat = try await offlineTransport.openChat(with: peer, currentUser: currentUser)
         return await ContactAliasStore.shared.applyAlias(to: chat, currentUserID: currentUser.id)
+    }
+
+    func importExternalHistory(_ messages: [Message], into chat: Chat, currentUser: User) async throws -> Chat {
+        switch chat.mode {
+        case .online:
+            let updatedChat = try await onlineRepository.importExternalHistory(messages, into: chat, currentUser: currentUser)
+            return await ContactAliasStore.shared.applyAlias(to: updatedChat, currentUserID: currentUser.id)
+        case .smart:
+            let link = try await smartLink(for: chat.id, currentUserID: currentUser.id)
+            let onlineChat = try await resolveOnlineChat(for: link, smartChatID: chat.id, currentUserID: currentUser.id)
+            let updatedOnlineChat = try await onlineRepository.importExternalHistory(messages, into: onlineChat, currentUser: currentUser)
+            let aliasedChat = await ContactAliasStore.shared.applyAlias(to: updatedOnlineChat, currentUserID: currentUser.id)
+            await ChatSnapshotStore.shared.upsertChat(aliasedChat, userID: currentUser.id, mode: .online)
+            return aliasedChat
+        case .offline:
+            return await importExternalHistoryLocally(messages, into: chat, currentUser: currentUser)
+        }
+    }
+
+    private func importExternalHistoryLocally(_ messages: [Message], into chat: Chat, currentUser: User) async -> Chat {
+        let normalizedMessages = messages
+            .sorted { lhs, rhs in
+                if lhs.createdAt == rhs.createdAt {
+                    return lhs.clientMessageID.uuidString < rhs.clientMessageID.uuidString
+                }
+                return lhs.createdAt < rhs.createdAt
+            }
+            .map { message in
+                Message(
+                    id: message.id,
+                    chatID: chat.id,
+                    senderID: message.senderID,
+                    clientMessageID: message.clientMessageID,
+                    senderDisplayName: message.senderDisplayName,
+                    mode: chat.mode,
+                    deliveryState: .migrated,
+                    kind: message.kind,
+                    text: message.text,
+                    attachments: message.attachments,
+                    replyToMessageID: message.replyToMessageID,
+                    replyPreview: message.replyPreview,
+                    communityContext: message.communityContext,
+                    deliveryOptions: message.deliveryOptions,
+                    status: .sent,
+                    createdAt: message.createdAt,
+                    editedAt: message.editedAt,
+                    deletedForEveryoneAt: message.deletedForEveryoneAt,
+                    reactions: message.reactions,
+                    voiceMessage: message.voiceMessage,
+                    liveLocation: message.liveLocation
+                )
+            }
+
+        guard normalizedMessages.isEmpty == false else {
+            return await ContactAliasStore.shared.applyAlias(to: chat, currentUserID: currentUser.id)
+        }
+
+        await ChatSnapshotStore.shared.saveMessages(
+            normalizedMessages,
+            chatID: chat.id,
+            userID: currentUser.id,
+            mode: chat.mode
+        )
+
+        var updatedChat = await ContactAliasStore.shared.applyAlias(to: chat, currentUserID: currentUser.id)
+        if let latestMessage = normalizedMessages.last(where: { $0.shouldHideDeletedPlaceholder == false }) {
+            updatedChat.lastActivityAt = latestMessage.createdAt
+            updatedChat.lastMessagePreview = importedMessageSummaryText(for: latestMessage)
+        }
+
+        await ChatSnapshotStore.shared.upsertChat(updatedChat, userID: currentUser.id, mode: chat.mode)
+
+        if let sourceChat = await resolvedOfflineContinuitySourceChat(
+            chatID: chat.id,
+            mode: chat.mode,
+            userID: currentUser.id
+        ) {
+            await mirrorOfflineContinuityHistoryIfNeeded(
+                messages: normalizedMessages,
+                in: sourceChat,
+                userID: currentUser.id,
+                sourceMode: chat.mode
+            )
+        }
+
+        return updatedChat
     }
 
     func retryPendingOutgoingMessages(currentUserID: UUID) async {
@@ -1958,17 +2067,88 @@ struct AppChatRepository: ChatRepository {
         let preparedDraft = normalizedDraft(draft, fallbackState: .online)
 
         do {
-            let sentMessage = try await onlineRepository.sendMessage(preparedDraft, in: chat.id, mode: .online, senderID: senderID)
-            let resolvedMessage = applyDraftDeliveryOptions(preparedDraft, to: sentMessage)
-                .withDeliveryRoute(.online)
-            await QueuedOutgoingMessageStore.shared.complete(messageID: preparedDraft.clientMessageID ?? resolvedMessage.clientMessageID, ownerUserID: senderID)
-            await offlineTransport.synchronizeArchivedChats(with: onlineRepository, currentUserID: senderID)
-            return resolvedMessage
+            return try await performOnlineSend(preparedDraft, chatID: chat.id, senderID: senderID)
         } catch {
+            if shouldRecoverFromMissingOnlineChat(error),
+               let recoveredChat = try await recoverOnlineChatForSending(fallbackChat: chat, currentUserID: senderID),
+               recoveredChat.id != chat.id {
+                let aliasedRecoveredChat = await ContactAliasStore.shared.applyAlias(
+                    to: recoveredChat,
+                    currentUserID: senderID
+                )
+                await ChatSnapshotStore.shared.upsertChat(aliasedRecoveredChat, userID: senderID, mode: .online)
+                return try await performOnlineSend(preparedDraft, chatID: aliasedRecoveredChat.id, senderID: senderID)
+            }
+
             guard allowQueueFallback, shouldQueueMessageForLater(error) else {
                 throw error
             }
             return await enqueuePendingOutgoingMessage(preparedDraft, in: chat, senderID: senderID)
+        }
+    }
+
+    private func performOnlineSend(
+        _ draft: OutgoingMessageDraft,
+        chatID: UUID,
+        senderID: UUID
+    ) async throws -> Message {
+        let sentMessage = try await onlineRepository.sendMessage(
+            draft,
+            in: chatID,
+            mode: .online,
+            senderID: senderID
+        )
+        guard sentMessage.senderID == senderID else {
+            throw AuthRepositoryError.invalidCredentials
+        }
+        let resolvedMessage = applyDraftDeliveryOptions(draft, to: sentMessage)
+            .withDeliveryRoute(.online)
+        await QueuedOutgoingMessageStore.shared.complete(
+            messageID: draft.clientMessageID ?? resolvedMessage.clientMessageID,
+            ownerUserID: senderID
+        )
+        await offlineTransport.synchronizeArchivedChats(with: onlineRepository, currentUserID: senderID)
+        return resolvedMessage
+    }
+
+    private func shouldRecoverFromMissingOnlineChat(_ error: Error) -> Bool {
+        if let chatError = error as? ChatRepositoryError {
+            if case .chatNotFound = chatError {
+                return true
+            }
+            if case .senderNotInChat = chatError {
+                return true
+            }
+        }
+        if let underlying = (error as NSError).userInfo[NSUnderlyingErrorKey] as? Error {
+            return shouldRecoverFromMissingOnlineChat(underlying)
+        }
+        return error.localizedDescription.localizedCaseInsensitiveContains("chat not found")
+            || error.localizedDescription.localizedCaseInsensitiveContains("not a member of this chat")
+    }
+
+    private func recoverOnlineChatForSending(fallbackChat: Chat, currentUserID: UUID) async throws -> Chat? {
+        guard fallbackChat.mode == .online else { return nil }
+
+        switch fallbackChat.type {
+        case .selfChat:
+            return try await resolvedSavedMessagesOnlineChat(currentUserID: currentUserID)
+        case .direct:
+            if let matchedOnline = try await matchedOnlineChat(for: fallbackChat, currentUserID: currentUserID) {
+                return matchedOnline
+            }
+            guard let otherUserID = fallbackChat.participantIDs.first(where: { $0 != currentUserID }) else {
+                return nil
+            }
+            return try await onlineRepository.createDirectChat(
+                with: otherUserID,
+                currentUserID: currentUserID,
+                mode: .online
+            )
+        case .group:
+            return try await matchedOnlineChat(for: fallbackChat, currentUserID: currentUserID)
+        case .secret:
+            return nil
         }
     }
 
@@ -2055,8 +2235,21 @@ struct AppChatRepository: ChatRepository {
     }
 
     private func shouldQueueMessageForLater(_ error: Error) -> Bool {
-        if error is URLError {
-            return true
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .notConnectedToInternet,
+                 .networkConnectionLost,
+                 .cannotConnectToHost,
+                 .cannotFindHost,
+                 .dnsLookupFailed,
+                 .timedOut,
+                 .internationalRoamingOff,
+                 .callIsActive,
+                 .dataNotAllowed:
+                return true
+            default:
+                return false
+            }
         }
 
         if NetworkUsagePolicy.hasReachableNetwork() == false {
@@ -2069,7 +2262,7 @@ struct AppChatRepository: ChatRepository {
 
         switch repositoryError {
         case .backendUnavailable:
-            return true
+            return false
         default:
             return false
         }
@@ -2098,13 +2291,20 @@ struct AppChatRepository: ChatRepository {
     private func clearLocalGroupState(chatID: UUID, currentUserID: UUID) async {
         let linkedChatIDs = await relatedLocalChatIDs(for: chatID)
         await onlineRepository.purgeLocalChatArtifacts(chatIDs: Array(linkedChatIDs), currentUserID: currentUserID)
+        await ChatMessagePageStore.shared.purgeChats(linkedChatIDs, userID: currentUserID)
+        await ShareChatDestinationStore.shared.purgeChats(linkedChatIDs)
+        await OfflineChatArchiveStore.shared.purgeChats(linkedChatIDs, ownerUserID: currentUserID)
         for linkedChatID in linkedChatIDs {
+            await ChatReadStateStore.shared.purgeChat(chatID: linkedChatID, userID: currentUserID)
+            await HiddenMessageStore.shared.purgeChat(ownerUserID: currentUserID, chatID: linkedChatID)
+            await PinnedMessageStore.shared.purgeChat(ownerUserID: currentUserID, chatID: linkedChatID)
+            await EventChatMetadataStore.shared.purgeChat(ownerUserID: currentUserID, chatID: linkedChatID)
             for mode in ChatMode.allCases {
                 await ChatSnapshotStore.shared.removeChat(chatID: linkedChatID, userID: currentUserID, mode: mode)
-                await ChatThreadStateStore.shared.clearChat(ownerUserID: currentUserID, mode: mode, chatID: linkedChatID)
+                await ChatThreadStateStore.shared.purgeChat(ownerUserID: currentUserID, mode: mode, chatID: linkedChatID)
             }
+            await SmartConversationStore.shared.removeLink(for: linkedChatID)
         }
-        await SmartConversationStore.shared.removeLink(for: chatID)
     }
 
     private func relatedLocalChatIDs(for chatID: UUID) async -> Set<UUID> {
@@ -2153,6 +2353,32 @@ struct AppChatRepository: ChatRepository {
         }
 
         return .text
+    }
+
+    private func importedMessageSummaryText(for message: Message) -> String? {
+        if let text = message.text?.trimmingCharacters(in: .whitespacesAndNewlines), text.isEmpty == false {
+            return text
+        }
+        if message.voiceMessage != nil {
+            return "Voice message"
+        }
+
+        switch message.attachments.first?.type {
+        case .photo:
+            return "Photo"
+        case .audio:
+            return "Audio"
+        case .video:
+            return "Video"
+        case .document:
+            return "Document"
+        case .contact:
+            return "Contact"
+        case .location:
+            return "Location"
+        case nil:
+            return "Imported message"
+        }
     }
 
     private func normalizedDraft(_ draft: OutgoingMessageDraft, fallbackState: MessageDeliveryState) -> OutgoingMessageDraft {
@@ -2464,9 +2690,69 @@ struct AppChatRepository: ChatRepository {
         return merged
     }
 
+    private func resolveMutationChat(
+        for message: Message,
+        fallbackChat: Chat,
+        ownerUserID: UUID
+    ) async -> Chat {
+        guard message.chatID != fallbackChat.id else {
+            return fallbackChat
+        }
+
+        switch fallbackChat.mode {
+        case .online:
+            if let cachedResolvedChat = await resolveCachedChatSnapshot(
+                chatID: message.chatID,
+                mode: .online,
+                userID: ownerUserID
+            ) {
+                return cachedResolvedChat
+            }
+            if let matchedOnlineChat = try? await matchedOnlineChat(for: fallbackChat, currentUserID: ownerUserID),
+               matchedOnlineChat.id == message.chatID {
+                return matchedOnlineChat
+            }
+            return chatReplacingIdentity(fallbackChat, chatID: message.chatID)
+        case .smart:
+            return fallbackChat
+        case .offline:
+            return chatReplacingIdentity(fallbackChat, chatID: message.chatID)
+        }
+    }
+
+    private func chatReplacingIdentity(_ chat: Chat, chatID: UUID) -> Chat {
+        Chat(
+            id: chatID,
+            mode: chat.mode,
+            type: chat.type,
+            title: chat.title,
+            subtitle: chat.subtitle,
+            participantIDs: chat.participantIDs,
+            participants: chat.participants,
+            group: chat.group,
+            lastMessagePreview: chat.lastMessagePreview,
+            lastActivityAt: chat.lastActivityAt,
+            unreadCount: chat.unreadCount,
+            isPinned: chat.isPinned,
+            draft: chat.draft,
+            disappearingPolicy: chat.disappearingPolicy,
+            notificationPreferences: chat.notificationPreferences,
+            guestRequest: chat.guestRequest,
+            eventDetails: chat.eventDetails,
+            communityDetails: chat.communityDetails,
+            moderationSettings: chat.moderationSettings
+        )
+    }
+
     private func cacheMessageMutation(_ message: Message, in chat: Chat, userID: UUID, mode: ChatMode) async {
         let stabilizedMessage = ChatMediaPersistentStore.persist(message)
         await ChatSnapshotStore.shared.upsertMessage(stabilizedMessage, in: chat, userID: userID, mode: mode)
+        await ChatMessagePageStore.shared.upsertMessages(
+            [stabilizedMessage],
+            chatID: chat.id,
+            userID: userID,
+            mode: mode
+        )
         await mirrorOfflineContinuityHistoryIfNeeded(messages: [stabilizedMessage], in: chat, userID: userID, sourceMode: mode)
     }
 
@@ -2550,12 +2836,30 @@ struct AppChatRepository: ChatRepository {
                 currentUserID: userID,
                 visibleMode: mode
             ),
-            visibleMode: mode
+            visibleMode: mode,
+            currentUserID: userID
         )
     }
 
-    private func sanitizeChatsForVisibleMode(_ chats: [Chat], visibleMode: ChatMode) -> [Chat] {
-        chats.filter { $0.isAvailable(in: visibleMode) }
+    private func sanitizeChatsForVisibleMode(
+        _ chats: [Chat],
+        visibleMode: ChatMode,
+        currentUserID: UUID
+    ) -> [Chat] {
+        chats.filter {
+            $0.isAvailable(in: visibleMode) &&
+                isChatVisibleForCurrentUser($0, currentUserID: currentUserID, visibleMode: visibleMode)
+        }
+    }
+
+    private func isChatVisibleForCurrentUser(_ chat: Chat, currentUserID: UUID, visibleMode: ChatMode) -> Bool {
+        if chat.type == .selfChat {
+            return true
+        }
+        guard chat.participantIDs.isEmpty == false else {
+            return visibleMode == .offline
+        }
+        return chat.participantIDs.contains(currentUserID)
     }
 
     private func visibleSnapshotMessages(chatID: UUID, mode: ChatMode, userID: UUID) async -> [Message] {

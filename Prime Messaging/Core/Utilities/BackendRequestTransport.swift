@@ -1,12 +1,15 @@
 import Foundation
+import OSLog
 #if canImport(UIKit)
 import UIKit
 #endif
 
 enum BackendRequestTransport {
     private static let decoder = BackendJSONDecoder.make()
+    private static let logger = Logger(subsystem: "mirowin.Prime-Messaging", category: "BackendRequestTransport")
     private static let requestTimeout: TimeInterval = 12
     private static let uploadRequestTimeout: TimeInterval = 180
+    private static let stableDeviceIdentifierDefaultsKey = "push.device_identifier"
 
     static func authorizedRequest(
         baseURL: URL,
@@ -223,7 +226,27 @@ enum BackendRequestTransport {
         }
 
         if session.shouldRefreshAccessToken {
-            return try await refreshSession(for: userID, baseURL: baseURL)
+            do {
+                return try await refreshSession(for: userID, baseURL: baseURL)
+            } catch let error as AuthRepositoryError {
+                switch error {
+                case .invalidCredentials, .accountNotFound:
+                    break
+                default:
+                    throw error
+                }
+                if let restoredSession = try await restoreSessionIfPossible(for: userID, baseURL: baseURL) {
+                    return restoredSession
+                }
+                if session.accessToken.isEmpty == false {
+                    logger.error("auth.session.refresh_failed_preserving_local_session user=\(userID.uuidString, privacy: .public)")
+                    return session
+                }
+                throw error
+            } catch {
+                logger.error("auth.session.refresh_temporarily_unavailable user=\(userID.uuidString, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+                return session
+            }
         }
 
         return session
@@ -231,7 +254,6 @@ enum BackendRequestTransport {
 
     private static func refreshSession(for userID: UUID, baseURL: URL) async throws -> AuthSession {
         guard let session = await AuthSessionStore.shared.session(for: userID), session.isRefreshTokenValid else {
-            await AuthSessionStore.shared.removeSession(for: userID)
             throw AuthRepositoryError.invalidCredentials
         }
 
@@ -250,7 +272,6 @@ enum BackendRequestTransport {
         }
 
         guard 200 ..< 300 ~= httpResponse.statusCode else {
-            await AuthSessionStore.shared.removeSession(for: userID)
             switch httpResponse.statusCode {
             case 401:
                 throw AuthRepositoryError.invalidCredentials
@@ -263,7 +284,12 @@ enum BackendRequestTransport {
 
         let payload = try decoder.decode(AuthenticatedSessionResponse.self, from: data)
         guard let updatedSession = payload.authSession() else {
-            await AuthSessionStore.shared.removeSession(for: userID)
+            throw AuthRepositoryError.invalidCredentials
+        }
+        guard updatedSession.userID == userID else {
+            logger.error(
+                "auth.refresh.identity_mismatch expected=\(userID.uuidString, privacy: .public) actual=\(updatedSession.userID.uuidString, privacy: .public)"
+            )
             throw AuthRepositoryError.invalidCredentials
         }
         await AuthSessionStore.shared.upsert(updatedSession)
@@ -279,8 +305,12 @@ enum BackendRequestTransport {
             return storedUserID
         }
 
-        if let mostRecentSession = await AuthSessionStore.shared.mostRecentSession() {
-            return mostRecentSession.userID
+        let sessions = await AuthSessionStore.shared.allSessions()
+        if sessions.count == 1, let session = sessions.first {
+            return session.userID
+        }
+        if sessions.count > 1 {
+            logger.error("auth.resolve_user_id.ambiguous_sessions count=\(sessions.count, privacy: .public)")
         }
 
         throw AuthRepositoryError.invalidCredentials
@@ -310,7 +340,13 @@ enum BackendRequestTransport {
             case 200 ..< 300:
                 let payload = try decoder.decode(AuthenticatedSessionResponse.self, from: data)
                 guard let restoredSession = payload.authSession() else {
-                    return nil
+                    continue
+                }
+                guard payload.user.id == userID, restoredSession.userID == userID else {
+                    logger.error(
+                        "auth.restore.identity_mismatch expected=\(userID.uuidString, privacy: .public) actual=\(payload.user.id.uuidString, privacy: .public)"
+                    )
+                    continue
                 }
                 await AuthSessionStore.shared.upsert(restoredSession)
                 await LocalAccountStore.shared.upsertRemoteAccount(payload.user, password: recoveryAccount.password)
@@ -359,6 +395,12 @@ enum BackendRequestTransport {
         guard let restoredSession = payload.authSession() else {
             return nil
         }
+        guard payload.user.id == userID, restoredSession.userID == userID else {
+            logger.error(
+                "auth.restore.signup.identity_mismatch expected=\(userID.uuidString, privacy: .public) actual=\(payload.user.id.uuidString, privacy: .public)"
+            )
+            throw AuthRepositoryError.invalidCredentials
+        }
         await AuthSessionStore.shared.upsert(restoredSession)
         await LocalAccountStore.shared.upsertRemoteAccount(payload.user, password: recoveryAccount.password)
         return restoredSession
@@ -377,6 +419,7 @@ enum BackendRequestTransport {
 
     private static func applyDeviceHeaders(to request: inout URLRequest) {
         request.setValue(platformHeaderValue(), forHTTPHeaderField: "X-Prime-Platform")
+        request.setValue(stableDeviceIdentifier(), forHTTPHeaderField: "X-Prime-Device-ID")
         if let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
             request.setValue(appVersion, forHTTPHeaderField: "X-Prime-App-Version")
         }
@@ -403,6 +446,23 @@ enum BackendRequestTransport {
         #else
         return "unknown"
         #endif
+    }
+
+    private static func stableDeviceIdentifier(defaults: UserDefaults = .standard) -> String {
+        if let existing = defaults.string(forKey: stableDeviceIdentifierDefaultsKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            existing.isEmpty == false {
+            return existing
+        }
+
+        let fallback = UUID().uuidString
+        #if canImport(UIKit)
+        let generated = UIDevice.current.identifierForVendor?.uuidString ?? fallback
+        #else
+        let generated = fallback
+        #endif
+        defaults.set(generated, forKey: stableDeviceIdentifierDefaultsKey)
+        return generated
     }
 
     private static func storedCurrentUserID(defaults: UserDefaults = .standard) -> UUID? {

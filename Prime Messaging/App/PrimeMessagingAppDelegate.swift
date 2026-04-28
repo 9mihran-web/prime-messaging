@@ -7,17 +7,44 @@ import PushKit
 @MainActor
 final class PrimeMessagingAppDelegate: NSObject, UIApplicationDelegate {
     private let logger = Logger(subsystem: "mirowin.Prime-Messaging", category: "PushRegistration")
+    private let startupCallRepository: any CallRepository = BackendCallRepository(fallback: MockCallRepository())
+    private enum BootstrapStorageKeys {
+        static let currentUser = "app_state.current_user"
+    }
     #if os(iOS) && canImport(PushKit)
     private let voipPushCoordinator = VoIPPushCoordinator()
     #endif
+
+    override init() {
+        super.init()
+        logPushTrace("init")
+    }
+
+    private func logPushTrace(_ step: String, details: String = "") {
+        let suffix = details.isEmpty ? "" : " \(details)"
+        let message = "PUSHTRACE appDelegate step=\(step) main=\(Thread.isMainThread)\(suffix)"
+        logger.error("\(message, privacy: .public)")
+        NSLog("%@", message)
+        print(message)
+    }
 
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey : Any]? = nil
     ) -> Bool {
+        logPushTrace("didFinishLaunching.begin")
+        logger.info("Deferring launch service setup until after first run loop")
+        DispatchQueue.main.async { [weak self] in
+            self?.performDeferredLaunchSetup(launchOptions: launchOptions)
+        }
+        logPushTrace("didFinishLaunching.end")
+        return true
+    }
+
+    private func performDeferredLaunchSetup(launchOptions: [UIApplication.LaunchOptionsKey : Any]?) {
+        logPushTrace("deferredLaunchSetup.begin")
         #if !os(tvOS)
         LocalPushNotificationService.shared.registerBackgroundTasksIfNeeded()
-        application.setMinimumBackgroundFetchInterval(UIApplication.backgroundFetchIntervalMinimum)
         #endif
         #if os(iOS) && canImport(PushKit)
         voipPushCoordinator.start()
@@ -25,15 +52,54 @@ final class PrimeMessagingAppDelegate: NSObject, UIApplicationDelegate {
 
         if let remoteNotificationPayload = launchOptions?[.remoteNotification] as? [AnyHashable: Any],
            let callRoute = NotificationCallRoute(userInfo: remoteNotificationPayload) {
+            logPushTrace("deferredLaunchSetup.callRoute", details: "call=\(callRoute.callID.uuidString)")
             NotificationCallRouteStore.shared.queue(callRoute)
-            InternetCallManager.shared.queueIncomingCallFromPush(callID: callRoute.callID, callerName: callRoute.callerName)
+            handleIncomingCallNotificationRoute(callRoute, prewarmCallKit: true)
             logger.info("Queued call route from launch options for call \(callRoute.callID.uuidString, privacy: .public)")
         } else if let remoteNotificationPayload = launchOptions?[.remoteNotification] as? [AnyHashable: Any],
                   let chatRoute = NotificationChatRoute(userInfo: remoteNotificationPayload) {
+            logPushTrace("deferredLaunchSetup.chatRoute", details: "chat=\(chatRoute.chatID.uuidString)")
             NotificationRouteStore.shared.queue(chatRoute)
             logger.info("Queued notification route from launch options for chat \(chatRoute.chatID.uuidString, privacy: .public)")
         }
-        return true
+        logPushTrace("deferredLaunchSetup.end")
+    }
+
+    private func preconfigureCallManagerForLaunchIfPossible() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let userID = await self.resolveBootstrapUserIDForCallManager() else {
+                self.logger.info("Skipped early call manager preconfigure: no recoverable user at launch")
+                return
+            }
+            InternetCallManager.shared.configure(
+                currentUserID: userID,
+                repository: self.startupCallRepository
+            )
+            GroupInternetCallManager.shared.configure(
+                currentUserID: userID,
+                repository: self.startupCallRepository
+            )
+            self.logger.info("Preconfigured call manager at launch for user \(userID.uuidString, privacy: .public)")
+        }
+    }
+
+    private func resolveBootstrapUserIDForCallManager() async -> UUID? {
+        if let persistedUserID = persistedAppStateUserID() {
+            return persistedUserID
+        }
+        let sessions = await AuthSessionStore.shared.allSessions()
+        if sessions.count == 1, let recentSession = sessions.first {
+            return recentSession.userID
+        }
+        return nil
+    }
+
+    private func persistedAppStateUserID() -> UUID? {
+        guard let data = UserDefaults.standard.data(forKey: BootstrapStorageKeys.currentUser) else {
+            return nil
+        }
+        return (try? JSONDecoder().decode(User.self, from: data))?.id
     }
 
     func application(
@@ -81,17 +147,22 @@ final class PrimeMessagingAppDelegate: NSObject, UIApplicationDelegate {
         #if !os(tvOS)
         if let callRoute = NotificationCallRoute(userInfo: userInfo) {
             NotificationCallRouteStore.shared.queue(callRoute)
-            InternetCallManager.shared.queueIncomingCallFromPush(callID: callRoute.callID, callerName: callRoute.callerName)
+            handleIncomingCallNotificationRoute(callRoute, prewarmCallKit: true)
             logger.info("Queued call route from remote notification callback for call \(callRoute.callID.uuidString, privacy: .public)")
             completionHandler(.newData)
             return
         }
 
         if let chatRoute = NotificationChatRoute(userInfo: userInfo) {
-            LocalPushNotificationService.shared.handleIncomingChatPushRoute(
-                chatRoute,
-                source: "remote_notification"
-            )
+            if application.applicationState == .active {
+                logger.info(
+                    "Received foreground chat push callback; willPresent path is responsible for in-app banner chat=\(chatRoute.chatID.uuidString, privacy: .public)"
+                )
+            } else {
+                logger.info(
+                    "Received background chat push callback; skipping immediate UI route chat=\(chatRoute.chatID.uuidString, privacy: .public)"
+                )
+            }
             completionHandler(.newData)
             return
         }
@@ -109,7 +180,7 @@ private final class VoIPPushCoordinator: NSObject, PKPushRegistryDelegate {
     private var registry: PKPushRegistry?
     private var recentCallPushes: [String: Date] = [:]
     private let duplicateWindow: TimeInterval = 2.0
-    private let staleWindow: TimeInterval = 45.0
+    private let staleWindow: TimeInterval = 10 * 60
     private let isoFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -132,6 +203,7 @@ private final class VoIPPushCoordinator: NSObject, PKPushRegistryDelegate {
             await LocalPushNotificationService.shared.syncVoIPDeviceToken(tokenData)
             NotificationCenter.default.post(name: .primeMessagingDidRegisterVoIPDeviceToken, object: tokenData)
             self.logger.info("Received VoIP token from PushKit. bytes=\(tokenData.count, privacy: .public)")
+            print("[CallManager] voip.token.received bytes=\(tokenData.count)")
         }
     }
 
@@ -153,35 +225,49 @@ private final class VoIPPushCoordinator: NSObject, PKPushRegistryDelegate {
             completion()
             return
         }
-
-        Task { @MainActor in
-            defer { completion() }
-
-            let userInfo = payload.dictionaryPayload
-            guard let callRoute = NotificationCallRoute(userInfo: userInfo) else {
-                self.logger.error("Invalid VoIP payload: call_id is missing or malformed")
-                return
+        if Thread.isMainThread {
+            MainActor.assumeIsolated {
+                self.handleIncomingVoIPPush(payload: payload, completion: completion)
             }
-            let now = Date()
-            if let rawIssuedAt = userInfo["issued_at"] as? String,
-               let issuedAt = isoFormatter.date(from: rawIssuedAt),
-               now.timeIntervalSince(issuedAt) > staleWindow {
-                self.logger.info("Dropped stale VoIP push call=\(callRoute.callID.uuidString, privacy: .public)")
-                return
-            }
-
-            let dedupeKey = callRoute.callID.uuidString.lowercased()
-            if let lastSeen = recentCallPushes[dedupeKey], now.timeIntervalSince(lastSeen) <= duplicateWindow {
-                self.logger.info("Dropped duplicate VoIP push call=\(callRoute.callID.uuidString, privacy: .public)")
-                return
-            }
-            recentCallPushes[dedupeKey] = now
-            recentCallPushes = recentCallPushes.filter { now.timeIntervalSince($0.value) <= 30 }
-
-            NotificationCallRouteStore.shared.queue(callRoute)
-            InternetCallManager.shared.queueIncomingCallFromPush(callID: callRoute.callID, callerName: callRoute.callerName)
-            self.logger.info("Handled VoIP push for call=\(callRoute.callID.uuidString, privacy: .public)")
+            return
         }
+        Task { @MainActor in
+            self.handleIncomingVoIPPush(payload: payload, completion: completion)
+        }
+    }
+
+    @MainActor
+    private func handleIncomingVoIPPush(payload: PKPushPayload, completion: @escaping () -> Void) {
+        defer { completion() }
+
+        let userInfo = payload.dictionaryPayload
+        guard let callRoute = NotificationCallRoute(userInfo: userInfo) else {
+            self.logger.error("Invalid VoIP payload: call_id is missing or malformed")
+            print("[CallManager] voip.push.invalid_payload")
+            return
+        }
+
+        let now = Date()
+        if let rawIssuedAt = userInfo["issued_at"] as? String,
+           let issuedAt = isoFormatter.date(from: rawIssuedAt),
+           now.timeIntervalSince(issuedAt) > staleWindow {
+            self.logger.info(
+                "VoIP push is older than stale window but still accepted. call=\(callRoute.callID.uuidString, privacy: .public)"
+            )
+        }
+
+        let dedupeKey = callRoute.callID.uuidString.lowercased()
+        if let lastSeen = recentCallPushes[dedupeKey], now.timeIntervalSince(lastSeen) <= duplicateWindow {
+            self.logger.info("VoIP duplicate received but still prewarming CallKit call=\(callRoute.callID.uuidString, privacy: .public)")
+            print("[CallManager] voip.push.duplicate.prewarm call=\(callRoute.callID.uuidString)")
+        }
+        recentCallPushes[dedupeKey] = now
+        recentCallPushes = recentCallPushes.filter { now.timeIntervalSince($0.value) <= 30 }
+
+        NotificationCallRouteStore.shared.queue(callRoute)
+        handleIncomingCallNotificationRoute(callRoute, prewarmCallKit: true)
+        self.logger.info("Handled VoIP push for call=\(callRoute.callID.uuidString, privacy: .public)")
+        print("[CallManager] voip.push.handled call=\(callRoute.callID.uuidString)")
     }
 }
 #endif

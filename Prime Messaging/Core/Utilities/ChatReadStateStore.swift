@@ -81,6 +81,12 @@ actor ChatReadStateStore {
         return incomingMessages.suffix(unresolvedUnreadCount).first?.id
     }
 
+    func purgeChat(chatID: UUID, userID: UUID) {
+        var markers = loadReadMarkers()
+        markers.removeAll { $0.chatID == chatID && $0.userID == userID }
+        persistReadMarkers(markers)
+    }
+
     private func upsertReadMarker(chatID: UUID, mode: ChatMode, userID: UUID, readThroughAt: Date) {
         var markers = loadReadMarkers()
         if let index = markers.firstIndex(where: { $0.chatID == chatID && $0.mode == mode && $0.userID == userID }) {

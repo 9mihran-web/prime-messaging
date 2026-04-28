@@ -16,15 +16,15 @@ enum ChatFeedCategoryFilter: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .all:
-            return "All"
+            return "chatfeed.filter.all".localized
         case .chats:
-            return "Chats"
+            return "chatfeed.filter.chats".localized
         case .groups:
-            return "Groups"
+            return "chatfeed.filter.groups".localized
         case .channels:
-            return "Channels"
+            return "chatfeed.filter.channels".localized
         case .communities:
-            return "Communities"
+            return "chatfeed.filter.communities".localized
         }
     }
 }
@@ -40,6 +40,10 @@ struct ChatListView: View {
     @StateObject private var viewModel = ChatListViewModel()
     @State private var pendingDeferredHydration = false
     @State private var pendingDeferredRefresh = false
+    @State private var pendingForegroundRefreshAfterActivation = false
+    @State private var isShowingPinLimitAlert = false
+    @State private var realtimeFeedTask: Task<Void, Never>?
+    @State private var deferredInitialRefreshTask: Task<Void, Never>?
 
     var body: some View {
         SwiftUI.Group {
@@ -53,60 +57,69 @@ struct ChatListView: View {
             }
         }
         .background(PrimeTheme.Colors.background)
-        .navigationDestination(for: Chat.self) { chat in
-            ChatView(chat: chat)
-        }
-        .navigationDestination(
-            isPresented: Binding(
-                get: { appState.routedChat != nil },
-                set: { isPresented in
-                    if isPresented == false {
-                        appState.clearRoutedChat()
-                    }
-                }
-            )
-        ) {
-            if let routedChat = appState.routedChat {
-                ChatView(chat: routedChat)
-            }
-        }
         .task(id: refreshTaskID) {
+            deferredInitialRefreshTask?.cancel()
             await hydrateChatsIfAppropriate(force: true)
+            await startRealtimeFeedIfNeeded()
+            deferredInitialRefreshTask = Task { @MainActor in
+                await Task.yield()
+                guard Task.isCancelled == false else { return }
+                await refreshChatsIfAppropriate(force: true)
+            }
             while !Task.isCancelled {
                 await refreshChatsIfAppropriate()
-                try? await Task.sleep(for: feedRefreshInterval)
+                try? await Task.sleep(for: feedSafetyRefreshInterval)
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .primeMessagingDraftsChanged)) { _ in
-            if shouldDeferFeedRefresh {
-                pendingDeferredHydration = true
-            } else {
-                viewModel.scheduleHydration(
-                    mode: mode,
-                    repository: environment.chatRepository,
-                    localStore: environment.localStore,
-                    userID: appState.currentUser.id
-                )
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .primeMessagingChatSnapshotsChanged)) { _ in
-            if shouldDeferFeedRefresh {
-                pendingDeferredHydration = true
-            } else {
-                viewModel.scheduleHydration(
-                    mode: mode,
-                    repository: environment.chatRepository,
-                    localStore: environment.localStore,
-                    userID: appState.currentUser.id
-                )
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+        .onDisappear {
+            deferredInitialRefreshTask?.cancel()
+            realtimeFeedTask?.cancel()
             Task {
+                await ChatRealtimeService.shared.unsubscribeFeed(userID: appState.currentUser.id)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .primeMessagingDraftsChanged).receive(on: RunLoop.main)) { _ in
+            if shouldDeferFeedRefresh {
+                pendingDeferredHydration = true
+            } else {
+                viewModel.scheduleHydration(
+                    mode: mode,
+                    repository: environment.chatRepository,
+                    authRepository: environment.authRepository,
+                    localStore: environment.localStore,
+                    userID: appState.currentUser.id
+                )
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .primeMessagingChatSnapshotsChanged).receive(on: RunLoop.main)) { _ in
+            if shouldDeferFeedRefresh {
+                pendingDeferredHydration = true
+            } else {
+                viewModel.scheduleHydration(
+                    mode: mode,
+                    repository: environment.chatRepository,
+                    authRepository: environment.authRepository,
+                    localStore: environment.localStore,
+                    userID: appState.currentUser.id
+                )
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification).receive(on: RunLoop.main)) { _ in
+            Task { @MainActor in
+                pendingForegroundRefreshAfterActivation = true
+                guard appState.isSceneActive else { return }
+                pendingForegroundRefreshAfterActivation = false
                 await refreshChatsIfAppropriate(force: true)
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .primeMessagingIncomingChatPush)) { notification in
+        .onChange(of: appState.isSceneActive) { isSceneActive in
+            guard isSceneActive, pendingForegroundRefreshAfterActivation else { return }
+            Task { @MainActor in
+                pendingForegroundRefreshAfterActivation = false
+                await refreshChatsIfAppropriate(force: true)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .primeMessagingIncomingChatPush).receive(on: RunLoop.main)) { notification in
             guard
                 let userInfo = notification.userInfo,
                 let route = NotificationChatRoute(userInfo: userInfo),
@@ -114,15 +127,23 @@ struct ChatListView: View {
             else {
                 return
             }
-            Task {
+            Task { @MainActor in
+                if await ChatRealtimeService.shared.isLikelyConnected(userID: appState.currentUser.id) {
+                    return
+                }
                 await refreshChatsIfAppropriate(force: true)
             }
         }
         .onChange(of: mediaPlaybackActivity.isPlaybackActive) { isActive in
             guard isActive == false else { return }
-            Task {
+            Task { @MainActor in
                 await runDeferredFeedUpdatesIfNeeded()
             }
+        }
+        .alert("chat.pin.limit.title".localized, isPresented: $isShowingPinLimitAlert) {
+            Button("common.ok".localized, role: .cancel) { }
+        } message: {
+            Text("chat.pin.limit.message".localized)
         }
     }
 
@@ -138,12 +159,44 @@ struct ChatListView: View {
         isChatScreenVisible && mediaPlaybackActivity.shouldDeferChatRefresh(gracePeriod: 1.75)
     }
 
-    private var feedRefreshInterval: Duration {
+    private var feedSafetyRefreshInterval: Duration {
         switch mode {
         case .offline:
-            return .seconds(4)
+            return .seconds(8)
         case .smart, .online:
-            return isChatScreenVisible ? .seconds(18) : .seconds(8)
+            return isChatScreenVisible ? .seconds(160) : .seconds(110)
+        }
+    }
+
+    @MainActor
+    private func startRealtimeFeedIfNeeded() async {
+        realtimeFeedTask?.cancel()
+        realtimeFeedTask = nil
+
+        guard mode == .online else { return }
+
+        await ChatRealtimeService.shared.subscribeFeed(
+            userID: appState.currentUser.id,
+            mode: mode
+        )
+        let stream = await ChatRealtimeService.shared.stream(for: appState.currentUser.id, mode: mode)
+        realtimeFeedTask = Task { @MainActor in
+            for await event in stream {
+                guard Task.isCancelled == false else { return }
+                await viewModel.applyRealtimeEvent(
+                    event,
+                    repository: environment.chatRepository,
+                    authRepository: environment.authRepository,
+                    localStore: environment.localStore,
+                    currentUserID: appState.currentUser.id,
+                    visibleMode: mode,
+                    activeChatID: appState.selectedChat?.id
+                )
+                if (event.type == "chat.removed" || event.type == "chat.deleted"), let chatID = event.chatID {
+                    appState.forgetChatRoutes(chatIDs: [chatID])
+                }
+                _ = appState.resolvePendingNotificationRoute(with: viewModel.chats)
+            }
         }
     }
 
@@ -158,6 +211,7 @@ struct ChatListView: View {
         await viewModel.hydrateChats(
             mode: mode,
             repository: environment.chatRepository,
+            authRepository: environment.authRepository,
             localStore: environment.localStore,
             userID: appState.currentUser.id
         )
@@ -175,6 +229,7 @@ struct ChatListView: View {
         await viewModel.refreshChats(
             mode: mode,
             repository: environment.chatRepository,
+            authRepository: environment.authRepository,
             localStore: environment.localStore,
             userID: appState.currentUser.id
         )
@@ -205,9 +260,14 @@ struct ChatListView: View {
                 ) {
                     appState.routeToChat(chat)
                 } content: {
-                    ChatRowView(chat: chat, currentUserID: appState.currentUser.id, visibleMode: mode)
+                    ChatRowView(
+                        chat: chat,
+                        presentation: row.presentation,
+                        currentUserID: appState.currentUser.id,
+                        visibleMode: mode
+                    )
+                        .equatable()
                 }
-                .padding(.vertical, 2)
 
                 if row.id != rows.last?.id {
                     Divider()
@@ -219,18 +279,63 @@ struct ChatListView: View {
     }
 
     private var displayRows: [ChatFeedRow] {
-        filteredChats.map { chat in
-            ChatFeedRow(
+        viewModel.chats.compactMap { chat -> ChatFeedRow? in
+            guard matchesFilter(chat: chat) else { return nil }
+            return ChatFeedRow(
                 id: chatFeedIdentityKey(for: chat, currentUserID: appState.currentUser.id),
-                chat: chat
+                chat: chat,
+                presentation: makeRowPresentation(for: chat)
             )
         }
     }
 
-    private var filteredChats: [Chat] {
-        viewModel.chats.filter { chat in
-            matchesFilter(chat: chat)
-        }
+    private func makeRowPresentation(for chat: Chat) -> ChatRowPresentation {
+        let title = chat.displayTitle(for: appState.currentUser.id)
+        let previewText = chat.lastMessagePreview ?? chat.subtitle
+        let communityBadge: ChatRowPresentation.Badge? = {
+            guard let communityDetails = chat.communityDetails else { return nil }
+            return .init(title: communityDetails.badgeTitle, systemName: communityDetails.symbolName)
+        }()
+        let eventBadge: ChatRowPresentation.Badge? = {
+            guard let eventDetails = chat.eventDetails, eventDetails.isExpired == false else { return nil }
+            return .init(title: eventDetails.badgeTitle, systemName: eventDetails.symbolName)
+        }()
+        let avatarPhotoURL = chat.group?.photoURL
+            ?? chat.directParticipant(for: appState.currentUser.id)?.photoURL
+            ?? (chat.type == .direct
+                ? chat.participantIDs
+                    .first(where: { $0 != appState.currentUser.id })
+                    .flatMap { viewModel.directAvatarURLByUserID[$0] }
+                : nil)
+        let avatarPlaceholderText = String(title.prefix(1))
+        let timestampText: String? = {
+            guard chat.type != .selfChat else { return nil }
+            let calendar = Calendar.current
+            if calendar.isDateInToday(chat.lastActivityAt) {
+                return chat.lastActivityAt.formatted(.dateTime.hour().minute())
+            }
+            if calendar.isDateInYesterday(chat.lastActivityAt) {
+                return "Yesterday"
+            }
+            return chat.lastActivityAt.formatted(.dateTime.day().month(.twoDigits).year(.twoDigits))
+        }()
+
+        return ChatRowPresentation(
+            title: title,
+            previewText: previewText,
+            eventStatus: chat.eventStatusText(),
+            communityStatus: chat.communityStatusText(),
+            moderationStatus: chat.moderationStatusText(),
+            timestampText: timestampText,
+            avatarPhotoURL: avatarPhotoURL,
+            avatarPlaceholderText: avatarPlaceholderText,
+            isOfficial: chat.communityDetails?.isOfficial == true,
+            communityBadge: communityBadge,
+            eventBadge: eventBadge,
+            unreadCount: chat.unreadCount,
+            isPinned: chat.isPinned,
+            draftText: chat.draft?.text
+        )
     }
 
     private func matchesFilter(chat: Chat) -> Bool {
@@ -238,19 +343,15 @@ struct ChatListView: View {
         case .all:
             return true
         case .chats:
-            return chat.communityDetails == nil && chat.type != .group
+            return chat.type == .direct || chat.type == .selfChat || chat.type == .secret
         case .groups:
-            if chat.type == .group {
-                return true
-            }
-            guard let kind = chat.communityDetails?.kind else {
-                return false
-            }
+            guard chat.type == .group else { return false }
+            let kind = chat.communityDetails?.kind ?? .group
             return kind == .group || kind == .supergroup
         case .channels:
-            return chat.communityDetails?.kind == .channel
+            return chat.type == .group && chat.communityDetails?.kind == .channel
         case .communities:
-            return chat.communityDetails?.kind == .community
+            return chat.type == .group && chat.communityDetails?.kind == .community
         }
     }
 
@@ -275,7 +376,10 @@ struct ChatListView: View {
                 tint: PrimeTheme.Colors.accent
             ) {
                 Task {
-                    await viewModel.togglePinned(chat, currentUserID: appState.currentUser.id)
+                    let didToggle = await viewModel.togglePinned(chat, currentUserID: appState.currentUser.id)
+                    if didToggle == false {
+                        isShowingPinLimitAlert = true
+                    }
                 }
             },
         ]
@@ -305,10 +409,30 @@ struct ChatListView: View {
     }
 }
 
-struct ChatRowView: View {
+struct ChatRowView: View, Equatable {
     let chat: Chat
+    let presentation: ChatRowPresentation
     let currentUserID: UUID
     let visibleMode: ChatMode
+
+    init(
+        chat: Chat,
+        presentation: ChatRowPresentation? = nil,
+        currentUserID: UUID,
+        visibleMode: ChatMode
+    ) {
+        self.chat = chat
+        self.currentUserID = currentUserID
+        self.visibleMode = visibleMode
+        self.presentation = presentation ?? Self.makePresentation(for: chat, currentUserID: currentUserID)
+    }
+
+    static func == (lhs: ChatRowView, rhs: ChatRowView) -> Bool {
+        lhs.chat == rhs.chat
+            && lhs.presentation == rhs.presentation
+            && lhs.currentUserID == rhs.currentUserID
+            && lhs.visibleMode == rhs.visibleMode
+    }
 
     var body: some View {
         HStack(alignment: .center, spacing: PrimeTheme.Spacing.medium) {
@@ -318,18 +442,18 @@ struct ChatRowView: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 8) {
-                            Text(chat.displayTitle(for: currentUserID))
+                            Text(presentation.title)
                                 .font(.system(.headline, design: .rounded).weight(.semibold))
                                 .foregroundStyle(PrimeTheme.Colors.textPrimary)
 
-                            if chat.communityDetails?.isOfficial == true {
+                            if presentation.isOfficial {
                                 Image(systemName: "checkmark.seal.fill")
                                     .font(.caption.weight(.semibold))
                                     .foregroundStyle(PrimeTheme.Colors.accent)
                             }
 
-                            if let communityDetails = chat.communityDetails {
-                                Label(communityDetails.badgeTitle, systemImage: communityDetails.symbolName)
+                            if let communityBadge = presentation.communityBadge {
+                                Label(communityBadge.title, systemImage: communityBadge.systemName)
                                     .font(.caption2.weight(.semibold))
                                     .foregroundStyle(PrimeTheme.Colors.accent)
                                     .padding(.horizontal, 8)
@@ -340,8 +464,8 @@ struct ChatRowView: View {
                                     )
                             }
 
-                            if let eventDetails = chat.eventDetails, eventDetails.isExpired == false {
-                                Label(eventDetails.badgeTitle, systemImage: eventDetails.symbolName)
+                            if let eventBadge = presentation.eventBadge {
+                                Label(eventBadge.title, systemImage: eventBadge.systemName)
                                     .font(.caption2.weight(.semibold))
                                     .foregroundStyle(PrimeTheme.Colors.offlineAccent)
                                     .padding(.horizontal, 8)
@@ -353,22 +477,22 @@ struct ChatRowView: View {
                             }
                         }
 
-                        Text(chat.lastMessagePreview ?? chat.subtitle)
+                        Text(presentation.previewText)
                             .font(.subheadline)
                             .foregroundStyle(PrimeTheme.Colors.textSecondary)
                             .lineLimit(2)
 
-                        if let eventStatus = chat.eventStatusText() {
+                        if let eventStatus = presentation.eventStatus {
                             Text(eventStatus)
                                 .font(.caption.weight(.medium))
                                 .foregroundStyle(PrimeTheme.Colors.offlineAccent)
                                 .lineLimit(1)
-                        } else if let communityStatus = chat.communityStatusText() {
+                        } else if let communityStatus = presentation.communityStatus {
                             Text(communityStatus)
                                 .font(.caption.weight(.medium))
                                 .foregroundStyle(PrimeTheme.Colors.accentSoft)
                                 .lineLimit(1)
-                        } else if let moderationStatus = chat.moderationStatusText() {
+                        } else if let moderationStatus = presentation.moderationStatus {
                             Text(moderationStatus)
                                 .font(.caption.weight(.medium))
                                 .foregroundStyle(PrimeTheme.Colors.warning)
@@ -378,38 +502,47 @@ struct ChatRowView: View {
 
                     Spacer()
                     VStack(alignment: .trailing, spacing: 6) {
-                        if let timestampText {
+                        if let timestampText = presentation.timestampText {
                             Text(timestampText)
                                 .font(.caption.weight(.medium))
                                 .foregroundStyle(PrimeTheme.Colors.textSecondary)
                         }
 
-                        if chat.unreadCount > 0 {
-                            Text("\(chat.unreadCount)")
+                        if presentation.unreadCount > 0 {
+                            Text("\(presentation.unreadCount)")
                                 .font(.caption2.weight(.bold))
                                 .foregroundStyle(Color.white)
                                 .padding(.horizontal, 7)
                                 .padding(.vertical, 4)
                                 .background(Capsule(style: .continuous).fill(PrimeTheme.Colors.accent))
                         }
+
+                        if presentation.isPinned {
+                            Image(systemName: "pin.fill")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(PrimeTheme.Colors.accent)
+                        }
                     }
                 }
 
-                if let draft = chat.draft {
-                    Text("Draft: \(draft.text)")
+                if let draftText = presentation.draftText {
+                    Text("Draft: \(draftText)")
                         .font(.caption)
                         .foregroundStyle(PrimeTheme.Colors.accentSoft)
                         .lineLimit(1)
                 }
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 14)
+        .padding(.horizontal, PrimeTheme.Spacing.medium)
+        .background(PrimeTheme.Colors.background)
     }
 
     private var avatarView: some View {
         SwiftUI.Group {
-            if let photoURL = avatarPhotoURL {
-                CachedRemoteImage(url: photoURL) { image in
+            if let photoURL = presentation.avatarPhotoURL {
+                CachedRemoteImage(url: photoURL, maxPixelSize: 256) { image in
                     image
                         .resizable()
                         .scaledToFill()
@@ -424,18 +557,11 @@ struct ChatRowView: View {
         .clipShape(Circle())
     }
 
-    private var avatarPhotoURL: URL? {
-        if let groupPhotoURL = chat.group?.photoURL {
-            return groupPhotoURL
-        }
-        return chat.directParticipant(for: currentUserID)?.photoURL
-    }
-
     private var avatarPlaceholder: some View {
         Circle()
             .fill(avatarAccentColor.opacity(0.92))
             .overlay(
-                Text(String(chat.displayTitle(for: currentUserID).prefix(1)))
+                Text(presentation.avatarPlaceholderText)
                     .font(.headline)
                     .foregroundStyle(Color.white)
             )
@@ -452,50 +578,115 @@ struct ChatRowView: View {
         }
     }
 
-    private var timestampText: String? {
-        guard chat.type != .selfChat else { return nil }
-        let calendar = Calendar.current
-        if calendar.isDateInToday(chat.lastActivityAt) {
-            return chat.lastActivityAt.formatted(.dateTime.hour().minute())
-        }
+    private static func makePresentation(for chat: Chat, currentUserID: UUID) -> ChatRowPresentation {
+        let title = chat.displayTitle(for: currentUserID)
+        let previewText = chat.lastMessagePreview ?? chat.subtitle
+        let communityBadge: ChatRowPresentation.Badge? = {
+            guard let communityDetails = chat.communityDetails else { return nil }
+            return .init(title: communityDetails.badgeTitle, systemName: communityDetails.symbolName)
+        }()
+        let eventBadge: ChatRowPresentation.Badge? = {
+            guard let eventDetails = chat.eventDetails, eventDetails.isExpired == false else { return nil }
+            return .init(title: eventDetails.badgeTitle, systemName: eventDetails.symbolName)
+        }()
+        let avatarPhotoURL = chat.group?.photoURL
+            ?? chat.directParticipant(for: currentUserID)?.photoURL
+        let avatarPlaceholderText = String(title.prefix(1))
+        let timestampText: String? = {
+            guard chat.type != .selfChat else { return nil }
+            let calendar = Calendar.current
+            if calendar.isDateInToday(chat.lastActivityAt) {
+                return chat.lastActivityAt.formatted(.dateTime.hour().minute())
+            }
+            if calendar.isDateInYesterday(chat.lastActivityAt) {
+                return "Yesterday"
+            }
+            return chat.lastActivityAt.formatted(.dateTime.day().month(.twoDigits).year(.twoDigits))
+        }()
 
-        if calendar.isDateInYesterday(chat.lastActivityAt) {
-            return "Yesterday"
-        }
-
-        return chat.lastActivityAt.formatted(.dateTime.day().month(.twoDigits).year(.twoDigits))
+        return ChatRowPresentation(
+            title: title,
+            previewText: previewText,
+            eventStatus: chat.eventStatusText(),
+            communityStatus: chat.communityStatusText(),
+            moderationStatus: chat.moderationStatusText(),
+            timestampText: timestampText,
+            avatarPhotoURL: avatarPhotoURL,
+            avatarPlaceholderText: avatarPlaceholderText,
+            isOfficial: chat.communityDetails?.isOfficial == true,
+            communityBadge: communityBadge,
+            eventBadge: eventBadge,
+            unreadCount: chat.unreadCount,
+            isPinned: chat.isPinned,
+            draftText: chat.draft?.text
+        )
     }
 }
 
 private struct ChatFeedRow: Identifiable {
     let id: String
     let chat: Chat
+    let presentation: ChatRowPresentation
 }
 
+struct ChatRowPresentation: Equatable {
+    struct Badge: Equatable {
+        let title: String
+        let systemName: String
+    }
+
+    let title: String
+    let previewText: String
+    let eventStatus: String?
+    let communityStatus: String?
+    let moderationStatus: String?
+    let timestampText: String?
+    let avatarPhotoURL: URL?
+    let avatarPlaceholderText: String
+    let isOfficial: Bool
+    let communityBadge: Badge?
+    let eventBadge: Badge?
+    let unreadCount: Int
+    let isPinned: Bool
+    let draftText: String?
+}
+
+@MainActor
 final class ChatListViewModel: ObservableObject {
     @Published private(set) var chats: [Chat] = []
+    @Published private(set) var directAvatarURLByUserID: [UUID: URL] = [:]
     private var activeScopeID = ""
     private var pendingHydrationTask: Task<Void, Never>?
+    private var directAvatarHydrationTask: Task<Void, Never>?
+    private var preparedChatCache: [String: PreparedChatCacheEntry] = [:]
+
+    private struct PreparedChatCacheEntry {
+        let inputFingerprint: Int
+        var chat: Chat
+    }
 
     deinit {
         pendingHydrationTask?.cancel()
+        directAvatarHydrationTask?.cancel()
     }
 
     @MainActor
     func scheduleHydration(
         mode: ChatMode,
         repository: ChatRepository,
+        authRepository: AuthRepository,
         localStore: LocalStore,
         userID: UUID,
         delay: Duration = .milliseconds(180)
     ) {
         pendingHydrationTask?.cancel()
-        pendingHydrationTask = Task { [mode, repository, localStore, userID] in
+        pendingHydrationTask = Task { [mode, repository, authRepository, localStore, userID] in
             try? await Task.sleep(for: delay)
             guard Task.isCancelled == false else { return }
             await self.hydrateChats(
                 mode: mode,
                 repository: repository,
+                authRepository: authRepository,
                 localStore: localStore,
                 userID: userID
             )
@@ -503,17 +694,16 @@ final class ChatListViewModel: ObservableObject {
     }
 
     @MainActor
-    func hydrateChats(mode: ChatMode, repository: ChatRepository, localStore: LocalStore, userID: UUID) async {
+    func hydrateChats(mode: ChatMode, repository: ChatRepository, authRepository: AuthRepository, localStore: LocalStore, userID: UUID) async {
         let scopeID = "\(mode.rawValue)-\(userID.uuidString)"
-        if activeScopeID != scopeID {
-            activeScopeID = scopeID
-        }
+        activateScope(scopeID)
 
         let cachedChats = await repository.cachedChats(mode: mode, for: userID)
         guard activeScopeID == scopeID else { return }
         await applyFetchedChats(
             cachedChats,
             repository: repository,
+            authRepository: authRepository,
             localStore: localStore,
             currentUserID: userID,
             visibleMode: mode,
@@ -522,17 +712,16 @@ final class ChatListViewModel: ObservableObject {
     }
 
     @MainActor
-    func refreshChats(mode: ChatMode, repository: ChatRepository, localStore: LocalStore, userID: UUID) async {
+    func refreshChats(mode: ChatMode, repository: ChatRepository, authRepository: AuthRepository, localStore: LocalStore, userID: UUID) async {
         let scopeID = "\(mode.rawValue)-\(userID.uuidString)"
-        if activeScopeID != scopeID {
-            activeScopeID = scopeID
-        }
+        activateScope(scopeID)
         do {
             let fetchedChats = try await repository.fetchChats(mode: mode, for: userID)
             guard activeScopeID == scopeID else { return }
             await applyFetchedChats(
                 fetchedChats,
                 repository: repository,
+                authRepository: authRepository,
                 localStore: localStore,
                 currentUserID: userID,
                 visibleMode: mode,
@@ -542,19 +731,111 @@ final class ChatListViewModel: ObservableObject {
     }
 
     @MainActor
+    func applyRealtimeEvent(
+        _ event: RealtimeChatEvent,
+        repository: ChatRepository,
+        authRepository: AuthRepository,
+        localStore: LocalStore,
+        currentUserID: UUID,
+        visibleMode: ChatMode,
+        activeChatID: UUID?
+    ) async {
+        if let mode = event.mode, mode != visibleMode {
+            return
+        }
+
+        if event.type == "chat.removed" || event.type == "chat.deleted" {
+            guard let chatID = event.chatID else { return }
+            chats.removeAll(where: { $0.id == chatID })
+            invalidatePreparedChatCache(chatID: chatID, mode: visibleMode)
+            await purgeLocalChatState(chatID: chatID, ownerUserID: currentUserID, repository: repository)
+            updateApplicationBadge(using: chats)
+            return
+        }
+
+        if let updatedChat = event.chat {
+            await applyFetchedChats(
+                [updatedChat],
+                repository: repository,
+                authRepository: authRepository,
+                localStore: localStore,
+                currentUserID: currentUserID,
+                visibleMode: visibleMode,
+                preserveExistingWhenEmpty: false
+            )
+            let persistedChat = chats.first(where: { $0.id == updatedChat.id }) ?? updatedChat
+            await ChatSnapshotStore.shared.upsertChat(persistedChat, userID: currentUserID, mode: visibleMode)
+        }
+
+        if event.type == "chat.resync_required" {
+            await refreshChats(
+                mode: visibleMode,
+                repository: repository,
+                authRepository: authRepository,
+                localStore: localStore,
+                userID: currentUserID
+            )
+            return
+        }
+
+        guard let message = event.message else { return }
+
+        if let chatIndex = chats.firstIndex(where: { $0.id == message.chatID }) {
+            var nextChat = chats[chatIndex]
+            nextChat.lastActivityAt = max(nextChat.lastActivityAt, message.createdAt)
+            nextChat.lastMessagePreview = realtimePreviewText(for: message)
+            if event.type == "message.created",
+               message.senderID != currentUserID,
+               activeChatID != message.chatID,
+               message.isDeleted == false {
+                nextChat.unreadCount = max(0, nextChat.unreadCount + 1)
+            }
+
+            chats[chatIndex] = nextChat
+            updatePreparedChatCache(for: nextChat)
+            updateDisplayedChats(chats, currentUserID: currentUserID)
+            await ChatSnapshotStore.shared.upsertMessage(
+                message,
+                in: nextChat,
+                userID: currentUserID,
+                mode: visibleMode
+            )
+            await ChatSnapshotStore.shared.upsertChat(nextChat, userID: currentUserID, mode: visibleMode)
+            return
+        }
+
+        if let eventChat = event.chat, eventChat.id == message.chatID {
+            var fallbackChat = eventChat
+            fallbackChat.lastActivityAt = max(fallbackChat.lastActivityAt, message.createdAt)
+            fallbackChat.lastMessagePreview = realtimePreviewText(for: message)
+            await ChatSnapshotStore.shared.upsertMessage(
+                message,
+                in: fallbackChat,
+                userID: currentUserID,
+                mode: visibleMode
+            )
+            await ChatSnapshotStore.shared.upsertChat(fallbackChat, userID: currentUserID, mode: visibleMode)
+        }
+
+        await refreshChats(
+            mode: visibleMode,
+            repository: repository,
+            authRepository: authRepository,
+            localStore: localStore,
+            userID: currentUserID
+        )
+    }
+
+    @MainActor
     private func applyFetchedChats(
         _ fetchedChats: [Chat],
         repository: ChatRepository,
+        authRepository: AuthRepository,
         localStore: LocalStore,
         currentUserID: UUID,
         visibleMode: ChatMode,
         preserveExistingWhenEmpty: Bool
     ) async {
-        let sanitizedExistingChats = await sanitizeExistingChats(
-            chats,
-            currentUserID: currentUserID,
-            visibleMode: visibleMode
-        )
         let drafts = await localStore.loadDrafts()
         let draftByChatKey = Dictionary(
             drafts.map { (draftKey(chatID: $0.chatID, mode: $0.mode), $0) },
@@ -573,34 +854,44 @@ final class ChatListViewModel: ObservableObject {
                 chatWithDraft.draft = nil
             }
 
-            let cachedMessages = await repository.cachedMessages(chatID: chat.id, mode: chat.mode)
-            await ChatReadStateStore.shared.bootstrapReadMarkerIfNeeded(
-                chat: chatWithDraft,
-                messages: cachedMessages,
-                currentUserID: currentUserID
-            )
-            chatWithDraft.unreadCount = await ChatReadStateStore.shared.unreadCount(
-                for: chatWithDraft,
-                messages: cachedMessages,
-                currentUserID: currentUserID
-            )
+            let inputFingerprint = preparedChatFingerprint(for: chatWithDraft)
+
+            if chat.mode == .online {
+                chatWithDraft.unreadCount = chatWithDraft.type == .selfChat ? 0 : max(chatWithDraft.unreadCount, 0)
+            } else {
+                let cachedMessages = await repository.cachedMessages(chatID: chat.id, mode: chat.mode)
+                await ChatReadStateStore.shared.bootstrapReadMarkerIfNeeded(
+                    chat: chatWithDraft,
+                    messages: cachedMessages,
+                    currentUserID: currentUserID
+                )
+                chatWithDraft.unreadCount = await ChatReadStateStore.shared.unreadCount(
+                    for: chatWithDraft,
+                    messages: cachedMessages,
+                    currentUserID: currentUserID
+                )
+            }
 
             let aliasedChat = await ContactAliasStore.shared.applyAlias(to: chatWithDraft, currentUserID: currentUserID)
             guard let eventDecoratedChat = await EventChatMetadataStore.shared.apply(to: aliasedChat, ownerUserID: currentUserID) else {
+                invalidatePreparedChatCache(chatID: chat.id, mode: chat.mode)
                 continue
             }
             if eventDecoratedChat.eventDetails?.isExpired == true {
-                await purgeLocalChatState(chatID: chat.id, ownerUserID: currentUserID)
+                invalidatePreparedChatCache(chatID: chat.id, mode: chat.mode)
+                await purgeLocalChatState(chatID: chat.id, ownerUserID: currentUserID, repository: repository)
                 continue
             }
             let communityDecoratedChat = await CommunityChatMetadataStore.shared.apply(to: eventDecoratedChat, ownerUserID: currentUserID)
             let moderationDecoratedChat = await GroupModerationSettingsStore.shared.apply(to: communityDecoratedChat, ownerUserID: currentUserID)
             if let decoratedChat = await ChatThreadStateStore.shared.apply(to: moderationDecoratedChat, ownerUserID: currentUserID) {
                 guard decoratedChat.isAvailable(in: visibleMode) else {
-                    await purgeLocalChatState(chatID: decoratedChat.id, ownerUserID: currentUserID)
+                    invalidatePreparedChatCache(chatID: decoratedChat.id, mode: decoratedChat.mode)
+                    await purgeLocalChatState(chatID: decoratedChat.id, ownerUserID: currentUserID, repository: repository)
                     continue
                 }
                 preparedChats.append(decoratedChat)
+                storePreparedChat(decoratedChat, inputFingerprint: inputFingerprint)
             }
         }
 
@@ -620,19 +911,97 @@ final class ChatListViewModel: ObservableObject {
             }
         }
 
-        guard preserveExistingWhenEmpty == false || preparedChats.isEmpty == false || sanitizedExistingChats.isEmpty else {
+        if preserveExistingWhenEmpty, preparedChats.isEmpty, chats.isEmpty == false {
+            let sanitizedExistingChats = await sanitizeExistingChats(
+                chats,
+                currentUserID: currentUserID,
+                visibleMode: visibleMode,
+                repository: repository
+            )
+            guard sanitizedExistingChats.isEmpty == false else {
+                updateDisplayedChats(preparedChats, currentUserID: currentUserID)
+                return
+            }
             updateDisplayedChats(sanitizedExistingChats, currentUserID: currentUserID)
             return
         }
 
-        let mergedChats = mergeDisplayedChats(existing: sanitizedExistingChats, incoming: preparedChats, currentUserID: currentUserID)
+        let existingMergeSource: [Chat]
+        if preserveExistingWhenEmpty {
+            let incomingConversationKeys = Set(
+                preparedChats.map { conversationKey(for: $0, currentUserID: currentUserID) }
+            )
+            existingMergeSource = chats.filter {
+                incomingConversationKeys.contains(
+                    conversationKey(for: $0, currentUserID: currentUserID)
+                )
+            }
+        } else {
+            existingMergeSource = chats
+        }
+
+        let mergedChats = mergeDisplayedChats(
+            existing: existingMergeSource,
+            incoming: preparedChats,
+            currentUserID: currentUserID
+        )
         updateDisplayedChats(mergedChats, currentUserID: currentUserID)
+        hydrateDirectAvatarURLsIfNeeded(
+            in: mergedChats,
+            authRepository: authRepository,
+            currentUserID: currentUserID
+        )
+    }
+
+    @MainActor
+    private func hydrateDirectAvatarURLsIfNeeded(
+        in chats: [Chat],
+        authRepository: AuthRepository,
+        currentUserID: UUID
+    ) {
+        let directTargets = chats.compactMap { chat -> UUID? in
+            guard chat.type == .direct else { return nil }
+            if let participant = chat.directParticipant(for: currentUserID),
+               let photoURL = participant.photoURL {
+                directAvatarURLByUserID[participant.id] = photoURL
+                return nil
+            }
+            return chat.participantIDs.first(where: { $0 != currentUserID })
+        }
+
+        let missingUserIDs = Array(Set(directTargets)).filter { directAvatarURLByUserID[$0] == nil }
+        guard missingUserIDs.isEmpty == false else { return }
+
+        directAvatarHydrationTask?.cancel()
+        let scopeID = activeScopeID
+        directAvatarHydrationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            for userID in missingUserIDs {
+                guard Task.isCancelled == false else { return }
+                do {
+                    let user = try await authRepository.userProfile(userID: userID)
+                    guard self.activeScopeID == scopeID else { return }
+                    if let photoURL = user.profile.profilePhotoURL {
+                        self.directAvatarURLByUserID[userID] = photoURL
+                    }
+                    if let chatIndex = self.chats.firstIndex(where: {
+                        $0.type == .direct && $0.participantIDs.contains(userID)
+                    }),
+                       let participantIndex = self.chats[chatIndex].participants.firstIndex(where: { $0.id == userID }) {
+                        self.chats[chatIndex].participants[participantIndex].photoURL = user.profile.profilePhotoURL
+                        self.chats[chatIndex].participants[participantIndex].displayName = user.profile.displayName
+                        self.chats[chatIndex].participants[participantIndex].username = user.profile.username
+                    }
+                } catch { }
+            }
+        }
     }
 
     private func sanitizeExistingChats(
         _ existingChats: [Chat],
         currentUserID: UUID,
-        visibleMode: ChatMode
+        visibleMode: ChatMode,
+        repository: ChatRepository
     ) async -> [Chat] {
         var sanitized: [Chat] = []
         sanitized.reserveCapacity(existingChats.count)
@@ -642,7 +1011,7 @@ final class ChatListViewModel: ObservableObject {
                 continue
             }
             if eventDecoratedChat.eventDetails?.isExpired == true {
-                await purgeLocalChatState(chatID: chat.id, ownerUserID: currentUserID)
+                await purgeLocalChatState(chatID: chat.id, ownerUserID: currentUserID, repository: repository)
                 continue
             }
             let communityDecoratedChat = await CommunityChatMetadataStore.shared.apply(to: eventDecoratedChat, ownerUserID: currentUserID)
@@ -651,7 +1020,7 @@ final class ChatListViewModel: ObservableObject {
                 continue
             }
             guard visibleChat.isAvailable(in: visibleMode) else {
-                await purgeLocalChatState(chatID: visibleChat.id, ownerUserID: currentUserID)
+                await purgeLocalChatState(chatID: visibleChat.id, ownerUserID: currentUserID, repository: repository)
                 continue
             }
             sanitized.append(visibleChat)
@@ -660,11 +1029,20 @@ final class ChatListViewModel: ObservableObject {
         return sanitized
     }
 
-    private func purgeLocalChatState(chatID: UUID, ownerUserID: UUID) async {
+    private func purgeLocalChatState(chatID: UUID, ownerUserID: UUID, repository: ChatRepository) async {
+        await repository.purgeLocalChatArtifacts(chatIDs: [chatID], currentUserID: ownerUserID)
+        await ChatMessagePageStore.shared.purgeChats([chatID], userID: ownerUserID)
+        await ChatReadStateStore.shared.purgeChat(chatID: chatID, userID: ownerUserID)
+        await ShareChatDestinationStore.shared.purgeChats([chatID])
+        await HiddenMessageStore.shared.purgeChat(ownerUserID: ownerUserID, chatID: chatID)
+        await PinnedMessageStore.shared.purgeChat(ownerUserID: ownerUserID, chatID: chatID)
+        await EventChatMetadataStore.shared.purgeChat(ownerUserID: ownerUserID, chatID: chatID)
+        await OfflineChatArchiveStore.shared.purgeChats([chatID], ownerUserID: ownerUserID)
         for mode in ChatMode.allCases {
             await ChatSnapshotStore.shared.removeChat(chatID: chatID, userID: ownerUserID, mode: mode)
-            await ChatThreadStateStore.shared.clearChat(ownerUserID: ownerUserID, mode: mode, chatID: chatID)
+            await ChatThreadStateStore.shared.purgeChat(ownerUserID: ownerUserID, mode: mode, chatID: chatID)
         }
+        await SmartConversationStore.shared.removeLink(for: chatID)
     }
 
     private func draftKey(chatID: UUID, mode: ChatMode) -> String {
@@ -684,14 +1062,22 @@ final class ChatListViewModel: ObservableObject {
 
         guard let index = chats.firstIndex(where: { $0.id == chat.id }) else { return }
         chats[index].unreadCount = 0
+        updatePreparedChatCache(for: chats[index])
         updateApplicationBadge(using: chats)
     }
 
     @MainActor
-    func togglePinned(_ chat: Chat, currentUserID: UUID) async {
-        guard let index = chats.firstIndex(where: { $0.id == chat.id }) else { return }
+    func togglePinned(_ chat: Chat, currentUserID: UUID) async -> Bool {
+        guard let index = chats.firstIndex(where: { $0.id == chat.id }) else { return false }
         let newPinnedState = chats[index].isPinned == false
+        if newPinnedState {
+            let pinnedCount = chats.filter(\.isPinned).count
+            if pinnedCount >= 3 {
+                return false
+            }
+        }
         chats[index].isPinned = newPinnedState
+        updatePreparedChatCache(for: chats[index])
         await ChatThreadStateStore.shared.setPinned(
             newPinnedState,
             ownerUserID: currentUserID,
@@ -699,6 +1085,7 @@ final class ChatListViewModel: ObservableObject {
             chatID: chat.id
         )
         updateDisplayedChats(chats, currentUserID: currentUserID)
+        return true
     }
 
     @MainActor
@@ -708,6 +1095,7 @@ final class ChatListViewModel: ObservableObject {
             ? .mutedPermanently
             : .active
         chats[index].notificationPreferences.muteState = newMuteState
+        updatePreparedChatCache(for: chats[index])
         await ChatThreadStateStore.shared.setMuteState(
             newMuteState,
             ownerUserID: currentUserID,
@@ -718,12 +1106,13 @@ final class ChatListViewModel: ObservableObject {
 
     @MainActor
     func hideChat(_ chat: Chat, currentUserID: UUID) async {
-        await ChatThreadStateStore.shared.clearChat(
+        await ChatThreadStateStore.shared.hideChat(
             ownerUserID: currentUserID,
             mode: chat.mode,
             chatID: chat.id
         )
         chats.removeAll(where: { $0.id == chat.id })
+        invalidatePreparedChatCache(chatID: chat.id, mode: chat.mode)
         updateApplicationBadge(using: chats)
     }
 
@@ -778,6 +1167,35 @@ final class ChatListViewModel: ObservableObject {
         }
     }
 
+    private func realtimePreviewText(for message: Message) -> String {
+        if message.isDeleted {
+            return "Message deleted"
+        }
+        if let text = message.text?.trimmingCharacters(in: .whitespacesAndNewlines), text.isEmpty == false {
+            return text
+        }
+        if message.voiceMessage != nil {
+            return "Voice message"
+        }
+        if let attachment = message.attachments.first {
+            switch attachment.type {
+            case .photo:
+                return "Photo"
+            case .video:
+                return "Video"
+            case .audio:
+                return "Audio"
+            case .document:
+                return "File"
+            case .contact:
+                return "Contact"
+            case .location:
+                return "Location"
+            }
+        }
+        return "Message"
+    }
+
     private func mergeDisplayedChats(existing: [Chat], incoming: [Chat], currentUserID: UUID) -> [Chat] {
         guard existing.isEmpty == false else { return incoming }
         guard incoming.isEmpty == false else { return existing }
@@ -821,25 +1239,69 @@ final class ChatListViewModel: ObservableObject {
     private func conversationKey(for chat: Chat, currentUserID: UUID) -> String {
         switch chat.type {
         case .selfChat:
-            return "self:\(currentUserID.uuidString)"
+            return "self:\(chat.id.uuidString)"
         case .direct:
-            let participantKey = chat.participantIDs
-                .map(\.uuidString)
-                .sorted()
-                .joined(separator: ":")
-            return "direct:\(participantKey)"
+            return "direct:\(chat.id.uuidString)"
         case .group:
-            if let groupID = chat.group?.id {
-                return "group:\(groupID.uuidString)"
-            }
-            let participantKey = chat.participantIDs
-                .map(\.uuidString)
-                .sorted()
-                .joined(separator: ":")
-            return "group-fallback:\(participantKey)"
+            return "group:\(chat.id.uuidString)"
         case .secret:
             return "secret:\(chat.id.uuidString)"
         }
+    }
+
+    private func activateScope(_ scopeID: String) {
+        guard activeScopeID != scopeID else { return }
+        activeScopeID = scopeID
+        preparedChatCache.removeAll()
+    }
+
+    private func preparedChatCacheKey(chatID: UUID, mode: ChatMode) -> String {
+        "\(mode.rawValue):\(chatID.uuidString)"
+    }
+
+    private func preparedChatFingerprint(for chat: Chat) -> Int {
+        var normalized = chat
+        normalized.unreadCount = 0
+        var hasher = Hasher()
+        hasher.combine(normalized)
+        return hasher.finalize()
+    }
+
+    private func cachedPreparedChat(for chat: Chat, visibleMode: ChatMode) -> Chat? {
+        let cacheKey = preparedChatCacheKey(chatID: chat.id, mode: chat.mode)
+        let fingerprint = preparedChatFingerprint(for: chat)
+        guard let cachedEntry = preparedChatCache[cacheKey], cachedEntry.inputFingerprint == fingerprint else {
+            return nil
+        }
+
+        let cachedChat = cachedEntry.chat
+        guard cachedChat.eventDetails?.isExpired != true, cachedChat.isAvailable(in: visibleMode) else {
+            preparedChatCache.removeValue(forKey: cacheKey)
+            return nil
+        }
+
+        return cachedChat
+    }
+
+    private func storePreparedChat(_ chat: Chat, inputFingerprint: Int) {
+        let cacheKey = preparedChatCacheKey(chatID: chat.id, mode: chat.mode)
+        preparedChatCache[cacheKey] = PreparedChatCacheEntry(
+            inputFingerprint: inputFingerprint,
+            chat: chat
+        )
+    }
+
+    private func updatePreparedChatCache(for chat: Chat) {
+        let cacheKey = preparedChatCacheKey(chatID: chat.id, mode: chat.mode)
+        guard let cachedEntry = preparedChatCache[cacheKey] else { return }
+        preparedChatCache[cacheKey] = PreparedChatCacheEntry(
+            inputFingerprint: cachedEntry.inputFingerprint,
+            chat: chat
+        )
+    }
+
+    private func invalidatePreparedChatCache(chatID: UUID, mode: ChatMode) {
+        preparedChatCache.removeValue(forKey: preparedChatCacheKey(chatID: chatID, mode: mode))
     }
 }
 
@@ -909,7 +1371,7 @@ private struct ChatSwipeRow<Content: View>: View {
                 .opacity(currentOffset < 0 ? 1 : 0)
             }
         }
-        .background(PrimeTheme.Colors.elevated.opacity(0.92))
+        .background(PrimeTheme.Colors.background)
     }
 
     private func actionButton(_ action: ChatRowSwipeAction) -> some View {
@@ -1000,22 +1462,11 @@ private struct ChatSwipeRow<Content: View>: View {
 private func chatFeedIdentityKey(for chat: Chat, currentUserID: UUID) -> String {
     switch chat.type {
     case .selfChat:
-        return "self:\(currentUserID.uuidString)"
+        return "self:\(chat.id.uuidString)"
     case .direct:
-        let participantKey = chat.participantIDs
-            .map(\.uuidString)
-            .sorted()
-            .joined(separator: ":")
-        return "direct:\(participantKey)"
+        return "direct:\(chat.id.uuidString)"
     case .group:
-        if let groupID = chat.group?.id {
-            return "group:\(groupID.uuidString)"
-        }
-        let participantKey = chat.participantIDs
-            .map(\.uuidString)
-            .sorted()
-            .joined(separator: ":")
-        return "group-fallback:\(participantKey)"
+        return "group:\(chat.id.uuidString)"
     case .secret:
         return "secret:\(chat.id.uuidString)"
     }

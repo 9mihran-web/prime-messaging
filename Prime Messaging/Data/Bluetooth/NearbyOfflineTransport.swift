@@ -83,8 +83,6 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
     private static let multipeerServiceType = "prmsgchat"
     private static let currentUserKey = "app_state.current_user"
     private static let installationIDKey = "offline_transport.installation_id"
-    private static let centralRestoreID = "mirowin.prime-messaging.ble.central"
-    private static let peripheralRestoreID = "mirowin.prime-messaging.ble.peripheral"
     private static let reachablePeerFreshnessWindow: TimeInterval = 8
     private static let meshPeerFreshnessWindow: TimeInterval = 20
     private static let meshMaxHopCount = 3
@@ -590,10 +588,7 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
             centralManager = CBCentralManager(
                 delegate: self,
                 queue: nil,
-                options: [
-                    CBCentralManagerOptionShowPowerAlertKey: true,
-                    CBCentralManagerOptionRestoreIdentifierKey: Self.centralRestoreID,
-                ]
+                options: [CBCentralManagerOptionShowPowerAlertKey: true]
             )
         }
 
@@ -602,10 +597,7 @@ final class NearbyOfflineTransport: NSObject, OfflineTransporting {
             peripheralManager = CBPeripheralManager(
                 delegate: self,
                 queue: nil,
-                options: [
-                    CBPeripheralManagerOptionShowPowerAlertKey: true,
-                    CBPeripheralManagerOptionRestoreIdentifierKey: Self.peripheralRestoreID,
-                ]
+                options: [CBPeripheralManagerOptionShowPowerAlertKey: true]
             )
         }
         #endif

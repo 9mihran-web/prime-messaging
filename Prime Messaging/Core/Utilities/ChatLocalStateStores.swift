@@ -28,6 +28,12 @@ actor HiddenMessageStore {
         loadRecords()[storageKey(ownerUserID: ownerUserID, chatID: chatID), default: []]
     }
 
+    func purgeChat(ownerUserID: UUID, chatID: UUID) {
+        var records = loadRecords()
+        records.removeValue(forKey: storageKey(ownerUserID: ownerUserID, chatID: chatID))
+        persist(records)
+    }
+
     private func storageKey(ownerUserID: UUID, chatID: UUID) -> String {
         "\(ownerUserID.uuidString)-\(chatID.uuidString)"
     }
@@ -67,6 +73,12 @@ actor PinnedMessageStore {
 
     func pinnedMessageID(ownerUserID: UUID, chatID: UUID) -> UUID? {
         loadRecords()[storageKey(ownerUserID: ownerUserID, chatID: chatID)] ?? nil
+    }
+
+    func purgeChat(ownerUserID: UUID, chatID: UUID) {
+        var records = loadRecords()
+        records.removeValue(forKey: storageKey(ownerUserID: ownerUserID, chatID: chatID))
+        persist(records)
     }
 
     private func storageKey(ownerUserID: UUID, chatID: UUID) -> String {
@@ -145,9 +157,15 @@ actor ChatThreadStateStore {
 
     func clearChat(ownerUserID: UUID, mode: ChatMode, chatID: UUID) {
         updateState(ownerUserID: ownerUserID, mode: mode, chatID: chatID) { state in
-            state.isHidden = true
+            state.isHidden = false
             state.clearedAt = .now
         }
+    }
+
+    func purgeChat(ownerUserID: UUID, mode: ChatMode, chatID: UUID) {
+        var records = loadRecords()
+        records.removeValue(forKey: storageKey(ownerUserID: ownerUserID, mode: mode, chatID: chatID))
+        persist(records)
     }
 
     func clearedAt(ownerUserID: UUID, mode: ChatMode, chatID: UUID) -> Date? {
@@ -228,6 +246,16 @@ actor OfflineChatArchiveStore {
         persist(records)
     }
 
+    func purgeChats(_ chatIDs: Set<UUID>, ownerUserID: UUID) {
+        guard chatIDs.isEmpty == false else { return }
+        var records = loadRecords()
+        guard var snapshot = records[ownerUserID.uuidString] else { return }
+        snapshot.chats.removeAll { chatIDs.contains($0.id) }
+        snapshot.messageBuckets.removeAll { chatIDs.contains($0.chatID) }
+        records[ownerUserID.uuidString] = snapshot
+        persist(records)
+    }
+
     private func loadRecords() -> [String: OfflineChatArchiveSnapshot] {
         guard let data = defaults.data(forKey: StorageKeys.archives) else { return [:] }
         return (try? decoder.decode([String: OfflineChatArchiveSnapshot].self, from: data)) ?? [:]
@@ -270,6 +298,12 @@ actor EventChatMetadataStore {
         var records = loadRecords()
         let key = storageKey(ownerUserID: ownerUserID, chatID: chatID)
         records[key] = details
+        persist(records)
+    }
+
+    func purgeChat(ownerUserID: UUID, chatID: UUID) {
+        var records = loadRecords()
+        records.removeValue(forKey: storageKey(ownerUserID: ownerUserID, chatID: chatID))
         persist(records)
     }
 
@@ -692,6 +726,7 @@ actor OnboardingProgressStore {
     struct StoredState: Codable, Hashable {
         var modeRawValue: String
         var stepRawValue: String
+        var isContactSyncEnabled: Bool?
         var selectedCountryCode: String
         var localIdentifierInput: String
         var email: String
@@ -702,6 +737,7 @@ actor OnboardingProgressStore {
         var pendingIdentifier: String
         var pendingContactValue: String
         var pendingIdentifierKindRawValue: String
+        var loginCredentialModeRawValue: String?
         var pendingLookup: StoredLookup?
     }
 

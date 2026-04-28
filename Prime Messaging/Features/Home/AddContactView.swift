@@ -504,7 +504,7 @@ struct AvatarBadgeView: View {
 
     var body: some View {
         if let url = profile.profilePhotoURL {
-            CachedRemoteImage(url: url) { image in
+            CachedRemoteImage(url: url, maxPixelSize: 256) { image in
                 image
                     .resizable()
                     .scaledToFill()

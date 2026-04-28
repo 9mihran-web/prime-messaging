@@ -120,13 +120,13 @@ enum CommunityKind: String, Codable, CaseIterable, Hashable, Identifiable {
     nonisolated var title: String {
         switch self {
         case .group:
-            return "Group"
+            return "community.kind.group".localized
         case .supergroup:
-            return "Supergroup"
+            return "community.kind.supergroup".localized
         case .channel:
-            return "Channel"
+            return "community.kind.channel".localized
         case .community:
-            return "Community"
+            return "community.kind.community".localized
         }
     }
 
@@ -177,7 +177,9 @@ struct CommunityChatDetails: Codable, Hashable {
     var topics: [CommunityTopic]
     var inviteCode: String?
     var inviteLink: URL?
+    var publicHandle: String?
     var isOfficial: Bool
+    var isBlockedByAdmin: Bool?
 
     init(
         kind: CommunityKind,
@@ -187,7 +189,9 @@ struct CommunityChatDetails: Codable, Hashable {
         topics: [CommunityTopic] = [],
         inviteCode: String? = nil,
         inviteLink: URL? = nil,
-        isOfficial: Bool = false
+        publicHandle: String? = nil,
+        isOfficial: Bool = false,
+        isBlockedByAdmin: Bool? = nil
     ) {
         self.kind = kind
         self.forumModeEnabled = forumModeEnabled
@@ -196,7 +200,9 @@ struct CommunityChatDetails: Codable, Hashable {
         self.topics = topics
         self.inviteCode = inviteCode
         self.inviteLink = inviteLink
+        self.publicHandle = publicHandle
         self.isOfficial = isOfficial
+        self.isBlockedByAdmin = isBlockedByAdmin
     }
 
     var badgeTitle: String {
@@ -272,14 +278,14 @@ struct ChatParticipant: Identifiable, Codable, Hashable {
         case photoURL
     }
 
-    init(id: UUID, username: String, displayName: String?, photoURL: URL? = nil) {
+    nonisolated init(id: UUID, username: String, displayName: String?, photoURL: URL? = nil) {
         self.id = id
         self.username = username
         self.displayName = displayName
         self.photoURL = photoURL
     }
 
-    init(from decoder: any Decoder) throws {
+    nonisolated init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
         username = try container.decode(String.self, forKey: .username)
@@ -456,7 +462,8 @@ extension Chat {
     }
 
     nonisolated func directParticipant(for currentUserID: UUID) -> ChatParticipant? {
-        participants.first(where: { $0.id != currentUserID })
+        guard type == .direct else { return nil }
+        return participants.first(where: { $0.id != currentUserID })
     }
 
     nonisolated func displayTitle(for currentUserID: UUID) -> String {

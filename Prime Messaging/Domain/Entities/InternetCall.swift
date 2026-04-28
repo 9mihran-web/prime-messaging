@@ -2,6 +2,7 @@ import Foundation
 
 enum InternetCallKind: String, Codable, Hashable {
     case audio
+    case video
 }
 
 enum InternetCallState: String, Codable, Hashable {
@@ -26,6 +27,7 @@ enum InternetCallEventType: String, Codable, Hashable {
     case offer
     case answer
     case ice
+    case mediaState = "media_state"
 }
 
 struct InternetCallParticipant: Identifiable, Codable, Hashable {
@@ -41,14 +43,14 @@ struct InternetCallParticipant: Identifiable, Codable, Hashable {
         case profilePhotoURL
     }
 
-    init(id: UUID, username: String, displayName: String?, profilePhotoURL: URL?) {
+    nonisolated init(id: UUID, username: String, displayName: String?, profilePhotoURL: URL?) {
         self.id = id
         self.username = username
         self.displayName = displayName
         self.profilePhotoURL = profilePhotoURL
     }
 
-    init(from decoder: any Decoder) throws {
+    nonisolated init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
         username = try container.decode(String.self, forKey: .username)
@@ -63,10 +65,13 @@ struct InternetCallEvent: Identifiable, Codable, Hashable {
     let sequence: Int
     let type: InternetCallEventType
     let senderID: UUID?
+    let targetUserID: UUID?
     let sdp: String?
     let candidate: String?
     let sdpMid: String?
     let sdpMLineIndex: Int?
+    let isMuted: Bool?
+    let isVideoEnabled: Bool?
     let createdAt: Date
 }
 
@@ -79,10 +84,13 @@ struct InternetCall: Identifiable, Codable, Hashable {
     var callerID: UUID
     var calleeID: UUID
     var participants: [InternetCallParticipant]
+    var joinedParticipantIDs: [UUID]?
     var createdAt: Date
     var answeredAt: Date?
     var endedAt: Date?
     var lastEventSequence: Int
+    var latestRemoteOfferSDP: String?
+    var latestRemoteOfferSequence: Int?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -93,19 +101,30 @@ struct InternetCall: Identifiable, Codable, Hashable {
         case callerID
         case calleeID
         case participants
+        case joinedParticipantIDs
         case createdAt
         case answeredAt
         case endedAt
         case lastEventSequence
+        case latestRemoteOfferSDP
+        case latestRemoteOfferSequence
     }
 }
 
 extension InternetCall {
-    func direction(for currentUserID: UUID) -> InternetCallDirection {
+    nonisolated var isGroupCall: Bool {
+        joinedParticipantIDs != nil || participants.count > 2
+    }
+
+    nonisolated var joinedParticipantIDSet: Set<UUID> {
+        Set(joinedParticipantIDs ?? [])
+    }
+
+    nonisolated func direction(for currentUserID: UUID) -> InternetCallDirection {
         callerID == currentUserID ? .outgoing : .incoming
     }
 
-    func effectiveState(for currentUserID: UUID) -> InternetCallState {
+    nonisolated func effectiveState(for currentUserID: UUID) -> InternetCallState {
         if state == .cancelled, direction(for: currentUserID) == .incoming, answeredAt == nil {
             return .missed
         }
@@ -113,24 +132,65 @@ extension InternetCall {
         return state
     }
 
-    func otherParticipant(for currentUserID: UUID) -> InternetCallParticipant? {
+    nonisolated func otherParticipant(for currentUserID: UUID) -> InternetCallParticipant? {
         participants.first(where: { $0.id != currentUserID })
     }
 
-    func displayName(for currentUserID: UUID) -> String {
-        guard let participant = otherParticipant(for: currentUserID) else {
-            return "Unknown"
+    nonisolated func otherParticipants(for currentUserID: UUID) -> [InternetCallParticipant] {
+        participants.filter { $0.id != currentUserID }
+    }
+
+    nonisolated func joinedParticipants(excluding currentUserID: UUID? = nil) -> [InternetCallParticipant] {
+        let joinedIDs = joinedParticipantIDSet
+        let baseParticipants: [InternetCallParticipant]
+        if joinedIDs.isEmpty {
+            baseParticipants = participants
+        } else {
+            baseParticipants = participants.filter { joinedIDs.contains($0.id) }
         }
 
+        guard let currentUserID else {
+            return baseParticipants
+        }
+
+        return baseParticipants.filter { $0.id != currentUserID }
+    }
+
+    nonisolated private func participantLabel(_ participant: InternetCallParticipant) -> String {
         let trimmedDisplayName = participant.displayName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if trimmedDisplayName.isEmpty == false {
             return trimmedDisplayName
         }
-
         return participant.username
     }
 
-    var activityDate: Date {
+    nonisolated func displayName(for currentUserID: UUID) -> String {
+        if isGroupCall {
+            let activeRemoteParticipants = joinedParticipants(excluding: currentUserID)
+            let fallbackRemoteParticipants = otherParticipants(for: currentUserID)
+            let remoteParticipants = activeRemoteParticipants.isEmpty ? fallbackRemoteParticipants : activeRemoteParticipants
+            let labels = remoteParticipants.map(participantLabel)
+
+            switch labels.count {
+            case 0:
+                return "Group call"
+            case 1:
+                return labels[0]
+            case 2:
+                return "\(labels[0]), \(labels[1])"
+            default:
+                return "\(labels[0]), \(labels[1]) +\(labels.count - 2)"
+            }
+        }
+
+        guard let participant = otherParticipant(for: currentUserID) else {
+            return "Unknown"
+        }
+
+        return participantLabel(participant)
+    }
+
+    nonisolated var activityDate: Date {
         endedAt ?? answeredAt ?? createdAt
     }
 }

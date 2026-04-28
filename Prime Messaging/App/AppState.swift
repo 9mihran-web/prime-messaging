@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import OSLog
 
 enum MainTab: Hashable {
     case contacts
@@ -8,7 +9,10 @@ enum MainTab: Hashable {
     case settings
 }
 
+@MainActor
 final class AppState: ObservableObject {
+    private let navigationLogger = Logger(subsystem: "mirowin.Prime-Messaging", category: "NavigationState")
+    private let navigationDiagnosticsEnabled = ProcessInfo.processInfo.environment["PRIME_NAVIGATION_DIAGNOSTICS"] == "1"
     private enum FeatureAvailability {
         static let smartModeEnabled = false
         static let emergencyModeEnabled = false
@@ -36,29 +40,111 @@ final class AppState: ObservableObject {
     private let onlineModeRestoreWindow: TimeInterval = 60 * 60 * 24
     private let recentChatRestoreWindow: TimeInterval = 60 * 60 * 6
     private let notificationRouteDuplicateWindow: TimeInterval = 1.2
+    private let shareAppGroupIdentifier = "group.prime1.prime-Messaging.shared"
+    private let shareRootDirectoryName = "IncomingShare"
+    private let mirroredCurrentUserFileName = "current-user.json"
     private var lastQueuedNotificationRoute: NotificationChatRoute?
     private var lastQueuedNotificationRouteAt: Date = .distantPast
+    private var pendingNotificationLaunchRoute: NotificationChatRoute?
+    private var lastSceneBecameActiveAt: Date?
 
-    @Published var selectedMode: ChatMode = .online
-    @Published var selectedMainTab: MainTab = .chats
+    @Published var selectedMode: ChatMode = .online {
+        didSet {
+            assertMainThreadForUIState()
+            logNavigationStateMutation("selectedMode")
+        }
+    }
+    @Published var selectedMainTab: MainTab = .chats {
+        didSet {
+            assertMainThreadForUIState()
+            logNavigationStateMutation("selectedMainTab")
+        }
+    }
     @Published var selectedChat: Chat? {
         didSet {
+            assertMainThreadForUIState()
+            logNavigationStateMutation("selectedChat")
             persistSelectedChatSelection()
         }
     }
-    @Published var routedChat: Chat?
+    @Published var routedChat: Chat? {
+        didSet {
+            assertMainThreadForUIState()
+            logNavigationStateMutation("routedChat")
+        }
+    }
     @Published var currentUser: User = .mockCurrentUser
     @Published private(set) var accounts: [User] = []
-    @Published var hasCompletedOnboarding = false
+    @Published var hasCompletedOnboarding = false {
+        didSet {
+            assertMainThreadForUIState()
+        }
+    }
     @Published var selectedLanguage: AppLanguage = .english
-    @Published var isShowingAccountAuth = false
-    @Published private(set) var requiresServerSessionValidation = false
-    @Published var isBootstrappingSession = true
-    @Published private(set) var pendingNotificationRoute: NotificationChatRoute?
-    @Published private(set) var pendingFocusedMessageID: UUID?
-    @Published private(set) var notificationRouteQueueRevision: Int = 0
+    @Published var isShowingAccountAuth = false {
+        didSet {
+            assertMainThreadForUIState()
+        }
+    }
+    @Published private(set) var requiresServerSessionValidation = false {
+        didSet {
+            assertMainThreadForUIState()
+        }
+    }
+    @Published var isBootstrappingSession = true {
+        didSet {
+            assertMainThreadForUIState()
+        }
+    }
+    @Published private(set) var isSceneActive = false {
+        didSet {
+            assertMainThreadForUIState()
+        }
+    }
+    @Published private(set) var isChatsRootReady = false {
+        didSet {
+            assertMainThreadForUIState()
+        }
+    }
+    @Published private(set) var pendingNotificationRoute: NotificationChatRoute? {
+        didSet {
+            assertMainThreadForUIState()
+            logNavigationStateMutation("pendingNotificationRoute")
+        }
+    }
+    @Published private(set) var pendingResolvedNotificationChat: Chat? {
+        didSet {
+            assertMainThreadForUIState()
+            logNavigationStateMutation("pendingResolvedNotificationChat")
+        }
+    }
+    @Published private(set) var pendingFocusedMessageID: UUID? {
+        didSet {
+            assertMainThreadForUIState()
+            logNavigationStateMutation("pendingFocusedMessageID")
+        }
+    }
+    @Published private(set) var notificationRouteQueueRevision: Int = 0 {
+        didSet {
+            assertMainThreadForUIState()
+            logNavigationStateMutation("notificationRouteQueueRevision")
+        }
+    }
+    @Published private(set) var incomingShareDraftRevision: Int = 0
     @Published var isEmergencyModeEnabled = false
     @Published var emergencyModeStatus: EmergencyModeStatus = .safe
+    private var pendingIncomingShareDraftsByChatID: [UUID: OutgoingMessageDraft] = [:]
+
+    private func assertMainThreadForUIState(_ function: StaticString = #function) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        assert(Thread.isMainThread, "\(function) must run on the main thread")
+    }
+
+    private func logNavigationStateMutation(_ field: StaticString) {
+        guard navigationDiagnosticsEnabled else { return }
+        let message = "NavigationState state mutation field=\(String(describing: field)) main=\(Thread.isMainThread)"
+        navigationLogger.notice("\(message, privacy: .public)")
+    }
 
     var isSmartModeAvailable: Bool {
         FeatureAvailability.smartModeEnabled && currentUser.isOfflineOnly == false
@@ -94,14 +180,20 @@ final class AppState: ObservableObject {
             defaults.set(AppLanguage.english.rawValue, forKey: StorageKeys.selectedLanguage)
         }
 
+        var restoredCurrentUser: User?
         if let data = defaults.data(forKey: StorageKeys.currentUser), let user = try? decoder.decode(User.self, from: data) {
             currentUser = user
+            restoredCurrentUser = user
         }
 
         if let data = defaults.data(forKey: StorageKeys.accounts), let storedAccounts = try? decoder.decode([User].self, from: data) {
             accounts = storedAccounts
         } else if defaults.data(forKey: StorageKeys.currentUser) != nil {
             accounts = [currentUser]
+        }
+
+        if restoredCurrentUser == nil, let recoveredAccount = accounts.first {
+            currentUser = recoveredAccount
         }
 
         selectedMode = restoredSelectedMode(for: currentUser, fallback: preferredDefaultMode(for: currentUser))
@@ -113,6 +205,7 @@ final class AppState: ObservableObject {
             emergencyModeStatus = storedEmergencyStatus
         }
         applyEmergencyStateIfNeeded()
+        mirrorCurrentUserForShareExtension()
     }
 
     func completeOnboarding(name: String, username: String, contactValue: String, methodType: IdentityMethodType) {
@@ -154,7 +247,9 @@ final class AppState: ObservableObject {
         selectedChat = nil
         routedChat = nil
         pendingNotificationRoute = nil
+        pendingResolvedNotificationChat = nil
         pendingFocusedMessageID = nil
+        pendingNotificationLaunchRoute = nil
         selectedMainTab = .chats
         clearPersistedSelectedChatSelection()
         upsertAccount(user)
@@ -202,12 +297,16 @@ final class AppState: ObservableObject {
     }
 
     func updateSelectedMode(_ mode: ChatMode) {
+        assertMainThreadForUIState()
         selectedMode = sanitizedMode(mode, for: currentUser)
         defaults.set(selectedMode.rawValue, forKey: StorageKeys.selectedMode)
         recordAppActivity()
     }
 
     func markSceneBecameActive() {
+        assertMainThreadForUIState()
+        isSceneActive = true
+        lastSceneBecameActiveAt = Date()
         let resolvedMode = restoredSelectedMode(for: currentUser, fallback: selectedMode)
         if resolvedMode != selectedMode {
             selectedMode = resolvedMode
@@ -217,8 +316,15 @@ final class AppState: ObservableObject {
     }
 
     func markSceneMovedToBackground() {
+        assertMainThreadForUIState()
+        isSceneActive = false
         defaults.set(selectedMode.rawValue, forKey: StorageKeys.selectedMode)
         recordAppActivity()
+    }
+
+    func setChatsRootReady(_ isReady: Bool) {
+        assertMainThreadForUIState()
+        isChatsRootReady = isReady
     }
 
     func setEmergencyModeEnabled(_ isEnabled: Bool) {
@@ -288,7 +394,9 @@ final class AppState: ObservableObject {
         selectedChat = nil
         routedChat = nil
         pendingNotificationRoute = nil
+        pendingResolvedNotificationChat = nil
         pendingFocusedMessageID = nil
+        pendingNotificationLaunchRoute = nil
         selectedMainTab = .chats
         clearPersistedSelectedChatSelection()
         persistState()
@@ -319,7 +427,9 @@ final class AppState: ObservableObject {
         selectedChat = nil
         routedChat = nil
         pendingNotificationRoute = nil
+        pendingResolvedNotificationChat = nil
         pendingFocusedMessageID = nil
+        pendingNotificationLaunchRoute = nil
         selectedMainTab = .chats
         clearPersistedSelectedChatSelection()
         persistState()
@@ -353,7 +463,9 @@ final class AppState: ObservableObject {
         selectedChat = nil
         routedChat = nil
         pendingNotificationRoute = nil
+        pendingResolvedNotificationChat = nil
         pendingFocusedMessageID = nil
+        pendingNotificationLaunchRoute = nil
         selectedMainTab = .chats
         clearPersistedSelectedChatSelection()
         upsertAccount(user)
@@ -373,11 +485,13 @@ final class AppState: ObservableObject {
     }
 
     func queueNotificationRoute(_ route: NotificationChatRoute) {
+        assertMainThreadForUIState()
         _ = enqueueNotificationRoute(route)
     }
 
     @discardableResult
     func enqueueNotificationRoute(_ route: NotificationChatRoute) -> Bool {
+        assertMainThreadForUIState()
         let now = Date()
         if let pendingNotificationRoute, pendingNotificationRoute == route {
             return false
@@ -388,33 +502,40 @@ final class AppState: ObservableObject {
             return false
         }
 
-        selectedMainTab = .chats
-        updateSelectedMode(route.mode)
         pendingNotificationRoute = route
+        pendingResolvedNotificationChat = nil
         pendingFocusedMessageID = route.messageID
+        pendingNotificationLaunchRoute = route
         notificationRouteQueueRevision &+= 1
         lastQueuedNotificationRoute = route
         lastQueuedNotificationRouteAt = now
         return true
     }
 
-    func clearPendingNotificationRoute() {
+    func clearPendingNotificationRoute(clearLaunchContext: Bool = false) {
+        assertMainThreadForUIState()
         pendingNotificationRoute = nil
+        pendingResolvedNotificationChat = nil
         pendingFocusedMessageID = nil
+        if clearLaunchContext {
+            pendingNotificationLaunchRoute = nil
+        }
         notificationRouteQueueRevision &+= 1
     }
 
     func fallbackToChatListAfterNotificationFailure(expectedRoute: NotificationChatRoute? = nil) {
+        assertMainThreadForUIState()
         if let expectedRoute, let pendingNotificationRoute, pendingNotificationRoute != expectedRoute {
             return
         }
         selectedMainTab = .chats
         selectedChat = nil
         routedChat = nil
-        clearPendingNotificationRoute()
+        clearPendingNotificationRoute(clearLaunchContext: true)
     }
 
     func resolvePendingNotificationRoute(with chats: [Chat]) -> Chat? {
+        assertMainThreadForUIState()
         guard let route = pendingNotificationRoute else { return nil }
         guard let chat = chats.first(where: { $0.id == route.chatID }) else { return nil }
 
@@ -423,10 +544,51 @@ final class AppState: ObservableObject {
         return chat
     }
 
+    func queueResolvedNotificationChat(_ chat: Chat, expectedRoute: NotificationChatRoute) {
+        assertMainThreadForUIState()
+        guard let pendingNotificationRoute, pendingNotificationRoute == expectedRoute else { return }
+        pendingResolvedNotificationChat = chat
+        notificationRouteQueueRevision &+= 1
+    }
+
+    @discardableResult
+    func commitQueuedNotificationNavigationIfPossible() -> Bool {
+        assertMainThreadForUIState()
+        guard let pendingNotificationRoute, let chat = pendingResolvedNotificationChat else { return false }
+        guard isSceneActive, hasCompletedOnboarding, isBootstrappingSession == false else { return false }
+
+        if selectedMainTab != .chats {
+            selectedMainTab = .chats
+            notificationRouteQueueRevision &+= 1
+            return false
+        }
+
+        guard isChatsRootReady else { return false }
+
+        updateSelectedMode(pendingNotificationRoute.mode)
+        selectedChat = chat
+        routedChat = chat
+        self.pendingNotificationRoute = nil
+        pendingResolvedNotificationChat = nil
+        pendingFocusedMessageID = nil
+        if let pendingNotificationLaunchRoute,
+           pendingNotificationLaunchRoute.chatID != chat.id {
+            self.pendingNotificationLaunchRoute = nil
+        }
+        notificationRouteQueueRevision &+= 1
+        return true
+    }
+
     func routeToChat(_ chat: Chat) {
+        assertMainThreadForUIState()
         updateSelectedMode(chat.mode)
         pendingNotificationRoute = nil
+        pendingResolvedNotificationChat = nil
         pendingFocusedMessageID = nil
+        if let pendingNotificationLaunchRoute,
+           pendingNotificationLaunchRoute.chatID != chat.id {
+            self.pendingNotificationLaunchRoute = nil
+        }
         selectedMainTab = .chats
 
         if selectedChat?.id == chat.id, routedChat?.id == chat.id {
@@ -435,27 +597,33 @@ final class AppState: ObservableObject {
             return
         }
 
-        let applyRoute = {
-            self.selectedChat = chat
-            self.routedChat = chat
-        }
-
-        if let currentRoutedChat = routedChat, currentRoutedChat.id != chat.id {
-            routedChat = nil
-            selectedChat = nil
-            DispatchQueue.main.async {
-                applyRoute()
-            }
-            return
-        }
-
-        applyRoute()
+        selectedChat = chat
+        routedChat = chat
     }
 
     func routeToChatAfterCurrentTransition(_ chat: Chat) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+        assertMainThreadForUIState()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(for: .milliseconds(180))
+            guard Task.isCancelled == false else { return }
             self.routeToChat(chat)
         }
+    }
+
+    func stageIncomingShareDraft(_ draft: OutgoingMessageDraft, for chatID: UUID) {
+        assertMainThreadForUIState()
+        pendingIncomingShareDraftsByChatID[chatID] = draft
+        incomingShareDraftRevision &+= 1
+    }
+
+    func consumeIncomingShareDraft(for chatID: UUID) -> OutgoingMessageDraft? {
+        assertMainThreadForUIState()
+        let draft = pendingIncomingShareDraftsByChatID.removeValue(forKey: chatID)
+        if draft != nil {
+            incomingShareDraftRevision &+= 1
+        }
+        return draft
     }
 
     func consumeFocusedMessageID(for chatID: UUID) -> UUID? {
@@ -468,11 +636,37 @@ final class AppState: ObservableObject {
         return messageID
     }
 
+    func consumeNotificationLaunchRoute(for chatID: UUID) -> NotificationChatRoute? {
+        guard let route = pendingNotificationLaunchRoute else { return nil }
+        guard route.chatID == chatID else { return nil }
+        pendingNotificationLaunchRoute = nil
+        return route
+    }
+
+    func hasPendingNotificationLaunchRoute(for chatID: UUID) -> Bool {
+        pendingNotificationLaunchRoute?.chatID == chatID
+    }
+
+    func pendingNotificationActivationSettleDelay(minimumActiveDuration: TimeInterval = 1.35) -> Duration? {
+        assertMainThreadForUIState()
+        guard let lastSceneBecameActiveAt else { return nil }
+        guard pendingNotificationRoute != nil || pendingResolvedNotificationChat != nil else { return nil }
+
+        let activeDuration = Date().timeIntervalSince(lastSceneBecameActiveAt)
+        guard activeDuration < minimumActiveDuration else { return nil }
+
+        let remainingDelay = minimumActiveDuration - activeDuration
+        guard remainingDelay > 0 else { return nil }
+        return .milliseconds(Int64(remainingDelay * 1000))
+    }
+
     func clearRoutedChat() {
+        assertMainThreadForUIState()
         routedChat = nil
     }
 
     func forgetChatRoutes(chatIDs: Set<UUID>) {
+        assertMainThreadForUIState()
         guard chatIDs.isEmpty == false else { return }
 
         if let selectedChat, chatIDs.contains(selectedChat.id) {
@@ -483,6 +677,12 @@ final class AppState: ObservableObject {
         }
         if let pendingNotificationRoute, chatIDs.contains(pendingNotificationRoute.chatID) {
             self.pendingNotificationRoute = nil
+        }
+        if let pendingResolvedNotificationChat, chatIDs.contains(pendingResolvedNotificationChat.id) {
+            self.pendingResolvedNotificationChat = nil
+        }
+        if let pendingNotificationLaunchRoute, chatIDs.contains(pendingNotificationLaunchRoute.chatID) {
+            self.pendingNotificationLaunchRoute = nil
         }
         if pendingFocusedMessageID != nil,
            selectedChat == nil,
@@ -579,6 +779,21 @@ final class AppState: ObservableObject {
 
         if let data = try? encoder.encode(accounts) {
             defaults.set(data, forKey: StorageKeys.accounts)
+        }
+
+        mirrorCurrentUserForShareExtension()
+    }
+
+    private func mirrorCurrentUserForShareExtension() {
+        let fileManager = FileManager.default
+        guard let containerURL = fileManager.containerURL(forSecurityApplicationGroupIdentifier: shareAppGroupIdentifier) else {
+            return
+        }
+        let directory = containerURL.appendingPathComponent(shareRootDirectoryName, isDirectory: true)
+        try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let mirrorURL = directory.appendingPathComponent(mirroredCurrentUserFileName, isDirectory: false)
+        if let data = try? encoder.encode(currentUser) {
+            try? data.write(to: mirrorURL, options: .atomic)
         }
     }
 

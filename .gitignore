@@ -9,3 +9,7 @@ xcuserdata/
 # Local scratch files
 kjekjekje.png
 vhgw.png
+
+# Local signing/auth secrets
+*.p8
+AuthKey_*.p8

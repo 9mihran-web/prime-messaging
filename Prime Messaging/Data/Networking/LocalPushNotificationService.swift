@@ -30,6 +30,19 @@ final class LocalPushNotificationService: NSObject, PushNotificationService {
     private var activeChatID: UUID?
     private var activeChatMode: ChatMode?
 
+    private func assertPushRoutingMainThread(_ function: StaticString = #function) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        assert(Thread.isMainThread, "\(function) must run on the main thread")
+    }
+
+    private func logPushTrace(_ step: String, details: String = "") {
+        let suffix = details.isEmpty ? "" : " \(details)"
+        let message = "PUSHTRACE service step=\(step) main=\(Thread.isMainThread)\(suffix)"
+        logger.error("\(message, privacy: .public)")
+        NSLog("%@", message)
+        print(message)
+    }
+
     init(notificationCenter: UNUserNotificationCenter = .current(), defaults: UserDefaults = .standard) {
         self.notificationCenter = notificationCenter
         self.defaults = defaults
@@ -144,11 +157,26 @@ final class LocalPushNotificationService: NSObject, PushNotificationService {
         activeChatMode = chat?.mode
     }
 
-    func handleIncomingChatPushRoute(_ route: NotificationChatRoute, source: String) {
+    func handleIncomingChatPushRoute(
+        _ route: NotificationChatRoute,
+        source: String,
+        userInfo: [AnyHashable: Any]? = nil
+    ) {
+        assertPushRoutingMainThread()
+        var postedUserInfo = userInfo ?? self.userInfo(for: route)
+        if postedUserInfo["chat_id"] == nil {
+            postedUserInfo["chat_id"] = route.chatID.uuidString
+        }
+        if postedUserInfo["mode"] == nil {
+            postedUserInfo["mode"] = route.mode.rawValue
+        }
+        if postedUserInfo["message_id"] == nil, let messageID = route.messageID {
+            postedUserInfo["message_id"] = messageID.uuidString
+        }
         NotificationCenter.default.post(
             name: .primeMessagingIncomingChatPush,
             object: nil,
-            userInfo: userInfo(for: route)
+            userInfo: postedUserInfo
         )
         logger.info(
             "Received chat push route for chat \(route.chatID.uuidString, privacy: .public) source=\(source, privacy: .public)"
@@ -158,6 +186,32 @@ final class LocalPushNotificationService: NSObject, PushNotificationService {
     func performBackgroundRefresh() async -> UIBackgroundFetchResult {
         await syncStoredDeviceTokenIfPossible(force: true)
         return .noData
+    }
+
+    func clearCallNotifications(for callID: UUID) async {
+        #if os(tvOS)
+        _ = callID
+        #else
+        let callIDString = callID.uuidString.lowercased()
+
+        let pending = await notificationCenter.pendingNotificationRequests()
+        let pendingIdentifiers = pending.compactMap { request -> String? in
+            guard let rawCallID = request.content.userInfo["call_id"] as? String else { return nil }
+            return rawCallID.lowercased() == callIDString ? request.identifier : nil
+        }
+        if pendingIdentifiers.isEmpty == false {
+            notificationCenter.removePendingNotificationRequests(withIdentifiers: pendingIdentifiers)
+        }
+
+        let delivered = await notificationCenter.deliveredNotifications()
+        let deliveredIdentifiers = delivered.compactMap { notification -> String? in
+            guard let rawCallID = notification.request.content.userInfo["call_id"] as? String else { return nil }
+            return rawCallID.lowercased() == callIDString ? notification.request.identifier : nil
+        }
+        if deliveredIdentifiers.isEmpty == false {
+            notificationCenter.removeDeliveredNotifications(withIdentifiers: deliveredIdentifiers)
+        }
+        #endif
     }
 
     private func startTokenSyncLoop() {
@@ -314,6 +368,13 @@ private struct DeviceTokenRegistrationRequest: Encodable {
 }
 
 extension LocalPushNotificationService: UNUserNotificationCenterDelegate {
+    nonisolated private func logPushTraceOffMain(_ step: String, details: String = "") {
+        let suffix = details.isEmpty ? "" : " \(details)"
+        let message = "PUSHTRACE service step=\(step) main=\(Thread.isMainThread)\(suffix)"
+        NSLog("%@", message)
+        print(message)
+    }
+
     nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
@@ -322,36 +383,36 @@ extension LocalPushNotificationService: UNUserNotificationCenterDelegate {
             await MainActor.run {
                 self.logger.info("Received incoming call push while app is foreground. call=\(route.callID.uuidString, privacy: .public)")
                 NotificationCallRouteStore.shared.queue(route)
-                InternetCallManager.shared.queueIncomingCallFromPush(callID: route.callID, callerName: route.callerName)
+                handleIncomingCallNotificationRoute(route, prewarmCallKit: true)
             }
+            // For call payloads in foreground, avoid duplicate "Incoming call" banners.
+            return []
         }
 
         if let route = NotificationChatRoute(userInfo: notification.request.content.userInfo) {
             let shouldSuppressInAppBanner = await MainActor.run { () -> Bool in
-                self.handleIncomingChatPushRoute(route, source: "will_present")
+                self.handleIncomingChatPushRoute(
+                    route,
+                    source: "will_present",
+                    userInfo: notification.request.content.userInfo
+                )
                 return self.activeChatID == route.chatID && self.activeChatMode == route.mode
             }
 
-            if shouldSuppressInAppBanner {
-                await MainActor.run {
+            await MainActor.run {
+                if shouldSuppressInAppBanner {
                     self.logger.info(
                         "Suppressing foreground banner for active chat \(route.chatID.uuidString, privacy: .public)"
                     )
+                } else {
+                    self.logger.info(
+                        "Suppressing system foreground banner in favor of in-app banner chat=\(route.chatID.uuidString, privacy: .public)"
+                    )
                 }
-                return []
             }
+            return []
         }
-
-        var options: UNNotificationPresentationOptions = [.banner, .list]
-        #if !os(tvOS)
-        if notification.request.content.sound != nil {
-            options.insert(.sound)
-        }
-        #endif
-        if notification.request.content.badge != nil {
-            options.insert(.badge)
-        }
-        return options
+        return []
     }
 
     #if !os(tvOS)
@@ -360,29 +421,38 @@ extension LocalPushNotificationService: UNUserNotificationCenterDelegate {
         didReceive response: UNNotificationResponse
     ) async {
         let userInfo = response.notification.request.content.userInfo
-        if let callRoute = NotificationCallRoute(userInfo: userInfo) {
-            await MainActor.run {
-                self.logger.info("Opened app from notification for call \(callRoute.callID.uuidString, privacy: .public)")
-                NotificationCallRouteStore.shared.queue(callRoute)
-                InternetCallManager.shared.queueIncomingCallFromPush(callID: callRoute.callID, callerName: callRoute.callerName)
-            }
+        logPushTraceOffMain("delegate.didReceiveResponse")
+
+        if let chatRoute = NotificationChatRoute(userInfo: userInfo) {
+            logPushTraceOffMain(
+                "delegate.didReceiveResponse.persistChatRoute",
+                details: "chat=\(chatRoute.chatID.uuidString)"
+            )
+            NotificationRouteStore.persistLaunchRoute(chatRoute)
             return
         }
 
-        guard let chatRoute = NotificationChatRoute(userInfo: userInfo) else {
+        if let callRoute = NotificationCallRoute(userInfo: userInfo) {
             await MainActor.run {
-                self.logger.error("Failed to build notification route from push tap payload.")
+                self.handleNotificationCallResponseTap(callRoute)
             }
             return
         }
 
         await MainActor.run {
-            self.handleIncomingChatPushRoute(chatRoute, source: "did_receive")
-            self.logger.info("Opened app from notification for chat \(chatRoute.chatID.uuidString, privacy: .public)")
-            NotificationRouteStore.shared.queue(chatRoute)
+            self.logPushTrace("handleNotificationResponseTap.invalidRoute")
         }
     }
     #endif
+
+    @MainActor
+    private func handleNotificationCallResponseTap(_ callRoute: NotificationCallRoute) {
+        assertPushRoutingMainThread()
+        logPushTrace("handleNotificationResponseTap.call.begin", details: "call=\(callRoute.callID.uuidString)")
+        logger.info("Opened app from notification for call \(callRoute.callID.uuidString, privacy: .public)")
+        NotificationCallRouteStore.shared.queue(callRoute)
+        handleIncomingCallNotificationRoute(callRoute, prewarmCallKit: true)
+    }
 
     private func userInfo(for route: NotificationChatRoute) -> [AnyHashable: Any] {
         var userInfo: [AnyHashable: Any] = [

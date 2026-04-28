@@ -1,7 +1,8 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import AVKit
 import Combine
 import CryptoKit
+import ImageIO
 import MapKit
 import OSLog
 #if canImport(PDFKit) && !os(tvOS)
@@ -19,6 +20,14 @@ import Speech
 #endif
 import SwiftUI
 import UIKit
+
+private final class ChatMediaUncheckedSendableBox<Value>: @unchecked Sendable {
+    let value: Value
+
+    init(_ value: Value) {
+        self.value = value
+    }
+}
 
 private enum ChatMediaStorage {
     private nonisolated(unsafe) static let fileManager = FileManager.default
@@ -176,13 +185,42 @@ enum ChatMediaPersistentStore {
 
 private enum MediaPipelineDiagnostics {
     static let logger = Logger(subsystem: "mirowin.Prime-Messaging", category: "MediaPipeline")
+    private static let throttleQueue = DispatchQueue(label: "PrimeMessaging.MediaPipelineDiagnostics.Throttle")
+    private nonisolated(unsafe) static var lastEmissionByKey: [String: TimeInterval] = [:]
+
+    private static func shouldEmitLog(
+        level: StaticString,
+        label: String,
+        url: URL?,
+        details: String,
+        minimumInterval: TimeInterval
+    ) -> Bool {
+        let fileToken = url?.lastPathComponent ?? "none"
+        let normalizedDetails = details.count > 96 ? String(details.prefix(96)) : details
+        let key = "\(level)|\(label)|\(fileToken)|\(normalizedDetails)"
+        let now = Date().timeIntervalSince1970
+
+        return throttleQueue.sync {
+            if let lastEmission = lastEmissionByKey[key], now - lastEmission < minimumInterval {
+                return false
+            }
+            lastEmissionByKey[key] = now
+            if lastEmissionByKey.count > 1_500 {
+                let cutoff = now - 30
+                lastEmissionByKey = lastEmissionByKey.filter { $0.value >= cutoff }
+            }
+            return true
+        }
+    }
 
     static func logResolvedFile(_ label: String, url: URL, size: Int64, duration: Double?, details: String = "") {
+        guard shouldEmitLog(level: "info", label: label, url: url, details: details, minimumInterval: 2.0) else { return }
         let durationText = duration.map { String(format: "%.3f", $0) } ?? "n/a"
         logger.info("\(label, privacy: .public) file=\(url.lastPathComponent, privacy: .public) size=\(size, privacy: .public) duration=\(durationText, privacy: .public) \(details, privacy: .public)")
     }
 
     static func logIssue(_ label: String, url: URL?, details: String) {
+        guard shouldEmitLog(level: "error", label: label, url: url, details: details, minimumInterval: 1.0) else { return }
         logger.error("\(label, privacy: .public) file=\(url?.lastPathComponent ?? "none", privacy: .public) \(details, privacy: .public)")
     }
 
@@ -195,6 +233,7 @@ private enum MediaPipelineDiagnostics {
         playbackBytes: Int64? = nil,
         details: String = ""
     ) {
+        guard shouldEmitLog(level: "info", label: label, url: url, details: details, minimumInterval: 2.0) else { return }
         let sourceText = sourceBytes.map(String.init) ?? "n/a"
         let playbackText = playbackBytes.map(String.init) ?? "n/a"
         logger.info(
@@ -218,7 +257,7 @@ private final class RemoteAttachmentDownloadController: ObservableObject {
     fileprivate func prepare(for attachment: Attachment) async {
         if ChatMediaPersistentStore.isUsableLocalMediaURL(attachment.localURL),
            let localURL = attachment.localURL,
-           MediaFileInspector.isValidAttachmentFile(localURL, attachment: attachment) {
+           await MediaFileInspector.isValidAttachmentFile(localURL, attachment: attachment) {
             resolvedLocalURL = localURL
             state = .ready
             return
@@ -231,7 +270,7 @@ private final class RemoteAttachmentDownloadController: ObservableObject {
         }
 
         if let cachedURL = await RemoteAssetCacheStore.shared.cachedFileURL(for: remoteURL) {
-            if MediaFileInspector.isValidAttachmentFile(cachedURL, attachment: attachment) {
+            if await MediaFileInspector.isValidAttachmentFile(cachedURL, attachment: attachment) {
                 resolvedLocalURL = ChatMediaPersistentStore.persistDownloadedFile(
                     sourceURL: cachedURL,
                     preferredFileName: attachment.fileName
@@ -275,7 +314,7 @@ private final class RemoteAttachmentDownloadController: ObservableObject {
                 return false
             }
 
-            guard MediaFileInspector.isValidAttachmentFile(cachedURL, attachment: attachment) else {
+            guard await MediaFileInspector.isValidAttachmentFile(cachedURL, attachment: attachment) else {
                 MediaPipelineDiagnostics.logIssue("attachment.download.manual_invalid", url: cachedURL, details: "downloaded attachment failed validation")
                 await RemoteAssetCacheStore.shared.invalidate(remoteURL: remoteURL)
                 state = .failed
@@ -289,7 +328,7 @@ private final class RemoteAttachmentDownloadController: ObservableObject {
             resolvedLocalURL = persistedURL
             state = .ready
 
-            let summary = MediaFileInspector.summary(for: persistedURL)
+            let summary = await MediaFileInspector.summary(for: persistedURL)
             MediaPipelineDiagnostics.logResolvedFile(
                 "attachment.download.manual_ok",
                 url: persistedURL,
@@ -442,14 +481,18 @@ private enum MediaFileInspector {
         let isPlayable: Bool
     }
 
-    static func summary(for url: URL) -> Summary {
+    static func summary(for url: URL) async -> Summary {
         let fileSize = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         let asset = AVURLAsset(url: url)
-        let duration = asset.duration.seconds
+        async let loadedDuration = try? asset.load(.duration)
+        async let loadedVideoTracks = try? asset.loadTracks(withMediaType: .video)
+        async let loadedAudioTracks = try? asset.loadTracks(withMediaType: .audio)
+        async let loadedPlayable = try? asset.load(.isPlayable)
+        let duration = (await loadedDuration ?? .zero).seconds
         let normalizedDuration = duration.isFinite && duration > 0 ? duration : nil
-        let hasVideoTrack = asset.tracks(withMediaType: .video).isEmpty == false
-        let hasAudioTrack = asset.tracks(withMediaType: .audio).isEmpty == false
-        let isPlayable = asset.isPlayable || hasVideoTrack || hasAudioTrack
+        let hasVideoTrack = ((await loadedVideoTracks) ?? []).isEmpty == false
+        let hasAudioTrack = ((await loadedAudioTracks) ?? []).isEmpty == false
+        let isPlayable = (await loadedPlayable) ?? hasVideoTrack || hasAudioTrack
         return Summary(
             fileSize: fileSize,
             durationSeconds: normalizedDuration,
@@ -463,8 +506,8 @@ private enum MediaFileInspector {
         declaredBytes > 0 && actualBytes < declaredBytes
     }
 
-    static func isValidAttachmentFile(_ url: URL, attachment: Attachment) -> Bool {
-        let summary = summary(for: url)
+    static func isValidAttachmentFile(_ url: URL, attachment: Attachment) async -> Bool {
+        let summary = await summary(for: url)
         guard summary.fileSize > 0 else { return false }
         if hasDeclaredByteShortfall(actualBytes: summary.fileSize, declaredBytes: attachment.byteSize) {
             MediaPipelineDiagnostics.logIssue(
@@ -488,8 +531,8 @@ private enum MediaFileInspector {
         _ url: URL,
         voiceMessage: VoiceMessage,
         enforceDeclaredByteSize: Bool = false
-    ) -> Bool {
-        let summary = summary(for: url)
+    ) async -> Bool {
+        let summary = await summary(for: url)
         guard summary.fileSize > 0 else { return false }
         if enforceDeclaredByteSize,
            hasDeclaredByteShortfall(actualBytes: summary.fileSize, declaredBytes: voiceMessage.byteSize) {
@@ -930,6 +973,7 @@ struct SharedChatContentSectionView: View {
     let kind: SharedChatContentKind
 
     @Environment(\.appEnvironment) private var environment
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @EnvironmentObject private var appState: AppState
 
     @StateObject private var attachmentPresentation = ChatAttachmentPresentationStore()
@@ -972,6 +1016,7 @@ struct SharedChatContentSectionView: View {
             RoundedRectangle(cornerRadius: 22, style: .continuous)
                 .fill(PrimeTheme.Colors.elevated)
         )
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 22, style: .continuous)
                 .stroke(PrimeTheme.Colors.separator.opacity(0.3), lineWidth: 1)
@@ -1062,20 +1107,35 @@ struct SharedChatContentSectionView: View {
     }
 
     private var mediaGrid: some View {
-        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-            ForEach(mediaEntries) { entry in
-                AttachmentView(
-                    attachment: entry.attachment,
-                    presentationContext: .init(
-                        senderDisplayName: senderDisplayName(for: entry.message),
-                        sentAt: entry.message.createdAt
-                    ),
-                    isInteractionEnabled: true
-                )
-            }
+        LazyVGrid(columns: mediaGridColumns, spacing: 1) {
+            mediaGridEntries
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 12)
+        .padding(.horizontal, 1)
+        .padding(.vertical, 1)
+    }
+
+    private var mediaGridColumns: [GridItem] {
+        let count: Int
+        #if os(tvOS)
+        count = 4
+        #else
+        count = horizontalSizeClass == .regular ? 4 : 3
+        #endif
+        return Array(repeating: GridItem(.flexible(), spacing: 1, alignment: .top), count: count)
+    }
+
+    @ViewBuilder
+    private var mediaGridEntries: some View {
+        ForEach(mediaEntries) { entry in
+            SharedMediaGridTileView(
+                attachment: entry.attachment,
+                presentationContext: .init(
+                    senderDisplayName: senderDisplayName(for: entry.message),
+                    sentAt: entry.message.createdAt
+                ),
+                isInteractionEnabled: true
+            )
+        }
     }
 
     private var filesList: some View {
@@ -1165,6 +1225,292 @@ struct SharedChatContentSectionView: View {
         }
         return chat.displayTitle(for: appState.currentUser.id)
     }
+}
+
+@MainActor
+final class LocalAttachmentImageLoader: ObservableObject {
+    @Published fileprivate private(set) var image: UIImage?
+    @Published fileprivate private(set) var isLoading = false
+
+    private var loadedKey: String?
+    private static let imageCache = NSCache<NSString, UIImage>()
+    private static let decodeQueue = DispatchQueue(
+        label: "PrimeMessaging.LocalAttachmentImageLoader.Decode",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+
+    fileprivate func load(from url: URL?, maxPixelSize: Int) async {
+        guard let url else {
+            image = nil
+            isLoading = false
+            loadedKey = nil
+            return
+        }
+
+        let cacheKey = "\(url.standardizedFileURL.path)#\(maxPixelSize)" as NSString
+        if loadedKey == cacheKey as String, image != nil {
+            return
+        }
+
+        if loadedKey != cacheKey as String {
+            image = nil
+        }
+
+        if let cachedImage = Self.imageCache.object(forKey: cacheKey) {
+            image = cachedImage
+            isLoading = false
+            loadedKey = cacheKey as String
+            return
+        }
+
+        isLoading = true
+        defer { isLoading = false }
+
+        let decodedImage = await Self.decodeImage(from: url, maxPixelSize: maxPixelSize)
+        guard Task.isCancelled == false else { return }
+
+        image = decodedImage
+        loadedKey = cacheKey as String
+        if let decodedImage {
+            Self.imageCache.setObject(decodedImage, forKey: cacheKey)
+        }
+    }
+
+    private static func decodeImage(from url: URL, maxPixelSize: Int) async -> UIImage? {
+        await withCheckedContinuation { continuation in
+            decodeQueue.async {
+                guard let imageSource = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+                    continuation.resume(returning: UIImage(contentsOfFile: url.path))
+                    return
+                }
+
+                let options: CFDictionary = [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceShouldCacheImmediately: true,
+                    kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+                ] as CFDictionary
+
+                if let thumbnail = CGImageSourceCreateThumbnailAtIndex(imageSource, 0, options) {
+                    continuation.resume(returning: UIImage(cgImage: thumbnail))
+                    return
+                }
+
+                continuation.resume(returning: UIImage(contentsOfFile: url.path))
+            }
+        }
+    }
+}
+
+struct LocalAttachmentImage<Content: View, Placeholder: View>: View {
+    let url: URL?
+    let maxPixelSize: Int
+    let shouldLoad: Bool
+    let content: (Image) -> Content
+    let placeholder: () -> Placeholder
+
+    @StateObject private var loader = LocalAttachmentImageLoader()
+
+    init(
+        url: URL?,
+        maxPixelSize: Int,
+        shouldLoad: Bool = true,
+        @ViewBuilder content: @escaping (Image) -> Content,
+        @ViewBuilder placeholder: @escaping () -> Placeholder
+    ) {
+        self.url = url
+        self.maxPixelSize = maxPixelSize
+        self.shouldLoad = shouldLoad
+        self.content = content
+        self.placeholder = placeholder
+    }
+
+    var body: some View {
+        SwiftUI.Group {
+            if let uiImage = loader.image {
+                content(Image(uiImage: uiImage))
+            } else {
+                placeholder()
+            }
+        }
+        .task(id: taskID) {
+            guard shouldLoad else { return }
+            await loader.load(from: url, maxPixelSize: maxPixelSize)
+        }
+    }
+
+    private var taskID: String {
+        "\(url?.standardizedFileURL.path ?? "missing")#\(maxPixelSize)"
+    }
+}
+
+private struct SharedMediaGridTileView: View {
+    let attachment: Attachment
+    let presentationContext: ChatAttachmentPresentationStore.PresentationContext?
+    let isInteractionEnabled: Bool
+
+    @EnvironmentObject private var attachmentPresentation: ChatAttachmentPresentationStore
+    @StateObject private var videoThumbnailLoader = VideoThumbnailLoader()
+    @State private var sourceFrame: CGRect = .zero
+
+    private func updateSourceFrame(_ newValue: CGRect) {
+        guard shouldCommitAttachmentSourceFrameUpdate(from: sourceFrame, to: newValue) else { return }
+        sourceFrame = newValue
+    }
+
+    var body: some View {
+        Button {
+            guard isInteractionEnabled else { return }
+            attachmentPresentation.present(
+                attachment,
+                sourceFrame: sourceFrame,
+                context: presentationContext
+            )
+        } label: {
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .aspectRatio(1, contentMode: .fit)
+                .overlay {
+                    ZStack {
+                        previewLayer
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .clipped()
+
+                        if attachment.type == .video {
+                            videoOverlay
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipped()
+                }
+                .clipped()
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .clipShape(Rectangle())
+        .contentShape(Rectangle())
+        .allowsHitTesting(isInteractionEnabled)
+        .task(id: attachment.id) {
+            guard attachment.type == .video else { return }
+            await videoThumbnailLoader.loadThumbnail(for: attachment)
+        }
+        .background(
+            GeometryReader { geometry in
+                Color.clear
+                    .onAppear {
+                        updateSourceFrame(geometry.frame(in: .global))
+                    }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private var previewLayer: some View {
+        switch attachment.type {
+        case .photo:
+            if let localURL = attachment.localURL {
+                LocalAttachmentImage(url: localURL, maxPixelSize: 960) { image in
+                    image
+                        .resizable()
+                        .scaledToFill()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } placeholder: {
+                    placeholderLayer(iconName: photoPlaceholderIconName)
+                }
+            } else if let remoteURL = attachment.remoteURL {
+                CachedRemoteImage(
+                    url: remoteURL,
+                    networkAccessKind: .autoDownload(attachment.autoDownloadKind),
+                    maxPixelSize: 960
+                ) { image in
+                    image
+                        .resizable()
+                        .scaledToFill()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } placeholder: {
+                    placeholderLayer(iconName: photoPlaceholderIconName)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                placeholderLayer(iconName: photoPlaceholderIconName)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        case .video:
+            if let image = videoThumbnailLoader.image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if videoThumbnailLoader.isLoading {
+                ZStack {
+                    Color.white.opacity(0.12)
+                    ProgressView()
+                        .tint(.white)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                placeholderLayer(iconName: videoPlaceholderIconName)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        default:
+            placeholderLayer(iconName: "photo")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private var photoPlaceholderIconName: String {
+        let canAutoDownload = attachment.localURL != nil || NetworkUsagePolicy.canAutoDownload(attachment.autoDownloadKind)
+        return canAutoDownload ? "photo" : "arrow.down.to.line"
+    }
+
+    private var videoPlaceholderIconName: String {
+        let canAutoDownload = attachment.localURL != nil || NetworkUsagePolicy.canAutoDownload(.videos)
+        return canAutoDownload ? "video" : "arrow.down.to.line"
+    }
+
+    private var videoOverlay: some View {
+        VStack {
+            Spacer(minLength: 0)
+            HStack(spacing: 5) {
+                Image(systemName: "video.fill")
+                    .font(.system(size: 9, weight: .bold))
+                Text(videoThumbnailLoader.durationLabel ?? "Video")
+                    .font(.system(size: 9, weight: .semibold, design: .rounded).monospacedDigit())
+            }
+            .foregroundStyle(Color.white.opacity(0.96))
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(Color.black.opacity(0.56), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .padding(6)
+        }
+        .background(
+            LinearGradient(
+                colors: [Color.clear, Color.black.opacity(0.4)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
+    }
+
+    @ViewBuilder
+    private func placeholderLayer(iconName: String) -> some View {
+        ZStack {
+            Color.white.opacity(0.12)
+            Image(systemName: iconName)
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundStyle(Color.white.opacity(0.82))
+        }
+    }
+}
+
+private func shouldCommitAttachmentSourceFrameUpdate(from current: CGRect, to next: CGRect) -> Bool {
+    guard current.equalTo(.zero) == false else { return true }
+
+    let positionDelta = max(abs(current.minX - next.minX), abs(current.minY - next.minY))
+    let sizeDelta = max(abs(current.width - next.width), abs(current.height - next.height))
+    return positionDelta >= 10 || sizeDelta >= 6
 }
 
 private struct AttachmentTypeBadge: View {
@@ -1281,7 +1627,7 @@ final class AudioRecorderController: NSObject, ObservableObject, AVAudioRecorder
         return activeRecorder.isRecording && recorder.isRecording
     }
 
-    nonisolated(unsafe) private static func setRecorder(_ recorder: AudioRecorderController, active: Bool) {
+    nonisolated private static func setRecorder(_ recorder: AudioRecorderController, active: Bool) {
         if active {
             activeRecorder = recorder
             isAnyRecordingActive = true
@@ -1343,7 +1689,7 @@ final class AudioRecorderController: NSObject, ObservableObject, AVAudioRecorder
         MediaPipelineDiagnostics.logIssue("voice.recording.resume", url: recorder.url, details: "current=\(recorder.currentTime)")
     }
 
-    func stopRecording() throws -> VoiceMessage? {
+    func stopRecording() async throws -> VoiceMessage? {
         guard let recorder else {
             Self.setRecorder(self, active: false)
             return nil
@@ -1362,8 +1708,8 @@ final class AudioRecorderController: NSObject, ObservableObject, AVAudioRecorder
         durationTask?.cancel()
         durationTask = nil
         lastHealthResumeAt = .distantPast
-        let recordedURL = finalizedRecordedURL(at: recorderURL, expectedDuration: liveDuration)
-        let measuredDuration = actualRecordedDuration(at: recordedURL)
+        let recordedURL = await finalizedRecordedURL(at: recorderURL, expectedDuration: liveDuration)
+        let measuredDuration = await actualRecordedDuration(at: recordedURL)
         let finalizedDuration = measuredDuration > 0.2 ? measuredDuration : liveDuration
         let finalizedByteSize = Int64((try? recordedURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         let durationGap = max(liveDuration - measuredDuration, 0)
@@ -1491,8 +1837,8 @@ final class AudioRecorderController: NSObject, ObservableObject, AVAudioRecorder
         max(recorder.currentTime, 0)
     }
 
-    private func actualRecordedDuration(at url: URL) -> TimeInterval {
-        let assetDuration = AVURLAsset(url: url).duration.seconds
+    private func actualRecordedDuration(at url: URL) async -> TimeInterval {
+        let assetDuration = ((try? await AVURLAsset(url: url).load(.duration)) ?? .zero).seconds
         if assetDuration.isFinite, assetDuration > 0 {
             return assetDuration
         }
@@ -1504,7 +1850,7 @@ final class AudioRecorderController: NSObject, ObservableObject, AVAudioRecorder
         return 0
     }
 
-    private func finalizedRecordedURL(at url: URL, expectedDuration: TimeInterval) -> URL {
+    private func finalizedRecordedURL(at url: URL, expectedDuration: TimeInterval) async -> URL {
         var previousFileSize: Int64 = -1
         var repeatedStableChecks = 0
         let minimumAcceptedDuration = max(expectedDuration - 0.75, 0.8)
@@ -1512,7 +1858,7 @@ final class AudioRecorderController: NSObject, ObservableObject, AVAudioRecorder
 
         for _ in 0 ..< 80 {
             let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
-            let actualDuration = actualRecordedDuration(at: url)
+            let actualDuration = await actualRecordedDuration(at: url)
             if fileSize > 0, fileSize == previousFileSize {
                 repeatedStableChecks += 1
             } else {
@@ -1528,10 +1874,10 @@ final class AudioRecorderController: NSObject, ObservableObject, AVAudioRecorder
                 break
             }
 
-            Thread.sleep(forTimeInterval: 0.1)
+            try? await Task.sleep(for: .milliseconds(100))
         }
 
-        let finalizedDuration = actualRecordedDuration(at: url)
+        let finalizedDuration = await actualRecordedDuration(at: url)
         if finalizedDuration + 0.75 < expectedDuration {
             MediaPipelineDiagnostics.logIssue(
                 "voice.recording.finalize_short",
@@ -1571,9 +1917,9 @@ final class AudioRecorderController: NSObject, ObservableObject, AVAudioRecorder
 
     private func configureRecordingAudioSession(using session: AVAudioSession) throws {
         #if os(tvOS)
-        try session.setCategory(.playAndRecord, mode: .default, options: [.allowBluetooth])
+        try session.setCategory(.playAndRecord, mode: .default, options: [.allowBluetoothHFP])
         #else
-        try session.setCategory(.playAndRecord, mode: .default, options: [.allowBluetooth])
+        try session.setCategory(.playAndRecord, mode: .default, options: [.allowBluetoothHFP])
         #endif
         try? session.setPreferredSampleRate(44_100)
         try? session.setPreferredIOBufferDuration(0.02)
@@ -1638,8 +1984,13 @@ final class AudioRecorderController: NSObject, ObservableObject, AVAudioRecorder
             object: AVAudioSession.sharedInstance(),
             queue: .main
         ) { [weak self] notification in
-            guard let self else { return }
-            self.handleAudioSessionInterruption(notification)
+            let userInfo = notification.userInfo
+            let rawType = userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            let optionsRaw = (userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt) ?? 0
+            Task { @MainActor [weak self] in
+                guard let self, let rawType else { return }
+                self.handleAudioSessionInterruption(rawType: rawType, optionsRaw: optionsRaw)
+            }
         }
 
         routeChangeObserver = NotificationCenter.default.addObserver(
@@ -1647,8 +1998,11 @@ final class AudioRecorderController: NSObject, ObservableObject, AVAudioRecorder
             object: AVAudioSession.sharedInstance(),
             queue: .main
         ) { [weak self] notification in
-            guard let self else { return }
-            self.handleAudioSessionRouteChange(notification)
+            let rawReason = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            Task { @MainActor [weak self] in
+                guard let self, let rawReason else { return }
+                self.handleAudioSessionRouteChange(rawReason: rawReason)
+            }
         }
     }
 
@@ -1663,13 +2017,9 @@ final class AudioRecorderController: NSObject, ObservableObject, AVAudioRecorder
         }
     }
 
-    private func handleAudioSessionInterruption(_ notification: Notification) {
+    private func handleAudioSessionInterruption(rawType: UInt, optionsRaw: UInt) {
         guard isRecording else { return }
-        guard
-            let userInfo = notification.userInfo,
-            let rawType = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
-            let type = AVAudioSession.InterruptionType(rawValue: rawType)
-        else { return }
+        guard let type = AVAudioSession.InterruptionType(rawValue: rawType) else { return }
 
         switch type {
         case .began:
@@ -1680,7 +2030,6 @@ final class AudioRecorderController: NSObject, ObservableObject, AVAudioRecorder
             isUserPaused = false
             MediaPipelineDiagnostics.logIssue("voice.recording.interruption.began", url: recorder?.url, details: "interruption began current=\(recorder?.currentTime ?? 0)")
         case .ended:
-            let optionsRaw = (userInfo[AVAudioSessionInterruptionOptionKey] as? UInt) ?? 0
             let options = AVAudioSession.InterruptionOptions(rawValue: optionsRaw)
             isHandlingInterruption = false
             guard shouldResumeAfterInterruption, let recorder else {
@@ -1708,13 +2057,9 @@ final class AudioRecorderController: NSObject, ObservableObject, AVAudioRecorder
         }
     }
 
-    private func handleAudioSessionRouteChange(_ notification: Notification) {
+    private func handleAudioSessionRouteChange(rawReason: UInt) {
         guard isRecording else { return }
-        guard
-            let userInfo = notification.userInfo,
-            let rawReason = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt,
-            let reason = AVAudioSession.RouteChangeReason(rawValue: rawReason)
-        else { return }
+        guard let reason = AVAudioSession.RouteChangeReason(rawValue: rawReason) else { return }
 
         MediaPipelineDiagnostics.logIssue("voice.recording.route_change", url: recorder?.url, details: "reason=\(reason.rawValue)")
         guard let recorder, isPaused else { return }
@@ -1991,9 +2336,13 @@ enum ChatMediaDraftBuilder {
         exportSession.outputFileType = outputFileType
         exportSession.shouldOptimizeForNetworkUse = true
 
+        let exportSessionBox = ChatMediaUncheckedSendableBox(exportSession)
         return try await withCheckedThrowingContinuation { continuation in
-            exportSession.exportAsynchronously {
-                switch exportSession.status {
+            exportSession.exportAsynchronously { [outputURL, outputFileType, exportSessionBox] in
+                let exportSession = exportSessionBox.value
+                let status = exportSession.status
+                let exportError = exportSession.error
+                switch status {
                 case .completed:
                     continuation.resume(
                         returning: (
@@ -2002,7 +2351,7 @@ enum ChatMediaDraftBuilder {
                         )
                     )
                 case .failed:
-                    continuation.resume(throwing: exportSession.error ?? NSError(domain: "PrimeMessagingVideoExport", code: -1))
+                    continuation.resume(throwing: exportError ?? NSError(domain: "PrimeMessagingVideoExport", code: -1))
                 case .cancelled:
                     continuation.resume(returning: nil)
                 default:
@@ -2073,6 +2422,7 @@ struct MessageAttachmentGallery: View {
     let alignment: HorizontalAlignment
     let presentationContext: ChatAttachmentPresentationStore.PresentationContext?
     let isInteractionEnabled: Bool
+    let defersHeavyMediaLoading: Bool
 
     var body: some View {
         VStack(alignment: alignment, spacing: PrimeTheme.Spacing.small) {
@@ -2080,7 +2430,8 @@ struct MessageAttachmentGallery: View {
                 AttachmentView(
                     attachment: attachment,
                     presentationContext: presentationContext,
-                    isInteractionEnabled: isInteractionEnabled
+                    isInteractionEnabled: isInteractionEnabled,
+                    defersHeavyMediaLoading: defersHeavyMediaLoading
                 )
                     .fixedSize(horizontal: true, vertical: false)
             }
@@ -2092,8 +2443,14 @@ private struct AttachmentView: View {
     let attachment: Attachment
     let presentationContext: ChatAttachmentPresentationStore.PresentationContext?
     let isInteractionEnabled: Bool
+    let defersHeavyMediaLoading: Bool
     @EnvironmentObject private var attachmentPresentation: ChatAttachmentPresentationStore
     @State private var sourceFrame: CGRect = .zero
+
+    private func updateSourceFrame(_ newValue: CGRect) {
+        guard shouldCommitAttachmentSourceFrameUpdate(from: sourceFrame, to: newValue) else { return }
+        sourceFrame = newValue
+    }
 
     private enum CardLayout {
         static let width: CGFloat = 244
@@ -2118,12 +2475,16 @@ private struct AttachmentView: View {
                 VideoAttachmentCard(
                     attachment: attachment,
                     presentationContext: presentationContext,
-                    isInteractionEnabled: isInteractionEnabled
+                    isInteractionEnabled: isInteractionEnabled,
+                    defersHeavyMediaLoading: defersHeavyMediaLoading
                 )
             case .location:
                 LocationAttachmentCard(attachment: attachment)
             default:
-                DocumentAttachmentCard(attachment: attachment)
+                DocumentAttachmentCard(
+                    attachment: attachment,
+                    defersHeavyMediaLoading: defersHeavyMediaLoading
+                )
                     .contentShape(Rectangle())
                     .onTapGesture {
                         guard isInteractionEnabled else { return }
@@ -2140,10 +2501,7 @@ private struct AttachmentView: View {
             GeometryReader { geometry in
                 Color.clear
                     .onAppear {
-                        sourceFrame = geometry.frame(in: .global)
-                    }
-                    .onChange(of: geometry.frame(in: .global)) { newValue in
-                        sourceFrame = newValue
+                        updateSourceFrame(geometry.frame(in: .global))
                     }
             }
         )
@@ -2151,17 +2509,27 @@ private struct AttachmentView: View {
 
     @ViewBuilder
     private var imageContent: some View {
-        if
-            let localURL = attachment.localURL,
-            let uiImage = UIImage(contentsOfFile: localURL.path)
-        {
-            Image(uiImage: uiImage)
-                .resizable()
-                .scaledToFill()
-                .frame(width: CardLayout.mediaSide, height: CardLayout.mediaSide)
-                .clipShape(RoundedRectangle(cornerRadius: PrimeTheme.Radius.card, style: .continuous))
+        if let localURL = attachment.localURL {
+            LocalAttachmentImage(
+                url: localURL,
+                maxPixelSize: 920,
+                shouldLoad: defersHeavyMediaLoading == false
+            ) { image in
+                image
+                    .resizable()
+                    .scaledToFill()
+            } placeholder: {
+                imagePlaceholder
+            }
+            .frame(width: CardLayout.mediaSide, height: CardLayout.mediaSide)
+            .clipShape(RoundedRectangle(cornerRadius: PrimeTheme.Radius.card, style: .continuous))
         } else if let remoteURL = attachment.remoteURL {
-            CachedRemoteImage(url: remoteURL, networkAccessKind: .autoDownload(attachment.autoDownloadKind)) { image in
+            CachedRemoteImage(
+                url: remoteURL,
+                networkAccessKind: .autoDownload(attachment.autoDownloadKind),
+                maxPixelSize: 920,
+                shouldLoad: defersHeavyMediaLoading == false
+            ) { image in
                 image
                     .resizable()
                     .scaledToFill()
@@ -2203,9 +2571,19 @@ private final class DocumentAttachmentThumbnailLoader: ObservableObject {
     @Published fileprivate private(set) var didFail = false
 
     private var loadedAttachmentID: UUID?
+    private static let imageCache = NSCache<NSString, UIImage>()
 
     fileprivate func loadThumbnail(for attachment: Attachment) async {
         guard loadedAttachmentID != attachment.id else { return }
+
+        let cacheKey = attachment.id.uuidString as NSString
+        if let cachedImage = Self.imageCache.object(forKey: cacheKey) {
+            image = cachedImage
+            didFail = false
+            isLoading = false
+            loadedAttachmentID = attachment.id
+            return
+        }
 
         if attachment.localURL == nil,
            attachment.remoteURL != nil,
@@ -2225,11 +2603,13 @@ private final class DocumentAttachmentThumbnailLoader: ObservableObject {
                 for: attachment,
                 networkAccessKind: .autoDownload(attachment.autoDownloadKind)
             )
+            guard Task.isCancelled == false else { return }
 
             if isPDFAttachment(attachment, resolvedURL: resolvedURL),
                let pdfThumbnail = makePDFThumbnail(for: resolvedURL) {
                 self.image = pdfThumbnail
                 self.loadedAttachmentID = attachment.id
+                Self.imageCache.setObject(pdfThumbnail, forKey: cacheKey)
                 return
             }
 
@@ -2247,8 +2627,10 @@ private final class DocumentAttachmentThumbnailLoader: ObservableObject {
                 representationTypes: .all
             )
             let image = try await QuickLookThumbnailResolver.generate(for: request)
+            guard Task.isCancelled == false else { return }
             self.image = image
             self.loadedAttachmentID = attachment.id
+            Self.imageCache.setObject(image, forKey: cacheKey)
             #else
             image = nil
             didFail = true
@@ -2306,6 +2688,7 @@ private enum QuickLookThumbnailResolver {
 
 private struct DocumentAttachmentCard: View {
     let attachment: Attachment
+    let defersHeavyMediaLoading: Bool
 
     @StateObject private var thumbnailLoader = DocumentAttachmentThumbnailLoader()
 
@@ -2344,7 +2727,8 @@ private struct DocumentAttachmentCard: View {
             .padding(.bottom, 2)
         }
         .frame(width: CardLayout.width, alignment: .leading)
-        .task(id: attachment.id) {
+        .task(id: "\(attachment.id.uuidString)-\(defersHeavyMediaLoading)") {
+            guard defersHeavyMediaLoading == false else { return }
             await thumbnailLoader.loadThumbnail(for: attachment)
         }
     }
@@ -2397,7 +2781,14 @@ private struct DocumentAttachmentCard: View {
                 Color(red: 0.95, green: 0.95, blue: 0.94)
 
                 VStack(spacing: 10) {
-                    if thumbnailLoader.isLoading {
+                    if defersHeavyMediaLoading, thumbnailLoader.image == nil {
+                        Image(systemName: "doc.text.image")
+                            .font(.system(size: 28, weight: .semibold))
+                            .foregroundStyle(PrimeTheme.Colors.accentSoft)
+                        Text("Preview after scroll")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(PrimeTheme.Colors.textSecondary)
+                    } else if thumbnailLoader.isLoading {
                         ProgressView()
                             .tint(PrimeTheme.Colors.accent)
                     } else {
@@ -2463,44 +2854,126 @@ private final class VideoThumbnailLoader: ObservableObject {
     @Published fileprivate private(set) var image: UIImage?
     @Published fileprivate private(set) var isLoading = false
     @Published fileprivate private(set) var didFail = false
+    @Published fileprivate private(set) var durationLabel: String?
 
     private var loadedAttachmentID: UUID?
+    private static let generationQueue = DispatchQueue(
+        label: "PrimeMessaging.VideoThumbnailLoader.Generation",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+    private static let imageCache = NSCache<NSString, UIImage>()
+    private static let durationCache = NSCache<NSString, NSString>()
 
     fileprivate func loadThumbnail(for attachment: Attachment) async {
         guard loadedAttachmentID != attachment.id else { return }
+
+        let cacheKey = attachment.id.uuidString as NSString
+        if let cachedImage = Self.imageCache.object(forKey: cacheKey) {
+            image = cachedImage
+            durationLabel = Self.durationCache.object(forKey: cacheKey) as String?
+            didFail = false
+            isLoading = false
+            loadedAttachmentID = attachment.id
+            return
+        }
 
         if attachment.localURL == nil,
            attachment.remoteURL != nil,
            NetworkUsagePolicy.canAutoDownload(.videos) == false {
             image = nil
             didFail = false
+            durationLabel = nil
             isLoading = false
             return
         }
 
         isLoading = true
         didFail = false
+        durationLabel = nil
         defer { isLoading = false }
 
         do {
-            let url = try await ChatMediaFileResolver.resolvedFileURL(
-                for: attachment,
-                networkAccessKind: .autoDownload(.videos)
-            )
-            let asset = AVURLAsset(url: url)
-            let generator = AVAssetImageGenerator(asset: asset)
-            generator.appliesPreferredTrackTransform = true
-            generator.maximumSize = CGSize(width: 720, height: 720)
-            let cgImage = try generator.copyCGImage(
-                at: CMTime(seconds: 0.15, preferredTimescale: 600),
-                actualTime: nil
-            )
-            image = UIImage(cgImage: cgImage)
+            let sourceURL: URL
+            if ChatMediaPersistentStore.isUsableLocalMediaURL(attachment.localURL),
+               let localURL = attachment.localURL {
+                sourceURL = localURL
+            } else {
+                sourceURL = try await ChatMediaFileResolver.resolvedFileURL(
+                    for: attachment,
+                    networkAccessKind: .autoDownload(.videos)
+                )
+            }
+            guard Task.isCancelled == false else { return }
+
+            let previewPayload = await Self.generatePreviewPayload(for: sourceURL)
+            guard Task.isCancelled == false else { return }
+            guard let previewPayload else {
+                image = nil
+                didFail = true
+                durationLabel = nil
+                return
+            }
+
+            image = previewPayload.image
+            durationLabel = previewPayload.durationLabel
+            Self.imageCache.setObject(previewPayload.image, forKey: cacheKey)
+            if let durationLabel = previewPayload.durationLabel {
+                Self.durationCache.setObject(durationLabel as NSString, forKey: cacheKey)
+            } else {
+                Self.durationCache.removeObject(forKey: cacheKey)
+            }
             loadedAttachmentID = attachment.id
         } catch {
             image = nil
             didFail = true
+            durationLabel = nil
         }
+    }
+
+    private struct PreviewPayload {
+        let image: UIImage
+        let durationLabel: String?
+    }
+
+    private static func generatePreviewPayload(for url: URL) async -> PreviewPayload? {
+        await withCheckedContinuation { continuation in
+            generationQueue.async {
+                let asset = AVURLAsset(url: url)
+                Task {
+                    let durationTime = (try? await asset.load(.duration)) ?? .zero
+                    let duration = durationTime.seconds
+                    let durationLabel: String?
+                    if duration.isFinite, duration > 0 {
+                        durationLabel = formatDuration(seconds: Int(duration.rounded()))
+                    } else {
+                        durationLabel = nil
+                    }
+
+                    let generator = AVAssetImageGenerator(asset: asset)
+                    generator.appliesPreferredTrackTransform = true
+                    generator.maximumSize = CGSize(width: 720, height: 720)
+
+                    guard let cgImage = try? generator.copyCGImage(
+                        at: CMTime(seconds: 0.15, preferredTimescale: 600),
+                        actualTime: nil
+                    ) else {
+                        continuation.resume(returning: nil)
+                        return
+                    }
+
+                    let image = UIImage(cgImage: cgImage)
+                    continuation.resume(returning: PreviewPayload(image: image, durationLabel: durationLabel))
+                }
+            }
+        }
+    }
+
+    nonisolated private static func formatDuration(seconds: Int) -> String {
+        let safeSeconds = max(seconds, 0)
+        let minutes = safeSeconds / 60
+        let remainder = safeSeconds % 60
+        return "\(minutes):" + String(format: "%02d", remainder)
     }
 }
 
@@ -2508,11 +2981,17 @@ private struct VideoAttachmentCard: View {
     let attachment: Attachment
     let presentationContext: ChatAttachmentPresentationStore.PresentationContext?
     let isInteractionEnabled: Bool
+    let defersHeavyMediaLoading: Bool
 
     @EnvironmentObject private var attachmentPresentation: ChatAttachmentPresentationStore
     @StateObject private var loader = VideoThumbnailLoader()
     @StateObject private var downloadController = RemoteAttachmentDownloadController()
     @State private var sourceFrame: CGRect = .zero
+
+    private func updateSourceFrame(_ newValue: CGRect) {
+        guard shouldCommitAttachmentSourceFrameUpdate(from: sourceFrame, to: newValue) else { return }
+        sourceFrame = newValue
+    }
 
     private enum CardLayout {
         static let width: CGFloat = 244
@@ -2583,9 +3062,9 @@ private struct VideoAttachmentCard: View {
             RoundedRectangle(cornerRadius: 24, style: .continuous)
                 .stroke(Color.white.opacity(0.12), lineWidth: 1)
         )
-        .task(id: attachment.id) {
+        .task(id: "\(attachment.id.uuidString)-\(defersHeavyMediaLoading)") {
             await downloadController.prepare(for: attachment)
-            if downloadController.isReady {
+            if downloadController.isReady, defersHeavyMediaLoading == false {
                 await loader.loadThumbnail(for: downloadController.resolvedAttachment(for: attachment))
             }
         }
@@ -2593,10 +3072,7 @@ private struct VideoAttachmentCard: View {
             GeometryReader { geometry in
                 Color.clear
                     .onAppear {
-                        sourceFrame = geometry.frame(in: .global)
-                    }
-                    .onChange(of: geometry.frame(in: .global)) { newValue in
-                        sourceFrame = newValue
+                        updateSourceFrame(geometry.frame(in: .global))
                     }
             }
         )
@@ -2628,6 +3104,15 @@ private struct VideoAttachmentCard: View {
                             .multilineTextAlignment(.center)
                     }
                     .padding(.horizontal, 18)
+                } else if defersHeavyMediaLoading, loader.image == nil {
+                    VStack(spacing: 10) {
+                        Image(systemName: "video")
+                            .font(.system(size: 24, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.9))
+                        Text("Preview after scroll")
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.82))
+                    }
                 } else if loader.isLoading {
                     VStack(spacing: 10) {
                         ProgressView()
@@ -3320,14 +3805,16 @@ private final class VideoAttachmentPlaybackController: ObservableObject {
             object: item,
             queue: .main
         ) { [weak self, weak player] _ in
-            guard let self else { return }
-            if let playbackActivityKey = self.playbackActivityKey {
-                MediaPlaybackActivityStore.shared.end(playbackActivityKey)
+            Task { @MainActor [weak self, weak player] in
+                guard let self else { return }
+                if let playbackActivityKey = self.playbackActivityKey {
+                    MediaPlaybackActivityStore.shared.end(playbackActivityKey)
+                }
+                self.isPlaying = false
+                self.shouldRemainPlaying = false
+                self.releasePinnedRemoteURL()
+                player?.seek(to: .zero)
             }
-            self.isPlaying = false
-            self.shouldRemainPlaying = false
-            self.releasePinnedRemoteURL()
-            player?.seek(to: .zero)
         }
 
         playbackStallObserver = NotificationCenter.default.addObserver(
@@ -3445,7 +3932,7 @@ private final class VideoAttachmentPlaybackController: ObservableObject {
         self.cachedURL = resolvedURL
         self.stablePlaybackURL = playbackURL
         self.pinnedRemoteURL = attachment.remoteURL
-        let summary = MediaFileInspector.summary(for: playbackURL)
+        let summary = await MediaFileInspector.summary(for: playbackURL)
         MediaPipelineDiagnostics.logResolvedFile(
             "video.playback.prepared",
             url: playbackURL,
@@ -4404,17 +4891,12 @@ struct VoiceMessagePlayerView: View {
         .frame(minWidth: style.minimumWidth, alignment: .leading)
         .background(backgroundBody)
         .onAppear {
-            MediaPipelineDiagnostics.logIssue("voice.viewer.appear", url: voiceMessage.remoteFileURL ?? voiceMessage.localFileURL, details: "voice bubble appeared")
             Task {
                 playback.cancelScheduledStop()
-                if voiceMessage.localFileURL != nil || NetworkUsagePolicy.canAutoDownload(.voiceMessages) {
-                    await playback.prepareIfNeeded(for: voiceMessage)
-                }
-                await transcription.loadIfNeeded(for: voiceMessage)
             }
         }
         .onDisappear {
-            MediaPipelineDiagnostics.logIssue("voice.viewer.disappear", url: voiceMessage.remoteFileURL ?? voiceMessage.localFileURL, details: "voice bubble disappeared")
+            playback.scheduleStop(after: .milliseconds(700))
         }
     }
 
@@ -4843,6 +5325,7 @@ private final class VoiceMessagePlaybackController: NSObject, ObservableObject, 
     }
 
     fileprivate func scheduleStop(after delay: Duration = .milliseconds(900)) {
+        guard player != nil || cachedURL != nil || isPlaying || progress > 0.001 else { return }
         cancelScheduledStop()
         scheduledStopTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: delay)
@@ -4943,7 +5426,7 @@ private final class VoiceMessagePlaybackController: NSObject, ObservableObject, 
         self.pinnedRemoteURL = voiceMessage.remoteFileURL
         self.progress = 0
         self.isPlaying = false
-        let summary = MediaFileInspector.summary(for: url)
+        let summary = await MediaFileInspector.summary(for: url)
         MediaPipelineDiagnostics.logResolvedFile(
             "voice.playback.prepared",
             url: url,
@@ -5222,19 +5705,26 @@ private struct VoiceWaveformView: View {
     var maximumBarHeight: CGFloat = 18
 
     var body: some View {
-        HStack(alignment: .center, spacing: spacing) {
-            ForEach(Array(samples.enumerated()), id: \.offset) { index, sample in
-                Capsule()
-                    .fill(color(for: index))
-                    .frame(width: barWidth, height: max(minimumBarHeight, CGFloat(sample) * maximumBarHeight))
+        Canvas { context, size in
+            guard samples.isEmpty == false else { return }
+
+            let progressThreshold = Int((Double(samples.count) * progress).rounded(.down))
+            let radius = min(barWidth / 2, 3)
+            var x: CGFloat = 0
+
+            for (index, sample) in samples.enumerated() {
+                let height = max(minimumBarHeight, CGFloat(sample) * maximumBarHeight)
+                let y = (size.height - height) / 2
+                let rect = CGRect(x: x, y: y, width: barWidth, height: height)
+                let path = Path(roundedRect: rect, cornerRadius: radius)
+                let color = index <= progressThreshold ? activeColor.opacity(0.96) : inactiveColor
+                context.fill(path, with: .color(color))
+                x += barWidth + spacing
+                if x > size.width { break }
             }
         }
         .frame(height: 24)
-    }
-
-    private func color(for index: Int) -> Color {
-        let threshold = Int(Double(samples.count) * progress)
-        return index <= threshold ? activeColor.opacity(0.96) : inactiveColor
+        .drawingGroup(opaque: false)
     }
 }
 
@@ -5307,13 +5797,17 @@ struct PhotoAttachmentViewer: View {
 
     @ViewBuilder
     private var imageBody: some View {
-        if let localURL = attachment.localURL,
-           let uiImage = UIImage(contentsOfFile: localURL.path) {
-            Image(uiImage: uiImage)
-                .resizable()
-                .scaledToFit()
+        if let localURL = attachment.localURL {
+            LocalAttachmentImage(url: localURL, maxPixelSize: 2200) { image in
+                image
+                    .resizable()
+                    .scaledToFit()
+            } placeholder: {
+                ProgressView()
+                    .tint(.white)
+            }
         } else if let remoteURL = attachment.remoteURL {
-            CachedRemoteImage(url: remoteURL) { image in
+            CachedRemoteImage(url: remoteURL, maxPixelSize: 2200) { image in
                 image
                     .resizable()
                     .scaledToFit()
@@ -5360,7 +5854,7 @@ private enum ChatMediaFileResolver {
     ) async throws -> Data {
         if ChatMediaPersistentStore.isUsableLocalMediaURL(attachment.localURL),
            let localURL = attachment.localURL,
-           MediaFileInspector.isValidAttachmentFile(localURL, attachment: attachment) {
+           await MediaFileInspector.isValidAttachmentFile(localURL, attachment: attachment) {
             return try Data(contentsOf: localURL)
         }
 
@@ -5382,13 +5876,13 @@ private enum ChatMediaFileResolver {
         if forceRefresh == false,
            ChatMediaPersistentStore.isUsableLocalMediaURL(attachment.localURL),
            let localURL = attachment.localURL {
-            if MediaFileInspector.isValidAttachmentFile(localURL, attachment: attachment) {
-                let summary = MediaFileInspector.summary(for: localURL)
+            if await MediaFileInspector.isValidAttachmentFile(localURL, attachment: attachment) {
+                let summary = await MediaFileInspector.summary(for: localURL)
                 MediaPipelineDiagnostics.logResolvedFile("attachment.local.hit", url: localURL, size: summary.fileSize, duration: summary.durationSeconds)
                 MediaPipelineDiagnostics.logByteComparison("attachment.local.bytes", url: localURL, declaredBytes: attachment.byteSize, actualBytes: summary.fileSize)
                 return localURL
             }
-            let summary = MediaFileInspector.summary(for: localURL)
+            let summary = await MediaFileInspector.summary(for: localURL)
             MediaPipelineDiagnostics.logByteComparison("attachment.local.invalid.bytes", url: localURL, declaredBytes: attachment.byteSize, actualBytes: summary.fileSize)
             MediaPipelineDiagnostics.logIssue("attachment.local.invalid", url: localURL, details: "discarding invalid local file before refetch")
             try? FileManager.default.removeItem(at: localURL)
@@ -5400,7 +5894,7 @@ private enum ChatMediaFileResolver {
                 preferredFileName: attachment.fileName,
                 declaredByteSize: attachment.byteSize,
                 networkAccessKind: networkAccessKind,
-                validator: { MediaFileInspector.isValidAttachmentFile($0, attachment: attachment) },
+                validator: { await MediaFileInspector.isValidAttachmentFile($0, attachment: attachment) },
                 logLabel: "attachment.remote"
             ) {
                 return resolvedRemoteURL
@@ -5420,12 +5914,12 @@ private enum ChatMediaFileResolver {
         try data.write(to: targetURL, options: .atomic)
         let targetSize = Int64((try? targetURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         MediaPipelineDiagnostics.logByteComparison("attachment.download.fallback.bytes", url: targetURL, declaredBytes: attachment.byteSize, actualBytes: targetSize)
-        if MediaFileInspector.isValidAttachmentFile(targetURL, attachment: attachment) == false {
+        if await MediaFileInspector.isValidAttachmentFile(targetURL, attachment: attachment) == false {
             MediaPipelineDiagnostics.logIssue("attachment.download.invalid", url: targetURL, details: "fallback downloaded file is not playable")
             try? FileManager.default.removeItem(at: targetURL)
             throw AttachmentLibrarySaverError.unavailableAsset
         }
-        let summary = MediaFileInspector.summary(for: targetURL)
+        let summary = await MediaFileInspector.summary(for: targetURL)
         MediaPipelineDiagnostics.logResolvedFile("attachment.download.fallback", url: targetURL, size: summary.fileSize, duration: summary.durationSeconds)
         return targetURL
     }
@@ -5438,18 +5932,18 @@ private enum ChatMediaFileResolver {
         if forceRefresh == false,
            ChatMediaPersistentStore.isUsableLocalMediaURL(voiceMessage.localFileURL),
            let localFileURL = voiceMessage.localFileURL {
-            if MediaFileInspector.isValidVoiceFile(localFileURL, voiceMessage: voiceMessage) {
-                let summary = MediaFileInspector.summary(for: localFileURL)
+            if await MediaFileInspector.isValidVoiceFile(localFileURL, voiceMessage: voiceMessage) {
+                let summary = await MediaFileInspector.summary(for: localFileURL)
                 MediaPipelineDiagnostics.logResolvedFile("voice.local.hit", url: localFileURL, size: summary.fileSize, duration: summary.durationSeconds)
                 MediaPipelineDiagnostics.logByteComparison("voice.local.bytes", url: localFileURL, declaredBytes: voiceMessage.byteSize, actualBytes: summary.fileSize)
                 return localFileURL
             }
-            if MediaFileInspector.isValidVoiceFile(
+            if await MediaFileInspector.isValidVoiceFile(
                 localFileURL,
                 voiceMessage: voiceMessage,
                 enforceDeclaredByteSize: false
             ) {
-                let summary = MediaFileInspector.summary(for: localFileURL)
+                let summary = await MediaFileInspector.summary(for: localFileURL)
                 MediaPipelineDiagnostics.logIssue(
                     "voice.local.accept_relaxed",
                     url: localFileURL,
@@ -5457,7 +5951,7 @@ private enum ChatMediaFileResolver {
                 )
                 return localFileURL
             }
-            let summary = MediaFileInspector.summary(for: localFileURL)
+            let summary = await MediaFileInspector.summary(for: localFileURL)
             MediaPipelineDiagnostics.logByteComparison("voice.local.invalid.bytes", url: localFileURL, declaredBytes: voiceMessage.byteSize, actualBytes: summary.fileSize)
             MediaPipelineDiagnostics.logIssue("voice.local.invalid", url: localFileURL, details: "discarding invalid local voice file before refetch")
             try? FileManager.default.removeItem(at: localFileURL)
@@ -5472,7 +5966,7 @@ private enum ChatMediaFileResolver {
             preferredFileName: remoteFileURL.lastPathComponent.isEmpty ? "voice.m4a" : remoteFileURL.lastPathComponent,
             declaredByteSize: voiceMessage.byteSize,
             networkAccessKind: networkAccessKind,
-            validator: { MediaFileInspector.isValidVoiceFile($0, voiceMessage: voiceMessage) },
+            validator: { await MediaFileInspector.isValidVoiceFile($0, voiceMessage: voiceMessage) },
             logLabel: "voice.remote"
         ) {
             return resolvedRemoteURL
@@ -5491,12 +5985,12 @@ private enum ChatMediaFileResolver {
         try data.write(to: targetURL, options: .atomic)
         let targetSize = Int64((try? targetURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         MediaPipelineDiagnostics.logByteComparison("voice.download.fallback.bytes", url: targetURL, declaredBytes: voiceMessage.byteSize, actualBytes: targetSize)
-        if MediaFileInspector.isValidVoiceFile(targetURL, voiceMessage: voiceMessage) == false {
+        if await MediaFileInspector.isValidVoiceFile(targetURL, voiceMessage: voiceMessage) == false {
             MediaPipelineDiagnostics.logIssue("voice.download.invalid", url: targetURL, details: "fallback downloaded voice file is not playable")
             try? FileManager.default.removeItem(at: targetURL)
             throw AttachmentLibrarySaverError.unavailableAsset
         }
-        let summary = MediaFileInspector.summary(for: targetURL)
+        let summary = await MediaFileInspector.summary(for: targetURL)
         MediaPipelineDiagnostics.logResolvedFile("voice.download.fallback", url: targetURL, size: summary.fileSize, duration: summary.durationSeconds)
         return targetURL
     }
@@ -5520,11 +6014,11 @@ private enum ChatMediaFileResolver {
         preferredFileName: String,
         declaredByteSize: Int64,
         networkAccessKind: NetworkUsagePolicy.AccessKind,
-        validator: (URL) -> Bool,
+        validator: @escaping (URL) async -> Bool,
         logLabel: String
     ) async throws -> URL? {
         if let cachedURL = await RemoteAssetCacheStore.shared.resolvedFileURL(for: remoteURL, networkAccessKind: networkAccessKind) {
-            let cachedSummary = MediaFileInspector.summary(for: cachedURL)
+            let cachedSummary = await MediaFileInspector.summary(for: cachedURL)
             MediaPipelineDiagnostics.logByteComparison("\(logLabel).cache.bytes", url: cachedURL, declaredBytes: declaredByteSize, actualBytes: cachedSummary.fileSize)
             if let remoteLength = await remoteContentLength(for: remoteURL, networkAccessKind: networkAccessKind),
                remoteLength > 0,
@@ -5536,12 +6030,12 @@ private enum ChatMediaFileResolver {
                     details: "cachedBytes=\(cachedSummary.fileSize) remoteBytes=\(remoteLength) invalidating cache"
                 )
                 await RemoteAssetCacheStore.shared.invalidate(remoteURL: remoteURL)
-            } else if validator(cachedURL) {
+            } else if await validator(cachedURL) {
                 let persistedURL = ChatMediaPersistentStore.persistDownloadedFile(
                     sourceURL: cachedURL,
                     preferredFileName: preferredFileName
                 ) ?? cachedURL
-                let summary = MediaFileInspector.summary(for: persistedURL)
+                let summary = await MediaFileInspector.summary(for: persistedURL)
                 MediaPipelineDiagnostics.logByteComparison(
                     "\(logLabel).persisted.bytes",
                     url: persistedURL,
@@ -5549,7 +6043,7 @@ private enum ChatMediaFileResolver {
                     actualBytes: summary.fileSize,
                     sourceBytes: cachedSummary.fileSize
                 )
-                if validator(persistedURL) {
+                if await validator(persistedURL) {
                     MediaPipelineDiagnostics.logResolvedFile("\(logLabel).cache.hit", url: persistedURL, size: summary.fileSize, duration: summary.durationSeconds)
                     return persistedURL
                 }
@@ -5567,7 +6061,7 @@ private enum ChatMediaFileResolver {
             return nil
         }
 
-        guard validator(refreshedURL) else {
+        guard await validator(refreshedURL) else {
             MediaPipelineDiagnostics.logIssue("\(logLabel).refresh.invalid", url: refreshedURL, details: "refreshed media file is still invalid")
             await RemoteAssetCacheStore.shared.invalidate(remoteURL: remoteURL)
             return nil
@@ -5577,8 +6071,8 @@ private enum ChatMediaFileResolver {
             sourceURL: refreshedURL,
             preferredFileName: preferredFileName
         ) ?? refreshedURL
-        let summary = MediaFileInspector.summary(for: persistedURL)
-        let refreshedSummary = MediaFileInspector.summary(for: refreshedURL)
+        let summary = await MediaFileInspector.summary(for: persistedURL)
+        let refreshedSummary = await MediaFileInspector.summary(for: refreshedURL)
         MediaPipelineDiagnostics.logByteComparison(
             "\(logLabel).refresh.bytes",
             url: persistedURL,
@@ -5586,7 +6080,7 @@ private enum ChatMediaFileResolver {
             actualBytes: summary.fileSize,
             sourceBytes: refreshedSummary.fileSize
         )
-        guard validator(persistedURL) else {
+        guard await validator(persistedURL) else {
             MediaPipelineDiagnostics.logIssue("\(logLabel).persisted.refresh.invalid", url: persistedURL, details: "persisted refreshed media copy is invalid")
             try? FileManager.default.removeItem(at: persistedURL)
             await RemoteAssetCacheStore.shared.invalidate(remoteURL: remoteURL)

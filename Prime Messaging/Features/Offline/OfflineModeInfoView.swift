@@ -39,6 +39,12 @@ struct OfflineModeInfoView: View {
                 try? await Task.sleep(for: .seconds(1))
             }
         }
+        .onDisappear {
+            guard appState.selectedMode == .online, appState.isEmergencyModeEnabled == false else { return }
+            Task {
+                await environment.offlineTransport.stopScanning()
+            }
+        }
     }
 
     private var refreshTaskID: String {

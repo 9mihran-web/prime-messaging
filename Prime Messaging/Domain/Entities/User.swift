@@ -1,6 +1,6 @@
 import Foundation
 
-struct User: Identifiable, Codable, Hashable {
+struct User: Identifiable, Codable, Equatable {
     let id: UUID
     var profile: Profile
     var identityMethods: [IdentityMethod]
@@ -19,7 +19,7 @@ struct User: Identifiable, Codable, Hashable {
         case guestExpiresAt
     }
 
-    init(
+    nonisolated init(
         id: UUID,
         profile: Profile,
         identityMethods: [IdentityMethod],
@@ -37,12 +37,12 @@ struct User: Identifiable, Codable, Hashable {
         self.guestExpiresAt = guestExpiresAt
     }
 
-    static let mockCurrentUser = User(
+    nonisolated static let mockCurrentUser = User(
         id: UUID(uuidString: "11111111-1111-1111-1111-111111111111") ?? UUID(),
         profile: Profile(
             displayName: "Prime User",
             username: "primeuser",
-            bio: "Welcome to Prime Messaging.",
+            bio: "",
             status: "Available",
             birthday: nil,
             email: nil,
@@ -57,7 +57,7 @@ struct User: Identifiable, Codable, Hashable {
         accountKind: .standard
     )
 
-    init(from decoder: any Decoder) throws {
+    nonisolated init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
         profile = try container.decode(Profile.self, forKey: .profile)
@@ -68,21 +68,51 @@ struct User: Identifiable, Codable, Hashable {
         guestExpiresAt = try container.decodeIfPresent(Date.self, forKey: .guestExpiresAt)
     }
 
-    var isGuest: Bool {
+    nonisolated var isGuest: Bool {
         accountKind == .guest
     }
 
-    var isOfflineOnly: Bool {
+    nonisolated var isOfflineOnly: Bool {
         accountKind == .offlineOnly
     }
 
-    var canUploadAvatar: Bool {
+    nonisolated var canUploadAvatar: Bool {
         accountKind != .guest
     }
 
-    var canEditAdvancedProfile: Bool {
+    nonisolated var canEditAdvancedProfile: Bool {
         accountKind != .guest
     }
+
+    nonisolated static func == (lhs: User, rhs: User) -> Bool {
+        lhs.id == rhs.id
+            && lhs.profile.displayName == rhs.profile.displayName
+            && lhs.profile.username == rhs.profile.username
+            && lhs.profile.bio == rhs.profile.bio
+            && lhs.profile.status == rhs.profile.status
+            && lhs.profile.birthday == rhs.profile.birthday
+            && lhs.profile.email == rhs.profile.email
+            && lhs.profile.phoneNumber == rhs.profile.phoneNumber
+            && lhs.profile.profilePhotoURL == rhs.profile.profilePhotoURL
+            && lhs.profile.socialLink == rhs.profile.socialLink
+            && lhs.identityMethods.map(\.id) == rhs.identityMethods.map(\.id)
+            && lhs.identityMethods.map(\.type) == rhs.identityMethods.map(\.type)
+            && lhs.identityMethods.map(\.value) == rhs.identityMethods.map(\.value)
+            && lhs.identityMethods.map(\.isVerified) == rhs.identityMethods.map(\.isVerified)
+            && lhs.identityMethods.map(\.isPubliclyDiscoverable) == rhs.identityMethods.map(\.isPubliclyDiscoverable)
+            && lhs.privacySettings.showEmail == rhs.privacySettings.showEmail
+            && lhs.privacySettings.showPhoneNumber == rhs.privacySettings.showPhoneNumber
+            && lhs.privacySettings.allowLastSeen == rhs.privacySettings.allowLastSeen
+            && lhs.privacySettings.allowProfilePhoto == rhs.privacySettings.allowProfilePhoto
+            && lhs.privacySettings.allowCallsFromNonContacts == rhs.privacySettings.allowCallsFromNonContacts
+            && lhs.privacySettings.allowGroupInvitesFromNonContacts == rhs.privacySettings.allowGroupInvitesFromNonContacts
+            && lhs.privacySettings.allowForwardLinkToProfile == rhs.privacySettings.allowForwardLinkToProfile
+            && lhs.privacySettings.guestMessageRequests == rhs.privacySettings.guestMessageRequests
+            && lhs.accountKind == rhs.accountKind
+            && lhs.createdAt == rhs.createdAt
+            && lhs.guestExpiresAt == rhs.guestExpiresAt
+    }
+
 }
 
 struct Profile: Codable, Hashable {
@@ -108,7 +138,7 @@ struct Profile: Codable, Hashable {
         case socialLink
     }
 
-    init(
+    nonisolated init(
         displayName: String,
         username: String,
         bio: String,
@@ -130,7 +160,7 @@ struct Profile: Codable, Hashable {
         self.socialLink = socialLink
     }
 
-    init(from decoder: any Decoder) throws {
+    nonisolated init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         displayName = try container.decode(String.self, forKey: .displayName)
         username = try container.decode(String.self, forKey: .username)
@@ -141,6 +171,30 @@ struct Profile: Codable, Hashable {
         phoneNumber = try container.decodeIfPresent(String.self, forKey: .phoneNumber)
         profilePhotoURL = container.decodeLossyURLIfPresent(forKey: .profilePhotoURL)
         socialLink = container.decodeLossyURLIfPresent(forKey: .socialLink)
+    }
+
+    nonisolated static func == (lhs: Profile, rhs: Profile) -> Bool {
+        lhs.displayName == rhs.displayName
+            && lhs.username == rhs.username
+            && lhs.bio == rhs.bio
+            && lhs.status == rhs.status
+            && lhs.birthday == rhs.birthday
+            && lhs.email == rhs.email
+            && lhs.phoneNumber == rhs.phoneNumber
+            && lhs.profilePhotoURL == rhs.profilePhotoURL
+            && lhs.socialLink == rhs.socialLink
+    }
+
+    nonisolated func hash(into hasher: inout Hasher) {
+        hasher.combine(displayName)
+        hasher.combine(username)
+        hasher.combine(bio)
+        hasher.combine(status)
+        hasher.combine(birthday)
+        hasher.combine(email)
+        hasher.combine(phoneNumber)
+        hasher.combine(profilePhotoURL)
+        hasher.combine(socialLink)
     }
 }
 
@@ -165,7 +219,7 @@ struct PrivacySettings: Codable, Hashable {
         case guestMessageRequests
     }
 
-    init(
+    nonisolated init(
         showEmail: Bool,
         showPhoneNumber: Bool,
         allowLastSeen: Bool,
@@ -185,7 +239,7 @@ struct PrivacySettings: Codable, Hashable {
         self.guestMessageRequests = guestMessageRequests
     }
 
-    static let defaultEmailOnly = PrivacySettings(
+    nonisolated static let defaultEmailOnly = PrivacySettings(
         showEmail: true,
         showPhoneNumber: false,
         allowLastSeen: true,
@@ -196,7 +250,7 @@ struct PrivacySettings: Codable, Hashable {
         guestMessageRequests: .approvalRequired
     )
 
-    init(from decoder: any Decoder) throws {
+    nonisolated init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         showEmail = try container.decodeIfPresent(Bool.self, forKey: .showEmail) ?? true
         showPhoneNumber = try container.decodeIfPresent(Bool.self, forKey: .showPhoneNumber) ?? false
@@ -206,5 +260,27 @@ struct PrivacySettings: Codable, Hashable {
         allowGroupInvitesFromNonContacts = try container.decodeIfPresent(Bool.self, forKey: .allowGroupInvitesFromNonContacts) ?? false
         allowForwardLinkToProfile = try container.decodeIfPresent(Bool.self, forKey: .allowForwardLinkToProfile) ?? false
         guestMessageRequests = try container.decodeIfPresent(GuestMessageRequestPolicy.self, forKey: .guestMessageRequests) ?? .approvalRequired
+    }
+
+    nonisolated static func == (lhs: PrivacySettings, rhs: PrivacySettings) -> Bool {
+        lhs.showEmail == rhs.showEmail
+            && lhs.showPhoneNumber == rhs.showPhoneNumber
+            && lhs.allowLastSeen == rhs.allowLastSeen
+            && lhs.allowProfilePhoto == rhs.allowProfilePhoto
+            && lhs.allowCallsFromNonContacts == rhs.allowCallsFromNonContacts
+            && lhs.allowGroupInvitesFromNonContacts == rhs.allowGroupInvitesFromNonContacts
+            && lhs.allowForwardLinkToProfile == rhs.allowForwardLinkToProfile
+            && lhs.guestMessageRequests == rhs.guestMessageRequests
+    }
+
+    nonisolated func hash(into hasher: inout Hasher) {
+        hasher.combine(showEmail)
+        hasher.combine(showPhoneNumber)
+        hasher.combine(allowLastSeen)
+        hasher.combine(allowProfilePhoto)
+        hasher.combine(allowCallsFromNonContacts)
+        hasher.combine(allowGroupInvitesFromNonContacts)
+        hasher.combine(allowForwardLinkToProfile)
+        hasher.combine(guestMessageRequests)
     }
 }

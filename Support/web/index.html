@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Prime Messaging Web</title>
+    <meta
+      name="description"
+      content="Prime Messaging Web client with real login, chats, messages, realtime updates, typing, media attachments, and browser calls."
+    />
+    <meta name="robots" content="noindex,nofollow" />
+    <meta name="theme-color" content="#971b23" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="icon" type="image/png" sizes="32x32" href="./favicon-256.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="./favicon-256.png" />
+    <link rel="apple-touch-icon" href="./favicon-256.png" />
+    <link rel="mask-icon" href="./prime-favicon.svg" color="#971b23" />
+    <link rel="stylesheet" href="./app.css?v=20260420e" />
+    <script src="./app.js?v=20260420e" defer></script>
+  </head>
+  <body>
+    <div class="app-shell" id="app-shell">
+      <section class="auth-screen" id="auth-screen">
+        <div class="auth-card">
+          <div class="auth-brand">
+            <img src="./prime-favicon.svg" alt="" aria-hidden="true" />
+            <div>
+              <p class="eyebrow">Prime Messaging Web</p>
+              <h1>Sign in to your conversations</h1>
+            </div>
+          </div>
+          <p class="auth-copy">
+            This web client already works with the current Prime Messaging backend:
+            login, chat list, live messages, direct chats, typing, reactions, attachments, settings, groups, and browser audio calls.
+          </p>
+          <form id="login-form" class="auth-form">
+            <label class="field">
+              <span>Email, username, or phone</span>
+              <input id="login-identifier" name="identifier" type="text" autocomplete="username" placeholder="@username or email" required />
+            </label>
+            <label class="field">
+              <span>Password</span>
+              <input id="login-password" name="password" type="password" autocomplete="current-password" placeholder="Your password" required />
+            </label>
+            <details class="advanced-settings">
+              <summary>Advanced connection settings</summary>
+              <label class="field">
+                <span>Backend API</span>
+                <input id="api-base-input" name="api_base" type="url" placeholder="https://prime-messaging-production.up.railway.app" />
+              </label>
+              <p class="hint">Leave this as default unless you are testing another backend instance.</p>
+            </details>
+            <button class="primary-button" id="login-submit" type="submit">Open web client</button>
+            <p class="form-status" id="auth-status" role="status" aria-live="polite"></p>
+          </form>
+        </div>
+      </section>
+
+      <section class="client-screen hidden" id="client-screen">
+        <aside class="sidebar">
+          <div class="sidebar-top">
+            <div class="brand-row">
+              <div class="brand-mark-wrap">
+                <img src="./prime-favicon.svg" alt="" aria-hidden="true" />
+              </div>
+              <div>
+                <p class="eyebrow">Prime Messaging</p>
+                <h2>Web client</h2>
+              </div>
+            </div>
+
+            <div class="me-card" id="me-card">
+              <div class="avatar avatar-large" id="me-avatar"></div>
+              <div class="me-copy">
+                <strong id="me-name">Guest</strong>
+                <span id="me-handle">@username</span>
+              </div>
+            </div>
+
+            <div class="search-block">
+              <label class="field search-field">
+                <span>Search chats or people</span>
+                <input id="global-search" type="search" placeholder="Search by name, username, or email" />
+              </label>
+              <div class="search-results hidden" id="search-results-wrap">
+                <div class="section-label">People</div>
+                <div id="search-results"></div>
+              </div>
+            </div>
+
+            <div class="sidebar-actions">
+              <button class="ghost-button" id="settings-button" type="button">Settings</button>
+              <button class="ghost-button" id="refresh-button" type="button">Refresh</button>
+              <button class="ghost-button danger" id="logout-button" type="button">Log out</button>
+            </div>
+
+            <div class="creation-actions">
+              <button class="ghost-button" id="new-group-button" type="button">New group</button>
+              <button class="ghost-button" id="new-channel-button" type="button">New channel</button>
+            </div>
+          </div>
+
+          <div class="chat-list-wrap">
+            <div class="section-label">
+              <span>Chats</span>
+              <span class="connection-pill" id="connection-pill">Offline</span>
+            </div>
+            <div class="chat-list" id="chat-list"></div>
+          </div>
+        </aside>
+
+        <main class="conversation-panel">
+          <header class="conversation-header" id="conversation-header">
+            <div class="conversation-meta">
+              <div class="avatar avatar-large" id="chat-avatar"></div>
+              <div>
+                <h3 id="chat-title">Select a chat</h3>
+                <p id="chat-subtitle">Your messages will appear here.</p>
+              </div>
+            </div>
+            <div class="conversation-actions">
+              <span class="subtle-pill" id="chat-mode-pill">online</span>
+              <button class="ghost-button hidden" id="call-button" type="button">Call</button>
+              <button class="ghost-button hidden" id="video-call-button" type="button">Video</button>
+              <button class="ghost-button hidden" id="group-details-button" type="button">Details</button>
+              <button class="ghost-button" id="mark-read-button" type="button">Mark read</button>
+            </div>
+          </header>
+
+          <section class="conversation-empty" id="conversation-empty">
+            <div class="empty-card">
+              <img src="./prime-favicon.svg" alt="" aria-hidden="true" />
+              <h2>Prime Messaging Web is ready</h2>
+              <p>
+                Open an existing chat from the left side, or search for a user and start a direct conversation.
+              </p>
+            </div>
+          </section>
+
+          <section class="conversation-body hidden" id="conversation-body">
+            <div class="message-list" id="message-list" aria-live="polite"></div>
+            <div class="typing-line" id="typing-line" role="status" aria-live="polite"></div>
+
+            <div class="composer-wrap" id="composer-wrap">
+              <div class="reply-banner hidden" id="reply-banner">
+                <div>
+                  <strong id="reply-banner-title">Replying</strong>
+                  <p id="reply-banner-text"></p>
+                </div>
+                <button class="ghost-button" id="cancel-reply-button" type="button">Cancel</button>
+              </div>
+
+              <div class="edit-banner hidden" id="edit-banner">
+                <div>
+                  <strong>Editing message</strong>
+                  <p id="edit-banner-text"></p>
+                </div>
+                <button class="ghost-button" id="cancel-edit-button" type="button">Cancel</button>
+              </div>
+
+              <div class="voice-banner hidden" id="voice-banner">
+                <div class="voice-banner-copy">
+                  <strong id="voice-banner-title">Voice message</strong>
+                  <p id="voice-banner-text"></p>
+                </div>
+                <audio class="hidden" id="voice-preview" controls preload="metadata"></audio>
+                <button class="ghost-button" id="remove-voice-button" type="button">Remove</button>
+              </div>
+
+              <div class="attachment-strip hidden" id="attachment-strip"></div>
+              <div class="drop-zone hidden" id="drop-zone">Drop files here to attach them</div>
+
+              <form class="composer" id="composer-form">
+                <label class="attach-button" for="file-input" title="Attach files">
+                  <input id="file-input" type="file" multiple />
+                  <span>+</span>
+                </label>
+                <button class="ghost-button mic-button" id="record-button" type="button">Mic</button>
+                <label class="composer-field">
+                  <textarea
+                    id="composer-input"
+                    rows="1"
+                    placeholder="Write a message"
+                  ></textarea>
+                </label>
+                <button class="primary-button send-button" id="send-button" type="submit">Send</button>
+              </form>
+              <p class="form-status" id="composer-status" role="status" aria-live="polite"></p>
+            </div>
+          </section>
+        </main>
+      </section>
+
+      <div class="modal-backdrop hidden" id="settings-modal">
+        <section class="modal-card settings-modal-card" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+          <header class="modal-header">
+            <div>
+              <p class="eyebrow">Account</p>
+              <h2 id="settings-title">Settings</h2>
+            </div>
+            <button class="ghost-button" id="settings-close-button" type="button">Close</button>
+          </header>
+
+          <div class="settings-modal-body">
+            <section class="settings-section">
+              <div class="settings-section-header">
+                <div>
+                  <h3>Profile</h3>
+                  <p>Update how people see you across chats.</p>
+                </div>
+                <div class="settings-profile-head">
+                  <div class="avatar avatar-large" id="settings-avatar"></div>
+                  <div class="settings-profile-meta">
+                    <strong id="settings-display-name">Prime user</strong>
+                    <span id="settings-account-kind">standard account</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="settings-avatar-actions">
+                <label class="ghost-button" for="settings-avatar-input">
+                  <input id="settings-avatar-input" type="file" accept="image/*" />
+                  <span>Upload photo</span>
+                </label>
+                <button class="ghost-button" id="settings-remove-avatar-button" type="button">Remove photo</button>
+              </div>
+              <p class="form-status" id="settings-avatar-status" role="status" aria-live="polite"></p>
+
+              <form class="settings-form" id="settings-profile-form">
+                <div class="settings-grid">
+                  <label class="field">
+                    <span>Display name</span>
+                    <input id="settings-display-name-input" type="text" maxlength="60" />
+                  </label>
+                  <label class="field">
+                    <span>Username</span>
+                    <input id="settings-username-input" type="text" maxlength="40" />
+                  </label>
+                </div>
+
+                <label class="field">
+                  <span>Bio</span>
+                  <textarea id="settings-bio-input" rows="3" placeholder="Tell people a little about yourself"></textarea>
+                </label>
+
+                <div class="settings-grid">
+                  <label class="field">
+                    <span>Status</span>
+                    <input id="settings-status-input" type="text" maxlength="80" />
+                  </label>
+                  <label class="field">
+                    <span>Birthday</span>
+                    <input id="settings-birthday-input" type="date" />
+                  </label>
+                </div>
+
+                <div class="settings-grid">
+                  <label class="field">
+                    <span>Email</span>
+                    <input id="settings-email-input" type="email" />
+                  </label>
+                  <label class="field">
+                    <span>Phone</span>
+                    <input id="settings-phone-input" type="tel" />
+                  </label>
+                </div>
+
+                <label class="field">
+                  <span>Social link</span>
+                  <input id="settings-social-link-input" type="url" placeholder="https://..." />
+                </label>
+
+                <div class="settings-form-actions">
+                  <button class="primary-button" id="settings-profile-save-button" type="submit">Save profile</button>
+                </div>
+                <p class="form-status" id="settings-profile-status" role="status" aria-live="polite"></p>
+              </form>
+            </section>
+
+            <section class="settings-section">
+              <div class="settings-section-header">
+                <div>
+                  <h3>Privacy</h3>
+                  <p>Control what others can see and how they can reach you.</p>
+                </div>
+              </div>
+
+              <form class="settings-form" id="settings-privacy-form">
+                <div class="toggle-list">
+                  <label class="toggle-row"><input id="privacy-show-email" type="checkbox" /><span>Show email on your profile</span></label>
+                  <label class="toggle-row"><input id="privacy-show-phone" type="checkbox" /><span>Show phone number on your profile</span></label>
+                  <label class="toggle-row"><input id="privacy-last-seen" type="checkbox" /><span>Let others see your last seen</span></label>
+                  <label class="toggle-row"><input id="privacy-profile-photo" type="checkbox" /><span>Show your profile photo</span></label>
+                  <label class="toggle-row"><input id="privacy-calls" type="checkbox" /><span>Allow calls from non-contacts</span></label>
+                  <label class="toggle-row"><input id="privacy-group-invites" type="checkbox" /><span>Allow group invites from non-contacts</span></label>
+                  <label class="toggle-row"><input id="privacy-forward-link" type="checkbox" /><span>Allow forwarding a link to your profile</span></label>
+                </div>
+
+                <label class="field">
+                  <span>Guest message requests</span>
+                  <select id="privacy-guest-requests">
+                    <option value="approvalRequired">Require approval</option>
+                    <option value="blocked">Block guest requests</option>
+                  </select>
+                </label>
+
+                <div class="settings-form-actions">
+                  <button class="primary-button" id="settings-privacy-save-button" type="submit">Save privacy</button>
+                </div>
+                <p class="form-status" id="settings-privacy-status" role="status" aria-live="polite"></p>
+              </form>
+            </section>
+
+            <section class="settings-section">
+              <div class="settings-section-header">
+                <div>
+                  <h3>Password</h3>
+                  <p>Change the password for this account.</p>
+                </div>
+              </div>
+
+              <form class="settings-form" id="settings-password-form">
+                <div class="settings-grid">
+                  <label class="field">
+                    <span>Current password</span>
+                    <input id="settings-current-password-input" type="password" autocomplete="current-password" />
+                  </label>
+                  <label class="field">
+                    <span>New password</span>
+                    <input id="settings-new-password-input" type="password" autocomplete="new-password" />
+                  </label>
+                </div>
+                <div class="settings-form-actions">
+                  <button class="primary-button" id="settings-password-save-button" type="submit">Change password</button>
+                </div>
+                <p class="form-status" id="settings-password-status" role="status" aria-live="polite"></p>
+              </form>
+            </section>
+
+            <section class="settings-section">
+              <div class="settings-section-header">
+                <div>
+                  <h3>Active sessions</h3>
+                  <p>Review where your account is signed in.</p>
+                </div>
+                <button class="ghost-button" id="revoke-other-sessions-button" type="button">Revoke others</button>
+              </div>
+              <div class="session-list" id="session-list"></div>
+              <p class="form-status" id="settings-sessions-status" role="status" aria-live="polite"></p>
+            </section>
+          </div>
+        </section>
+      </div>
+
+      <div class="modal-backdrop hidden" id="group-modal">
+        <section class="modal-card group-modal-card" role="dialog" aria-modal="true" aria-labelledby="group-modal-title">
+          <header class="modal-header">
+            <div>
+              <p class="eyebrow">Groups & Channels</p>
+              <h2 id="group-modal-title">New group</h2>
+            </div>
+            <button class="ghost-button" id="group-close-button" type="button">Close</button>
+          </header>
+
+          <div class="settings-modal-body">
+            <section class="settings-section">
+              <div class="settings-section-header">
+                <div>
+                  <h3 id="group-basics-title">Basics</h3>
+                  <p id="group-basics-subtitle">Create a new space for your people.</p>
+                </div>
+                <div class="settings-profile-head">
+                  <div class="avatar avatar-large" id="group-avatar"></div>
+                  <div class="settings-profile-meta">
+                    <strong id="group-summary-title">New group</strong>
+                    <span id="group-summary-subtitle">Private conversation</span>
+                  </div>
+                </div>
+              </div>
+
+              <form class="settings-form" id="group-basics-form">
+                <div class="settings-grid">
+                  <label class="field">
+                    <span>Type</span>
+                    <select id="group-kind-select">
+                      <option value="group">Group</option>
+                      <option value="channel">Channel</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>Title</span>
+                    <input id="group-title-input" type="text" maxlength="120" placeholder="Team, community, project..." />
+                  </label>
+                </div>
+
+                <div class="toggle-list">
+                  <label class="toggle-row"><input id="group-public-checkbox" type="checkbox" /><span>Public invite link</span></label>
+                  <label class="toggle-row"><input id="group-comments-checkbox" type="checkbox" /><span>Enable comments in channels</span></label>
+                  <label class="toggle-row"><input id="group-forum-checkbox" type="checkbox" /><span>Forum mode</span></label>
+                </div>
+
+                <div class="settings-avatar-actions" id="group-avatar-actions">
+                  <label class="ghost-button" for="group-avatar-input">
+                    <input id="group-avatar-input" type="file" accept="image/*" />
+                    <span>Upload group photo</span>
+                  </label>
+                  <button class="ghost-button" id="group-remove-avatar-button" type="button">Remove photo</button>
+                </div>
+
+                <div class="settings-form-actions">
+                  <button class="primary-button" id="group-save-button" type="submit">Create</button>
+                </div>
+                <p class="form-status" id="group-status" role="status" aria-live="polite"></p>
+              </form>
+            </section>
+
+            <section class="settings-section">
+              <div class="settings-section-header">
+                <div>
+                  <h3>Invite link</h3>
+                  <p>Share this link so people can join faster.</p>
+                </div>
+              </div>
+              <div class="invite-card">
+                <input id="group-invite-link" type="text" readonly value="Invite link will appear after creation" />
+                <button class="ghost-button" id="copy-group-invite-button" type="button">Copy</button>
+              </div>
+            </section>
+
+            <section class="settings-section">
+              <div class="settings-section-header">
+                <div>
+                  <h3>Add people</h3>
+                  <p id="group-add-people-subtitle">Search for people to add them to this space.</p>
+                </div>
+              </div>
+              <label class="field">
+                <span>Find people</span>
+                <input id="group-member-search-input" type="search" placeholder="Search by name, username, or email" />
+              </label>
+              <div class="search-results" id="group-member-search-results"></div>
+              <div class="selected-member-list" id="group-selected-members"></div>
+              <p class="form-status" id="group-member-status" role="status" aria-live="polite"></p>
+            </section>
+
+            <section class="settings-section">
+              <div class="settings-section-header">
+                <div>
+                  <h3>Members</h3>
+                  <p id="group-members-subtitle">Current people in this space.</p>
+                </div>
+              </div>
+              <div class="session-list" id="group-member-list"></div>
+            </section>
+
+            <section class="settings-section">
+              <div class="settings-section-header">
+                <div>
+                  <h3>Danger zone</h3>
+                  <p>Leave the space, or delete it if you own it.</p>
+                </div>
+              </div>
+              <div class="settings-form-actions">
+                <button class="ghost-button danger" id="group-leave-button" type="button">Leave</button>
+                <button class="ghost-button danger" id="group-delete-button" type="button">Delete</button>
+              </div>
+              <p class="form-status" id="group-danger-status" role="status" aria-live="polite"></p>
+            </section>
+          </div>
+        </section>
+      </div>
+
+      <section class="call-overlay hidden" id="call-overlay" aria-live="polite">
+        <div class="call-card">
+          <div class="call-status-row">
+            <span class="subtle-pill" id="call-direction-pill">Call</span>
+            <div class="call-status-actions">
+              <span class="call-duration hidden" id="call-duration">0:00</span>
+              <button class="ghost-button ghost-button-compact" id="call-expand-button" type="button">Expand</button>
+              <button class="ghost-button ghost-button-compact hidden" id="call-debug-toggle-button" type="button">Debug</button>
+            </div>
+          </div>
+
+          <div class="call-stage hidden" id="call-stage">
+            <video class="call-remote-video" id="call-remote-video" autoplay playsinline></video>
+            <div class="call-stage-empty hidden" id="call-stage-empty">
+              <span class="subtle-pill">Camera is off</span>
+            </div>
+            <video class="call-local-video hidden" id="call-local-video" autoplay playsinline muted></video>
+          </div>
+
+          <div class="call-hero">
+            <div class="avatar avatar-call" id="call-avatar"></div>
+            <div class="call-hero-copy">
+              <h2 id="call-peer-name">Prime user</h2>
+              <p id="call-status-text">Waiting for call state…</p>
+            </div>
+          </div>
+
+          <div class="call-meta-row">
+            <span class="subtle-pill" id="call-connection-pill">Idle</span>
+            <span class="subtle-pill" id="call-local-muted-pill">Mic on</span>
+            <span class="subtle-pill hidden" id="call-local-video-pill">Camera on</span>
+            <span class="subtle-pill hidden" id="call-remote-muted-pill">Remote muted</span>
+            <span class="subtle-pill hidden" id="call-remote-video-pill">Remote camera on</span>
+          </div>
+
+          <div class="call-actions">
+            <button class="ghost-button danger hidden" id="call-reject-button" type="button">Decline</button>
+            <button class="primary-button hidden" id="call-answer-button" type="button">Answer</button>
+            <button class="ghost-button hidden" id="call-mute-button" type="button">Mute</button>
+            <button class="ghost-button hidden" id="call-video-toggle-button" type="button">Start camera</button>
+            <button class="ghost-button hidden" id="call-screen-share-button" type="button">Share screen</button>
+            <button class="ghost-button danger hidden" id="call-hangup-button" type="button">Hang up</button>
+          </div>
+
+          <div class="call-device-row hidden" id="call-device-row">
+            <label class="field call-device-field">
+              <span>Microphone</span>
+              <select id="call-microphone-select"></select>
+            </label>
+            <label class="field call-device-field">
+              <span>Camera</span>
+              <select id="call-camera-select"></select>
+            </label>
+            <label class="field call-device-field">
+              <span>Speaker</span>
+              <select id="call-speaker-select"></select>
+            </label>
+          </div>
+
+          <p class="form-status" id="call-status-line" role="status" aria-live="polite"></p>
+          <div class="call-debug hidden" id="call-debug"></div>
+          <audio id="call-remote-audio" autoplay playsinline></audio>
+          <audio id="call-local-audio" autoplay playsinline muted></audio>
+        </div>
+      </section>
+    </div>
+  </body>
+</html>

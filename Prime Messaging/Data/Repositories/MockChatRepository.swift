@@ -172,6 +172,50 @@ struct MockChatRepository: ChatRepository {
         )
     }
 
+    func importExternalHistory(_ messages: [Message], into chat: Chat, currentUser: User) async throws -> Chat {
+        let normalizedMessages = messages.map { message in
+            Message(
+                id: message.id,
+                chatID: chat.id,
+                senderID: message.senderID,
+                clientMessageID: message.clientMessageID,
+                senderDisplayName: message.senderDisplayName,
+                mode: chat.mode,
+                deliveryState: .migrated,
+                kind: message.kind,
+                text: message.text,
+                attachments: message.attachments,
+                replyToMessageID: message.replyToMessageID,
+                replyPreview: message.replyPreview,
+                communityContext: message.communityContext,
+                deliveryOptions: message.deliveryOptions,
+                status: .sent,
+                createdAt: message.createdAt,
+                editedAt: message.editedAt,
+                deletedForEveryoneAt: message.deletedForEveryoneAt,
+                reactions: message.reactions,
+                voiceMessage: message.voiceMessage,
+                liveLocation: message.liveLocation
+            )
+        }
+
+        await ChatSnapshotStore.shared.saveMessages(
+            normalizedMessages,
+            chatID: chat.id,
+            userID: currentUser.id,
+            mode: chat.mode
+        )
+
+        var updatedChat = chat
+        if let latestMessage = normalizedMessages.last {
+            updatedChat.lastActivityAt = latestMessage.createdAt
+            updatedChat.lastMessagePreview = latestMessage.text ?? resolvedKind(for: OutgoingMessageDraft(attachments: latestMessage.attachments, voiceMessage: latestMessage.voiceMessage)).rawValue.capitalized
+        }
+
+        await ChatSnapshotStore.shared.upsertChat(updatedChat, userID: currentUser.id, mode: chat.mode)
+        return updatedChat
+    }
+
     func submitGuestRequest(introText: String, in chatID: UUID, senderID: UUID) async throws -> Chat {
         try await updateOnlineChat(chatID: chatID) { chat in
             let recipientID = chat.participantIDs.first(where: { $0 != senderID }) ?? senderID

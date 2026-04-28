@@ -1,6 +1,7 @@
 import CryptoKit
 import Combine
 import Foundation
+import ImageIO
 import OSLog
 import SwiftUI
 import UIKit
@@ -273,8 +274,10 @@ actor RemoteAssetCacheStore {
         guard requests.isEmpty == false else { return }
 
         var uniqueRequests: [RemoteAssetWarmupRequest] = []
-        var seen = Set<RemoteAssetWarmupRequest>()
-        for request in requests where seen.insert(request).inserted {
+        var seen = Set<String>()
+        for request in requests {
+            let requestKey = request.url.absoluteString + "|" + request.networkAccessKind.cacheKey
+            guard seen.insert(requestKey).inserted else { continue }
             uniqueRequests.append(request)
             if uniqueRequests.count >= limit {
                 break
@@ -330,28 +333,93 @@ actor RemoteAssetCacheStore {
 final class CachedRemoteImageLoader: ObservableObject {
     @Published private(set) var image: UIImage?
     @Published private(set) var isLoading = false
+    private var loadedKey: String?
 
-    func load(from remoteURL: URL?, networkAccessKind: NetworkUsagePolicy.AccessKind) async {
+    private static let imageCache = NSCache<NSString, UIImage>()
+    private static let decodeQueue = DispatchQueue(
+        label: "PrimeMessaging.CachedRemoteImageLoader.Decode",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+
+    func load(
+        from remoteURL: URL?,
+        networkAccessKind: NetworkUsagePolicy.AccessKind,
+        maxPixelSize: Int
+    ) async {
         guard let remoteURL else {
             image = nil
             isLoading = false
+            loadedKey = nil
+            return
+        }
+
+        let cacheKey = "\(remoteURL.absoluteString)#\(maxPixelSize)" as NSString
+        if loadedKey == cacheKey as String, image != nil {
+            return
+        }
+
+        if loadedKey != cacheKey as String {
+            image = nil
+        }
+
+        if let cachedImage = Self.imageCache.object(forKey: cacheKey) {
+            image = cachedImage
+            isLoading = false
+            loadedKey = cacheKey as String
             return
         }
 
         isLoading = true
-        if let cachedImage = await RemoteAssetCacheStore.shared.cachedImage(for: remoteURL) {
-            image = cachedImage
+        defer { isLoading = false }
+
+        if let localURL = await RemoteAssetCacheStore.shared.cachedFileURL(for: remoteURL),
+           let decodedImage = await Self.decodeImage(from: localURL, maxPixelSize: maxPixelSize) {
+            image = decodedImage
+            loadedKey = cacheKey as String
+            Self.imageCache.setObject(decodedImage, forKey: cacheKey)
+            return
         }
 
-        if let localURL = await RemoteAssetCacheStore.shared.resolvedFileURL(for: remoteURL, networkAccessKind: networkAccessKind),
-           let refreshedImage = UIImage(contentsOfFile: localURL.path) {
-            image = refreshedImage
+        if let localURL = await RemoteAssetCacheStore.shared.resolvedFileURL(
+            for: remoteURL,
+            networkAccessKind: networkAccessKind
+        ),
+           let decodedImage = await Self.decodeImage(from: localURL, maxPixelSize: maxPixelSize) {
+            guard Task.isCancelled == false else { return }
+            image = decodedImage
+            loadedKey = cacheKey as String
+            Self.imageCache.setObject(decodedImage, forKey: cacheKey)
         }
-        isLoading = false
+    }
+
+    private static func decodeImage(from url: URL, maxPixelSize: Int) async -> UIImage? {
+        await withCheckedContinuation { continuation in
+            decodeQueue.async {
+                guard let imageSource = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+                    continuation.resume(returning: UIImage(contentsOfFile: url.path))
+                    return
+                }
+
+                let options: CFDictionary = [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceShouldCacheImmediately: true,
+                    kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+                ] as CFDictionary
+
+                if let thumbnail = CGImageSourceCreateThumbnailAtIndex(imageSource, 0, options) {
+                    continuation.resume(returning: UIImage(cgImage: thumbnail))
+                    return
+                }
+
+                continuation.resume(returning: UIImage(contentsOfFile: url.path))
+            }
+        }
     }
 }
 
-struct RemoteAssetWarmupRequest: Hashable {
+struct RemoteAssetWarmupRequest {
     let url: URL
     let networkAccessKind: NetworkUsagePolicy.AccessKind
 }
@@ -359,6 +427,8 @@ struct RemoteAssetWarmupRequest: Hashable {
 struct CachedRemoteImage<Content: View, Placeholder: View>: View {
     let url: URL?
     let networkAccessKind: NetworkUsagePolicy.AccessKind
+    let maxPixelSize: Int
+    let shouldLoad: Bool
     let content: (Image) -> Content
     let placeholder: () -> Placeholder
 
@@ -367,11 +437,15 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
     init(
         url: URL?,
         networkAccessKind: NetworkUsagePolicy.AccessKind = .mediaDownloads,
+        maxPixelSize: Int = 1280,
+        shouldLoad: Bool = true,
         @ViewBuilder content: @escaping (Image) -> Content,
         @ViewBuilder placeholder: @escaping () -> Placeholder
     ) {
         self.url = url
         self.networkAccessKind = networkAccessKind
+        self.maxPixelSize = maxPixelSize
+        self.shouldLoad = shouldLoad
         self.content = content
         self.placeholder = placeholder
     }
@@ -384,8 +458,17 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
                 placeholder()
             }
         }
-        .task(id: url) {
-            await loader.load(from: url, networkAccessKind: networkAccessKind)
+        .task(id: taskID) {
+            guard shouldLoad else { return }
+            await loader.load(
+                from: url,
+                networkAccessKind: networkAccessKind,
+                maxPixelSize: maxPixelSize
+            )
         }
+    }
+
+    private var taskID: String {
+        "\(url?.absoluteString ?? "missing")#\(maxPixelSize)"
     }
 }

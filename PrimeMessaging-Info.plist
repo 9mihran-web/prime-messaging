@@ -37,11 +37,6 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
-	<key>NSAppTransportSecurity</key>
-	<dict>
-		<key>NSAllowsArbitraryLoads</key>
-		<true/>
-	</dict>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Prime Messaging uses Bluetooth to find nearby devices and exchange nearby messages.</string>
 	<key>NSBluetoothPeripheralUsageDescription</key>
@@ -53,7 +48,7 @@
 	<key>NSCameraUsageDescription</key>
 	<string>Prime Messaging uses the camera to capture photos and videos for messages.</string>
 	<key>NSContactsUsageDescription</key>
-	<string>Prime Messaging uses your contacts to help you sync and discover people you already know.</string>
+	<string>Prime Messaging uses your contacts to show which people you already know are on Prime and to help you invite others. Contact details may be securely processed to match existing users.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Prime Messaging uses Face ID to unlock your protected chats.</string>
 	<key>NSLocalNetworkUsageDescription</key>
@@ -62,6 +57,10 @@
 	<string>Prime Messaging uses your location to share your current location in chats.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Prime Messaging uses the microphone for audio messages and internet calls.</string>
+	<key>NSUserActivityTypes</key>
+	<array>
+		<string>INSendMessageIntent</string>
+	</array>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Prime Messaging saves downloaded photos and videos from chats to your photo library.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
@@ -70,19 +69,23 @@
 	<string>Prime Messaging uses speech recognition to transcribe voice messages on your device.</string>
 	<key>PrimeMessagingServerURL</key>
 	<string>$(PRIME_MESSAGING_SERVER_URL)</string>
+	<key>PrimeMessagingAppStoreURL</key>
+	<string>$(PRIME_MESSAGING_APP_STORE_URL)</string>
+	<key>PrimeMessagingHelpCenterURL</key>
+	<string>https://primemessaging.site/helpcenter/</string>
+	<key>PrimeMessagingInviteURL</key>
+	<string>$(PRIME_MESSAGING_INVITE_URL)</string>
+	<key>PrimeMessagingPrivacyPolicyURL</key>
+	<string>https://primemessaging.site/privacypolicy/</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UIBackgroundModes</key>
 	<array>
-		<string>bluetooth-central</string>
-		<string>bluetooth-peripheral</string>
 		<string>remote-notification</string>
-		<string>nearby-interaction</string>
 		<string>processing</string>
 		<string>fetch</string>
 		<string>audio</string>
 		<string>voip</string>
-		<string>location</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict/>

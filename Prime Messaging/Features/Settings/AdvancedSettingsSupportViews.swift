@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import AVKit
 
 struct FavoritesView: View {
     @Environment(\.appEnvironment) private var environment
@@ -715,6 +716,13 @@ private struct AdminConsoleBanResponse: Decodable {
     var bannedUntil: Date?
 }
 
+private struct AdminConsoleBroadcastResponse: Decodable {
+    var ok: Bool
+    var queued: Bool
+    var recipientCount: Int
+    var broadcastID: String?
+}
+
 private struct AdminConsoleCreateUserRequest: Encodable {
     var displayName: String
     var username: String
@@ -807,9 +815,13 @@ enum AdminConsoleAccessControl {
     static let allowedUsername = "mihran"
 
     static func isAllowed(_ username: String) -> Bool {
+        #if DEBUG
         let trimmedUsername = username.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let normalizedUsername = trimmedUsername.hasPrefix("@") ? String(trimmedUsername.dropFirst()) : trimmedUsername
         return normalizedUsername == allowedUsername
+        #else
+        return false
+        #endif
     }
 }
 
@@ -870,6 +882,18 @@ private struct AdminConsoleService {
         return try BackendJSONDecoder.make().decode([Chat].self, from: data)
     }
 
+    func fetchCommunityChats(kinds: [CommunityKind]) async throws -> [Chat] {
+        let kindsValue = kinds.map(\.rawValue).joined(separator: ",")
+        let data = try await performRequest(
+            path: "/admin/chats",
+            queryItems: [
+                URLQueryItem(name: "kinds", value: kindsValue.isEmpty ? nil : kindsValue),
+                URLQueryItem(name: "include_blocked", value: "1"),
+            ]
+        )
+        return try BackendJSONDecoder.make().decode([Chat].self, from: data)
+    }
+
     func fetchMessages(chatID: UUID) async throws -> AdminConsoleMessagesPayload {
         let data = try await performRequest(
             path: "/admin/messages",
@@ -917,6 +941,31 @@ private struct AdminConsoleService {
         let requestBody = try JSONSerialization.data(withJSONObject: ["is_official": isOfficial])
         let data = try await performRequest(path: "/admin/chats/\(chatID.uuidString)/official", method: "PATCH", body: requestBody)
         return try BackendJSONDecoder.make().decode(Chat.self, from: data)
+    }
+
+    func setChatBlocked(chatID: UUID, isBlocked: Bool) async throws -> Chat {
+        let requestBody = try JSONSerialization.data(withJSONObject: ["is_blocked": isBlocked])
+        let data = try await performRequest(path: "/admin/chats/\(chatID.uuidString)/block", method: "PATCH", body: requestBody)
+        return try BackendJSONDecoder.make().decode(Chat.self, from: data)
+    }
+
+    func deleteChat(chatID: UUID) async throws {
+        _ = try await performRequest(path: "/admin/chats/\(chatID.uuidString)", method: "DELETE")
+    }
+
+    func sendPushBroadcast(title: String, body: String, deepLink: String?) async throws -> AdminConsoleBroadcastResponse {
+        var payload: [String: Any] = [
+            "title": title,
+            "body": body,
+            "category": "admin_broadcast",
+            "notification_type": "broadcast",
+        ]
+        if let deepLink = deepLink?.trimmingCharacters(in: .whitespacesAndNewlines), deepLink.isEmpty == false {
+            payload["deep_link"] = deepLink
+        }
+        let requestBody = try JSONSerialization.data(withJSONObject: payload)
+        let data = try await performRequest(path: "/admin/push/broadcast", method: "POST", body: requestBody)
+        return try BackendJSONDecoder.make().decode(AdminConsoleBroadcastResponse.self, from: data)
     }
 
     private func performRequest(
@@ -975,6 +1024,10 @@ private struct AdminConsoleService {
                     throw NSError(domain: "AdminConsole", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: "Chat not found."])
                 case "invalid_group_chat":
                     throw NSError(domain: "AdminConsole", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: "settings.admin_console.error.invalid_verification_chat".localized])
+                case "chat_admin_blocked":
+                    throw NSError(domain: "AdminConsole", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: "This chat is blocked by admin."])
+                case "broadcast_title_and_body_required":
+                    throw NSError(domain: "AdminConsole", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: "Push title and body are required."])
                 default:
                     throw NSError(domain: "AdminConsole", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: serverError.error])
                 }
@@ -1143,6 +1196,42 @@ struct AdminConsoleView: View {
                         Text("settings.admin_console.user_lookup.empty".localized)
                             .foregroundStyle(PrimeTheme.Colors.textSecondary)
                     }
+                }
+
+                Section("Channels & Communities") {
+                    NavigationLink {
+                        AdminCommunitiesAndChannelsView(
+                            credentials: trimmedCredentials,
+                            currentUserID: appState.currentUser.id
+                        )
+                    } label: {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Manage groups, channels, communities")
+                                .foregroundStyle(PrimeTheme.Colors.textPrimary)
+                            Text("Set official page, block/unblock, delete, open chat view")
+                                .font(.caption)
+                                .foregroundStyle(PrimeTheme.Colors.textSecondary)
+                        }
+                    }
+                    .disabled(trimmedCredentials.isEmpty)
+                }
+
+                Section("Push Notification Creator") {
+                    NavigationLink {
+                        AdminPushNotificationCreatorView(
+                            credentials: trimmedCredentials,
+                            currentUserID: appState.currentUser.id
+                        )
+                    } label: {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Create push broadcast")
+                                .foregroundStyle(PrimeTheme.Colors.textPrimary)
+                            Text("Send push instantly to all active app devices")
+                                .font(.caption)
+                                .foregroundStyle(PrimeTheme.Colors.textSecondary)
+                        }
+                    }
+                    .disabled(trimmedCredentials.isEmpty)
                 }
 
                 if statusMessage.isEmpty == false {
@@ -1646,7 +1735,12 @@ private struct AdminUserManagementView: View {
                 Section("settings.admin_console.user_chats".localized) {
                     ForEach(Array(chats.prefix(3))) { chat in
                         NavigationLink {
-                            AdminChatMessagesView(chat: chat, credentials: credentials, currentUserID: currentUserID)
+                            AdminChatMessagesView(
+                                chat: chat,
+                                credentials: credentials,
+                                currentUserID: currentUserID,
+                                focusUserID: user.uuidValue
+                            )
                         } label: {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(chat.displayTitle(for: user.uuidValue ?? currentUserID))
@@ -1871,7 +1965,12 @@ private struct AdminUserAllChatsView: View {
                 Section("settings.admin_console.user_chats".localized) {
                     ForEach(chats) { chat in
                         NavigationLink {
-                            AdminChatMessagesView(chat: chat, credentials: credentials, currentUserID: currentUserID)
+                            AdminChatMessagesView(
+                                chat: chat,
+                                credentials: credentials,
+                                currentUserID: currentUserID,
+                                focusUserID: user.uuidValue
+                            )
                         } label: {
                             VStack(alignment: .leading, spacing: 4) {
                                 HStack(spacing: 6) {
@@ -1967,15 +2066,177 @@ private struct AdminUserAllChatsView: View {
     }
 }
 
-private struct AdminChatMessagesView: View {
+private struct AdminCommunitiesAndChannelsView: View {
+    private enum Filter: String, CaseIterable, Identifiable {
+        case all
+        case groups
+        case channels
+        case communities
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .all: return "All"
+            case .groups: return "Groups"
+            case .channels: return "Channels"
+            case .communities: return "Communities"
+            }
+        }
+    }
+
+    let credentials: AdminConsoleCredentials
+    let currentUserID: UUID
+
+    @State private var chats: [Chat] = []
+    @State private var statusMessage = ""
+    @State private var isLoading = false
+    @State private var filter: Filter = .all
+
+    private var filteredChats: [Chat] {
+        switch filter {
+        case .all:
+            return chats
+        case .groups:
+            return chats.filter { $0.communityDetails?.kind == .group || $0.communityDetails?.kind == .supergroup || $0.communityDetails == nil }
+        case .channels:
+            return chats.filter { $0.communityDetails?.kind == .channel }
+        case .communities:
+            return chats.filter { $0.communityDetails?.kind == .community }
+        }
+    }
+
+    var body: some View {
+        List {
+            Section {
+                Picker("Filter", selection: $filter) {
+                    ForEach(Filter.allCases) { item in
+                        Text(item.title).tag(item)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+
+            if isLoading {
+                Section {
+                    HStack {
+                        Spacer()
+                        ProgressView()
+                        Spacer()
+                    }
+                }
+            } else if filteredChats.isEmpty {
+                Section {
+                    Text(statusMessage.isEmpty ? "No channels or communities found." : statusMessage)
+                        .foregroundStyle(PrimeTheme.Colors.textSecondary)
+                }
+            } else {
+                Section("Groups & Channels") {
+                    ForEach(filteredChats) { chat in
+                        NavigationLink {
+                            AdminCommunityChannelDetailView(
+                                chat: chat,
+                                credentials: credentials,
+                                currentUserID: currentUserID
+                            )
+                        } label: {
+                            AdminCommunityChannelRow(chat: chat)
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("Groups & Channels")
+        .task {
+            await loadChats()
+        }
+        .refreshable {
+            await loadChats()
+        }
+    }
+
+    @MainActor
+    private func loadChats() async {
+        guard let baseURL = BackendConfiguration.currentBaseURL else {
+            statusMessage = "auth.server.unavailable".localized
+            return
+        }
+        isLoading = true
+        defer { isLoading = false }
+
+        do {
+            chats = try await AdminConsoleService(
+                baseURL: baseURL,
+                credentials: credentials,
+                currentUserID: currentUserID
+            ).fetchCommunityChats(kinds: CommunityKind.allCases)
+            statusMessage = ""
+        } catch {
+            chats = []
+            statusMessage = error.localizedDescription
+        }
+    }
+}
+
+private struct AdminCommunityChannelRow: View {
+    let chat: Chat
+
+    private var memberCountText: String {
+        let count = chat.group?.members.count ?? chat.participantIDs.count
+        if chat.communityDetails?.kind == .channel {
+            return "\(count) subscribers"
+        }
+        return "\(count) members"
+    }
+
+    private var kindTitle: String {
+        chat.communityDetails?.kind.title ?? "Group"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text(chat.displayTitle(for: chat.participantIDs.first ?? chat.id))
+                    .foregroundStyle(PrimeTheme.Colors.textPrimary)
+                if chat.communityDetails?.isOfficial == true {
+                    Label("Official", systemImage: "checkmark.seal.fill")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(PrimeTheme.Colors.accent)
+                }
+                if chat.communityDetails?.isBlockedByAdmin == true {
+                    Label("Blocked", systemImage: "nosign")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.red)
+                }
+            }
+
+            Text("\(kindTitle) · \(memberCountText)")
+                .font(.caption)
+                .foregroundStyle(PrimeTheme.Colors.textSecondary)
+
+            if let preview = chat.lastMessagePreview, preview.isEmpty == false {
+                Text(preview)
+                    .font(.caption)
+                    .foregroundStyle(PrimeTheme.Colors.textSecondary)
+                    .lineLimit(2)
+            }
+        }
+    }
+}
+
+private struct AdminCommunityChannelDetailView: View {
+    @Environment(\.dismiss) private var dismiss
+
     let chat: Chat
     let credentials: AdminConsoleCredentials
     let currentUserID: UUID
 
-    @State private var messages: [Message] = []
     @State private var currentChat: Chat
-    @State private var isUpdatingOfficialBadge = false
     @State private var statusMessage = ""
+    @State private var isBusyOfficial = false
+    @State private var isBusyBlock = false
+    @State private var isDeleting = false
+    @State private var isShowingDeleteAlert = false
 
     init(chat: Chat, credentials: AdminConsoleCredentials, currentUserID: UUID) {
         self.chat = chat
@@ -1986,86 +2247,389 @@ private struct AdminChatMessagesView: View {
 
     var body: some View {
         List {
-            if currentChat.isAdminVerifiableCommunity {
-                Section("settings.admin_console.verification".localized) {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack(spacing: 6) {
-                                Text(currentChat.displayTitle(for: currentChat.participantIDs.first ?? currentChat.id))
-                                    .foregroundStyle(PrimeTheme.Colors.textPrimary)
-                                if currentChat.communityDetails?.isOfficial == true {
-                                    Image(systemName: "checkmark.seal.fill")
-                                        .foregroundStyle(PrimeTheme.Colors.accent)
-                                }
-                            }
-                            Text(currentChat.adminVerificationStatusText)
-                                .font(.caption)
-                                .foregroundStyle(PrimeTheme.Colors.textSecondary)
-                        }
+            Section("Community") {
+                LabeledContent("Title", value: currentChat.displayTitle(for: currentChat.participantIDs.first ?? currentChat.id))
+                LabeledContent("Kind", value: currentChat.communityDetails?.kind.title ?? "Group")
+                if currentChat.communityDetails?.isOfficial == true {
+                    LabeledContent("Official", value: "Yes")
+                }
+                if currentChat.communityDetails?.isBlockedByAdmin == true {
+                    LabeledContent("Blocked by admin", value: "Yes")
+                }
+            }
 
-                        Spacer()
+            Section("Actions") {
+                NavigationLink("Open Chat") {
+                    AdminChatMessagesView(
+                        chat: currentChat,
+                        credentials: credentials,
+                        currentUserID: currentUserID,
+                        focusUserID: nil
+                    )
+                }
 
-                        Button {
-                            Task {
-                                await toggleOfficialBadge()
-                            }
-                        } label: {
-                            if isUpdatingOfficialBadge {
-                                ProgressView()
-                            } else {
-                                Text(
-                                    currentChat.communityDetails?.isOfficial == true
-                                        ? "settings.admin_console.verification.remove".localized
-                                        : "settings.admin_console.verification.verify".localized
-                                )
-                            }
+                if currentChat.isAdminVerifiableCommunity {
+                    Button {
+                        Task { await toggleOfficial() }
+                    } label: {
+                        if isBusyOfficial {
+                            HStack { ProgressView(); Text("Updating official status…") }
+                        } else {
+                            Text(currentChat.communityDetails?.isOfficial == true ? "Remove Official Badge" : "Set Official Badge")
                         }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
+                    }
+                    .disabled(isBusyOfficial || isDeleting)
+                }
+
+                Button {
+                    Task { await toggleBlocked() }
+                } label: {
+                    if isBusyBlock {
+                        HStack { ProgressView(); Text("Updating block state…") }
+                    } else {
+                        Text(currentChat.communityDetails?.isBlockedByAdmin == true ? "Unblock Community" : "Block Community")
                     }
                 }
+                .foregroundStyle(currentChat.communityDetails?.isBlockedByAdmin == true ? PrimeTheme.Colors.success : .red)
+                .disabled(isBusyBlock || isDeleting)
+
+                Button(isDeleting ? "Deleting…" : "Delete Chat", role: .destructive) {
+                    isShowingDeleteAlert = true
+                }
+                .disabled(isDeleting || isBusyOfficial || isBusyBlock)
+            }
+
+            if statusMessage.isEmpty == false {
+                Section {
+                    Text(statusMessage)
+                        .foregroundStyle(PrimeTheme.Colors.textSecondary)
+                }
+            }
+        }
+        .navigationTitle("Manage Community")
+        .alert("Delete Chat", isPresented: $isShowingDeleteAlert) {
+            Button("Delete", role: .destructive) {
+                Task { await deleteChat() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This will permanently delete the chat and its messages.")
+        }
+    }
+
+    @MainActor
+    private func toggleOfficial() async {
+        guard let baseURL = BackendConfiguration.currentBaseURL else {
+            statusMessage = "auth.server.unavailable".localized
+            return
+        }
+        guard currentChat.isAdminVerifiableCommunity else { return }
+
+        isBusyOfficial = true
+        defer { isBusyOfficial = false }
+
+        do {
+            currentChat = try await AdminConsoleService(
+                baseURL: baseURL,
+                credentials: credentials,
+                currentUserID: currentUserID
+            ).setOfficialBadge(
+                chatID: currentChat.id,
+                isOfficial: currentChat.communityDetails?.isOfficial != true
+            )
+            statusMessage = currentChat.communityDetails?.isOfficial == true ? "Official badge enabled." : "Official badge removed."
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func toggleBlocked() async {
+        guard let baseURL = BackendConfiguration.currentBaseURL else {
+            statusMessage = "auth.server.unavailable".localized
+            return
+        }
+
+        isBusyBlock = true
+        defer { isBusyBlock = false }
+
+        do {
+            currentChat = try await AdminConsoleService(
+                baseURL: baseURL,
+                credentials: credentials,
+                currentUserID: currentUserID
+            ).setChatBlocked(
+                chatID: currentChat.id,
+                isBlocked: currentChat.communityDetails?.isBlockedByAdmin != true
+            )
+            statusMessage = currentChat.communityDetails?.isBlockedByAdmin == true ? "Community blocked." : "Community unblocked."
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func deleteChat() async {
+        guard let baseURL = BackendConfiguration.currentBaseURL else {
+            statusMessage = "auth.server.unavailable".localized
+            return
+        }
+
+        isDeleting = true
+        defer { isDeleting = false }
+
+        do {
+            try await AdminConsoleService(
+                baseURL: baseURL,
+                credentials: credentials,
+                currentUserID: currentUserID
+            ).deleteChat(chatID: currentChat.id)
+            dismiss()
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+}
+
+private struct AdminPushNotificationCreatorView: View {
+    let credentials: AdminConsoleCredentials
+    let currentUserID: UUID
+
+    @State private var title = ""
+    @State private var bodyText = ""
+    @State private var deepLink = ""
+    @State private var statusMessage = ""
+    @State private var isSending = false
+
+    var body: some View {
+        List {
+            Section("Compose Push") {
+                TextField("Title", text: $title)
+                TextField("Message", text: $bodyText, axis: .vertical)
+                    .lineLimit(3...8)
+                TextField("Deep Link (optional)", text: $deepLink)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            }
+
+            Section {
+                Button {
+                    Task { await sendBroadcast() }
+                } label: {
+                    if isSending {
+                        HStack {
+                            Spacer()
+                            ProgressView()
+                            Text("Sending…")
+                            Spacer()
+                        }
+                    } else {
+                        Text("Send Push to All")
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isSending || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+
+            if statusMessage.isEmpty == false {
+                Section {
+                    Text(statusMessage)
+                        .foregroundStyle(PrimeTheme.Colors.textSecondary)
+                }
+            }
+        }
+        .navigationTitle("Push Creator")
+    }
+
+    @MainActor
+    private func sendBroadcast() async {
+        guard let baseURL = BackendConfiguration.currentBaseURL else {
+            statusMessage = "auth.server.unavailable".localized
+            return
+        }
+
+        isSending = true
+        defer { isSending = false }
+
+        do {
+            let payload = try await AdminConsoleService(
+                baseURL: baseURL,
+                credentials: credentials,
+                currentUserID: currentUserID
+            ).sendPushBroadcast(
+                title: title.trimmingCharacters(in: .whitespacesAndNewlines),
+                body: bodyText.trimmingCharacters(in: .whitespacesAndNewlines),
+                deepLink: deepLink.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : deepLink.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+            if payload.queued {
+                statusMessage = "Push queued for \(payload.recipientCount) device(s)."
+            } else {
+                statusMessage = "No active device tokens found."
+            }
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+}
+
+private struct AdminChatMessagesView: View {
+    let chat: Chat
+    let credentials: AdminConsoleCredentials
+    let currentUserID: UUID
+    let focusUserID: UUID?
+
+    @State private var messages: [Message] = []
+    @State private var currentChat: Chat
+    @State private var isUpdatingOfficialBadge = false
+    @State private var isUpdatingBlockState = false
+    @State private var statusMessage = ""
+
+    init(chat: Chat, credentials: AdminConsoleCredentials, currentUserID: UUID, focusUserID: UUID? = nil) {
+        self.chat = chat
+        self.credentials = credentials
+        self.currentUserID = currentUserID
+        self.focusUserID = focusUserID
+        _currentChat = State(initialValue: chat)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if currentChat.isAdminVerifiableCommunity || currentChat.communityDetails?.isBlockedByAdmin != nil {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 8) {
+                        Text(currentChat.displayTitle(for: currentChat.participantIDs.first ?? currentChat.id))
+                            .font(.headline)
+                            .foregroundStyle(PrimeTheme.Colors.textPrimary)
+                        if currentChat.communityDetails?.isOfficial == true {
+                            Image(systemName: "checkmark.seal.fill")
+                                .foregroundStyle(PrimeTheme.Colors.accent)
+                        }
+                        if currentChat.communityDetails?.isBlockedByAdmin == true {
+                            Label("Blocked", systemImage: "nosign")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.red)
+                        }
+                    }
+
+                    HStack(spacing: 8) {
+                        if currentChat.isAdminVerifiableCommunity {
+                            Button {
+                                Task { await toggleOfficialBadge() }
+                            } label: {
+                                if isUpdatingOfficialBadge {
+                                    ProgressView()
+                                } else {
+                                    Text(currentChat.communityDetails?.isOfficial == true ? "Remove Official" : "Set Official")
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .disabled(isUpdatingOfficialBadge || isUpdatingBlockState)
+                        }
+
+                        Button {
+                            Task { await toggleBlockedState() }
+                        } label: {
+                            if isUpdatingBlockState {
+                                ProgressView()
+                            } else {
+                                Text(currentChat.communityDetails?.isBlockedByAdmin == true ? "Unblock" : "Block")
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(isUpdatingOfficialBadge || isUpdatingBlockState)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(.thinMaterial)
             }
 
             if messages.isEmpty {
-                Section {
-                    Text(statusMessage.isEmpty ? "settings.admin_console.messages.empty".localized : statusMessage)
+                VStack(spacing: 10) {
+                    Spacer()
+                    Text(statusMessage.isEmpty ? "No messages in this chat." : statusMessage)
                         .foregroundStyle(PrimeTheme.Colors.textSecondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 20)
+                    Spacer()
                 }
             } else {
-                Section("settings.admin_console.messages".localized) {
-                    ForEach(messages) { message in
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack {
-                                Text(message.senderDisplayName ?? message.senderID.uuidString)
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(PrimeTheme.Colors.textSecondary)
-                                Spacer()
-                                Text(message.createdAt.formatted(date: .abbreviated, time: .shortened))
-                                    .font(.caption2)
-                                    .foregroundStyle(PrimeTheme.Colors.textSecondary)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 8) {
+                            ForEach(Array(messages.indices), id: \.self) { index in
+                                let message = messages[index]
+                                AdminChatConversationBubbleRow(
+                                    message: message,
+                                    isOutgoing: isOutgoingMessage(message),
+                                    showsSender: shouldShowSender(at: index),
+                                    senderName: senderLabel(for: message)
+                                )
+                                .id(message.id)
                             }
-
-                            if let text = message.text, text.isEmpty == false {
-                                Text(text)
-                                    .foregroundStyle(PrimeTheme.Colors.textPrimary)
-                            } else {
-                                Text(message.kind.rawValue.capitalized)
-                                    .foregroundStyle(PrimeTheme.Colors.textSecondary)
-                            }
-
-                            Text("\(message.deliveryState.rawValue.capitalized) · \(message.status.rawValue.capitalized)")
-                                .font(.caption2)
-                                .foregroundStyle(PrimeTheme.Colors.textSecondary)
                         }
-                        .padding(.vertical, 4)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 12)
+                    }
+                    .background(PrimeTheme.Colors.background)
+                    .onAppear {
+                        guard let lastID = messages.last?.id else { return }
+                        proxy.scrollTo(lastID, anchor: .bottom)
+                    }
+                    .onChange(of: messages.count) { _ in
+                        guard let lastID = messages.last?.id else { return }
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            proxy.scrollTo(lastID, anchor: .bottom)
+                        }
                     }
                 }
             }
+
+            if statusMessage.isEmpty == false {
+                Text(statusMessage)
+                    .font(.footnote)
+                    .foregroundStyle(PrimeTheme.Colors.textSecondary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.ultraThinMaterial)
+            }
         }
         .navigationTitle(chat.displayTitle(for: chat.participantIDs.first ?? chat.id))
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    Task { await loadMessages() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+            }
+        }
         .task {
             await loadMessages()
         }
+    }
+
+    private func isOutgoingMessage(_ message: Message) -> Bool {
+        if let focusUserID {
+            return message.senderID == focusUserID
+        }
+        return message.senderID == currentUserID
+    }
+
+    private func shouldShowSender(at index: Int) -> Bool {
+        guard index > 0 else { return true }
+        return messages[index - 1].senderID != messages[index].senderID
+    }
+
+    private func senderLabel(for message: Message) -> String {
+        if let senderDisplayName = message.senderDisplayName, senderDisplayName.isEmpty == false {
+            return senderDisplayName
+        }
+        return message.senderID.uuidString
     }
 
     @MainActor
@@ -2080,6 +2644,33 @@ private struct AdminChatMessagesView: View {
             currentChat = payload.chat ?? currentChat
             messages = payload.messages
             statusMessage = ""
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func toggleBlockedState() async {
+        guard let baseURL = BackendConfiguration.currentBaseURL else {
+            statusMessage = "auth.server.unavailable".localized
+            return
+        }
+
+        isUpdatingBlockState = true
+        defer { isUpdatingBlockState = false }
+
+        do {
+            currentChat = try await AdminConsoleService(
+                baseURL: baseURL,
+                credentials: credentials,
+                currentUserID: currentUserID
+            ).setChatBlocked(
+                chatID: currentChat.id,
+                isBlocked: currentChat.communityDetails?.isBlockedByAdmin != true
+            )
+            statusMessage = currentChat.communityDetails?.isBlockedByAdmin == true
+                ? "Chat is blocked by admin."
+                : "Chat is unblocked."
         } catch {
             statusMessage = error.localizedDescription
         }
@@ -2111,5 +2702,268 @@ private struct AdminChatMessagesView: View {
         } catch {
             statusMessage = error.localizedDescription
         }
+    }
+}
+
+private struct AdminChatConversationBubbleRow: View {
+    let message: Message
+    let isOutgoing: Bool
+    let showsSender: Bool
+    let senderName: String
+
+    var body: some View {
+        HStack {
+            if isOutgoing {
+                Spacer(minLength: 42)
+            }
+
+            VStack(alignment: isOutgoing ? .trailing : .leading, spacing: 4) {
+                if showsSender {
+                    Text(senderName)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(PrimeTheme.Colors.textSecondary)
+                }
+                VStack(alignment: isOutgoing ? .trailing : .leading, spacing: 8) {
+                    if let text = message.text?.trimmingCharacters(in: .whitespacesAndNewlines), text.isEmpty == false {
+                        Text(text)
+                            .font(.body)
+                            .foregroundStyle(isOutgoing ? .white : PrimeTheme.Colors.textPrimary)
+                            .frame(maxWidth: 260, alignment: isOutgoing ? .trailing : .leading)
+                    }
+
+                    if message.attachments.isEmpty == false {
+                        ForEach(message.attachments) { attachment in
+                            AdminMessageAttachmentView(
+                                attachment: attachment,
+                                isOutgoing: isOutgoing
+                            )
+                        }
+                    }
+
+                    if let voiceMessage = message.voiceMessage {
+                        AdminVoiceMessagePreview(
+                            voiceMessage: voiceMessage,
+                            isOutgoing: isOutgoing
+                        )
+                    }
+
+                    if message.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false,
+                       message.attachments.isEmpty,
+                       message.voiceMessage == nil {
+                        Text(fallbackLabel)
+                            .font(.body)
+                            .foregroundStyle(isOutgoing ? .white : PrimeTheme.Colors.textPrimary)
+                    }
+                }
+                .frame(maxWidth: 260, alignment: isOutgoing ? .trailing : .leading)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(
+                    isOutgoing
+                        ? PrimeTheme.Colors.accent
+                        : PrimeTheme.Colors.elevated,
+                    in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+                )
+                Text(message.createdAt.formatted(date: .omitted, time: .shortened))
+                    .font(.caption2)
+                    .foregroundStyle(PrimeTheme.Colors.textSecondary)
+            }
+
+            if !isOutgoing {
+                Spacer(minLength: 42)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: isOutgoing ? .trailing : .leading)
+    }
+
+    private var fallbackLabel: String {
+        switch message.kind {
+        case .photo:
+            return "Photo"
+        case .video:
+            return "Video"
+        case .audio:
+            return "Audio"
+        case .voice:
+            return "Voice message"
+        case .document:
+            return "Document"
+        case .contact:
+            return "Contact"
+        case .location:
+            return "Location"
+        case .liveLocation:
+            return "Live location"
+        case .system:
+            return "System message"
+        case .text:
+            return "Message"
+        }
+    }
+}
+
+private struct AdminMessageAttachmentView: View {
+    let attachment: Attachment
+    let isOutgoing: Bool
+
+    var body: some View {
+        switch attachment.type {
+        case .photo:
+            AdminPhotoAttachmentPreview(attachment: attachment)
+        case .video:
+            AdminGenericAttachmentCard(
+                title: attachment.fileName.nilIfEmpty ?? "Video",
+                subtitle: attachmentMetadataSubtitle(prefix: "Video"),
+                systemImage: "video.fill",
+                tint: .red,
+                isOutgoing: isOutgoing
+            )
+        case .document:
+            AdminGenericAttachmentCard(
+                title: attachment.fileName.nilIfEmpty ?? "Document",
+                subtitle: attachmentMetadataSubtitle(prefix: attachment.mimeType.nilIfEmpty ?? "Document"),
+                systemImage: "doc.fill",
+                tint: .blue,
+                isOutgoing: isOutgoing
+            )
+        case .audio:
+            AdminGenericAttachmentCard(
+                title: attachment.fileName.nilIfEmpty ?? "Audio",
+                subtitle: attachmentMetadataSubtitle(prefix: "Audio"),
+                systemImage: "music.note",
+                tint: .orange,
+                isOutgoing: isOutgoing
+            )
+        case .contact:
+            AdminGenericAttachmentCard(
+                title: attachment.fileName.nilIfEmpty ?? "Contact",
+                subtitle: attachment.mimeType.nilIfEmpty ?? "Shared contact",
+                systemImage: "person.crop.circle.fill",
+                tint: .green,
+                isOutgoing: isOutgoing
+            )
+        case .location:
+            AdminGenericAttachmentCard(
+                title: attachment.fileName.nilIfEmpty ?? "Location",
+                subtitle: attachment.mimeType.nilIfEmpty ?? "Shared location",
+                systemImage: "location.fill",
+                tint: .pink,
+                isOutgoing: isOutgoing
+            )
+        }
+    }
+
+    private func attachmentMetadataSubtitle(prefix: String) -> String {
+        let size = ByteCountFormatter.string(fromByteCount: attachment.byteSize, countStyle: .file)
+        return size.isEmpty ? prefix : "\(prefix) • \(size)"
+    }
+}
+
+private struct AdminPhotoAttachmentPreview: View {
+    let attachment: Attachment
+
+    var body: some View {
+        SwiftUI.Group {
+            if let localImage = localImage {
+                Image(uiImage: localImage)
+                    .resizable()
+                    .scaledToFill()
+            } else if let remoteURL = attachment.remoteURL {
+                CachedRemoteImage(url: remoteURL, maxPixelSize: 1200) { image in
+                    image
+                        .resizable()
+                        .scaledToFill()
+                } placeholder: {
+                    placeholder
+                }
+            } else {
+                placeholder
+            }
+        }
+        .frame(width: 220, height: 160)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.black.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    private var localImage: UIImage? {
+        guard let url = attachment.localURL, url.isFileURL else { return nil }
+        return UIImage(contentsOfFile: url.path)
+    }
+
+    private var placeholder: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.black.opacity(0.08))
+            Image(systemName: "photo")
+                .font(.system(size: 28, weight: .semibold))
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct AdminVoiceMessagePreview: View {
+    let voiceMessage: VoiceMessage
+    let isOutgoing: Bool
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "waveform")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(isOutgoing ? .white : PrimeTheme.Colors.accent)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Voice message")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(isOutgoing ? .white : PrimeTheme.Colors.textPrimary)
+                Text("\(formattedDuration) • \(ByteCountFormatter.string(fromByteCount: voiceMessage.byteSize, countStyle: .file))")
+                    .font(.caption)
+                    .foregroundStyle(isOutgoing ? Color.white.opacity(0.82) : PrimeTheme.Colors.textSecondary)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: 220, alignment: .leading)
+    }
+
+    private var formattedDuration: String {
+        let minutes = voiceMessage.durationSeconds / 60
+        let seconds = voiceMessage.durationSeconds % 60
+        return String(format: "%d:%02d", minutes, seconds)
+    }
+}
+
+private struct AdminGenericAttachmentCard: View {
+    let title: String
+    let subtitle: String
+    let systemImage: String
+    let tint: Color
+    let isOutgoing: Bool
+
+    var body: some View {
+        HStack(spacing: 10) {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill((isOutgoing ? Color.white.opacity(0.16) : tint.opacity(0.14)))
+                .frame(width: 40, height: 40)
+                .overlay(
+                    Image(systemName: systemImage)
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(isOutgoing ? .white : tint)
+                )
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(isOutgoing ? .white : PrimeTheme.Colors.textPrimary)
+                    .lineLimit(2)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(isOutgoing ? Color.white.opacity(0.82) : PrimeTheme.Colors.textSecondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: 220, alignment: .leading)
     }
 }

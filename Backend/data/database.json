@@ -1,0 +1,12 @@
+{
+  "users": [],
+  "chats": [],
+  "messages": [],
+  "sessions": [],
+  "deviceTokens": [],
+  "otpChallenges": [],
+  "calls": [],
+  "callEvents": [],
+  "chatReadMarkers": [],
+  "blocks": []
+}

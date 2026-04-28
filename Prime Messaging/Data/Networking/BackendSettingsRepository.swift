@@ -164,7 +164,8 @@ struct BackendSettingsRepository: SettingsRepository {
             return currentUser.id
         }
 
-        if let session = await AuthSessionStore.shared.mostRecentSession() {
+        let sessions = await AuthSessionStore.shared.allSessions()
+        if sessions.count == 1, let session = sessions.first {
             return session.userID
         }
 

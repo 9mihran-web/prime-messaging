@@ -3,6 +3,7 @@ import UIKit
 
 struct MainTabView: View {
     @EnvironmentObject private var appState: AppState
+    @Environment(\.colorScheme) private var colorScheme
     @State private var settingsTapCount = 0
     @State private var isShowingHiddenAdminConsole = false
 
@@ -51,6 +52,12 @@ struct MainTabView: View {
             }
             .environmentObject(appState)
         }
+        .onAppear {
+            applyLiquidGlassTabBarAppearance(for: colorScheme)
+        }
+        .onChange(of: colorScheme) { newValue in
+            applyLiquidGlassTabBarAppearance(for: newValue)
+        }
         .onChange(of: appState.currentUser.id) { _ in
             settingsTapCount = 0
             isShowingHiddenAdminConsole = false
@@ -73,6 +80,39 @@ struct MainTabView: View {
         guard settingsTapCount >= 10 else { return }
         settingsTapCount = 0
         isShowingHiddenAdminConsole = true
+    }
+
+    private func applyLiquidGlassTabBarAppearance(for scheme: ColorScheme) {
+        #if os(iOS)
+        let appearance = UITabBarAppearance()
+        appearance.configureWithTransparentBackground()
+        appearance.backgroundEffect = UIBlurEffect(
+            style: scheme == .dark ? .systemChromeMaterialDark : .systemUltraThinMaterialLight
+        )
+        appearance.backgroundColor = scheme == .dark
+            ? UIColor.black.withAlphaComponent(0.22)
+            : UIColor.white.withAlphaComponent(0.40)
+        appearance.shadowColor = UIColor.white.withAlphaComponent(scheme == .dark ? 0.08 : 0.22)
+
+        let selectedColor = UIColor(PrimeTheme.Colors.accent)
+        let unselectedColor = UIColor.secondaryLabel.withAlphaComponent(scheme == .dark ? 0.86 : 0.72)
+
+        for itemAppearance in [appearance.stackedLayoutAppearance, appearance.inlineLayoutAppearance, appearance.compactInlineLayoutAppearance] {
+            itemAppearance.normal.iconColor = unselectedColor
+            itemAppearance.normal.titleTextAttributes = [.foregroundColor: unselectedColor]
+            itemAppearance.selected.iconColor = selectedColor
+            itemAppearance.selected.titleTextAttributes = [.foregroundColor: selectedColor]
+        }
+
+        let tabBar = UITabBar.appearance()
+        tabBar.standardAppearance = appearance
+        tabBar.tintColor = selectedColor
+        tabBar.unselectedItemTintColor = unselectedColor
+        tabBar.isTranslucent = true
+        if #available(iOS 15.0, *) {
+            tabBar.scrollEdgeAppearance = appearance
+        }
+        #endif
     }
 }
 
@@ -178,6 +218,9 @@ private struct CallsView: View {
     @ObservedObject private var internetCallManager = InternetCallManager.shared
     @State private var callHistory: [InternetCall] = []
     @State private var errorText = ""
+    @State private var selectedCallForActions: InternetCall?
+    @State private var selectedCallForRedial: InternetCall?
+    @State private var presentedProfileUser: User?
 
     var body: some View {
         ScrollView {
@@ -211,6 +254,79 @@ private struct CallsView: View {
         .navigationTitle("tab.calls".localized)
         .task(id: appState.currentUser.id) {
             await refreshLoop()
+        }
+        .confirmationDialog(
+            "Call actions",
+            isPresented: Binding(
+                get: { selectedCallForActions != nil },
+                set: { isPresented in
+                    if isPresented == false {
+                        selectedCallForActions = nil
+                    }
+                }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let call = selectedCallForActions {
+                if call.isGroupCall == false {
+                    Button("Open profile") {
+                        Task {
+                            await openProfile(for: call)
+                        }
+                    }
+                }
+                Button("Open chat") {
+                    Task {
+                        await openChat(for: call)
+                    }
+                }
+                Button(call.isGroupCall ? "Open group call" : "Redial") {
+                    selectedCallForActions = nil
+                    selectedCallForRedial = call
+                }
+            }
+            Button("common.cancel".localized, role: .cancel) { }
+        }
+        .confirmationDialog(
+            "Redial",
+            isPresented: Binding(
+                get: { selectedCallForRedial != nil },
+                set: { isPresented in
+                    if isPresented == false {
+                        selectedCallForRedial = nil
+                    }
+                }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let call = selectedCallForRedial {
+                if call.isGroupCall {
+                    Button("Open group call") {
+                        Task {
+                            await redialAudio(for: call)
+                        }
+                    }
+                } else {
+                    Button("Audio call") {
+                        Task {
+                            await redialAudio(for: call)
+                        }
+                    }
+                    Button("Video call") {
+                        Task {
+                            await redialVideo(for: call)
+                        }
+                    }
+                }
+            }
+            Button("common.cancel".localized, role: .cancel) { }
+        }
+        .sheet(item: $presentedProfileUser) { user in
+            NavigationStack {
+                ContactProfileView(user: user)
+                    .environmentObject(appState)
+            }
+            .presentationDetents([.large])
         }
     }
 
@@ -264,6 +380,27 @@ private struct CallsView: View {
 
     @ViewBuilder
     private func callRow(_ call: InternetCall) -> some View {
+        CallHistorySwipeRow(
+            onTap: {
+                selectedCallForActions = call
+            },
+            onSwipeLeft: {
+                Task {
+                    await openChat(for: call)
+                }
+            },
+            onSwipeRight: {
+                Task {
+                    await redialAudio(for: call)
+                }
+            }
+        ) {
+            callRowContent(call)
+        }
+    }
+
+    @ViewBuilder
+    private func callRowContent(_ call: InternetCall) -> some View {
         let direction = call.direction(for: appState.currentUser.id)
         let effectiveState = call.effectiveState(for: appState.currentUser.id)
 
@@ -309,6 +446,150 @@ private struct CallsView: View {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .stroke(PrimeTheme.Colors.separator.opacity(0.22), lineWidth: 1)
         )
+    }
+
+    @MainActor
+    private func openProfile(for call: InternetCall) async {
+        defer { selectedCallForActions = nil }
+        guard let participant = call.otherParticipant(for: appState.currentUser.id) else {
+            errorText = "Could not open profile."
+            return
+        }
+
+        if let resolvedUser = try? await environment.authRepository.userProfile(userID: participant.id) {
+            presentedProfileUser = resolvedUser
+            errorText = ""
+            return
+        }
+
+        presentedProfileUser = fallbackUser(from: participant)
+        errorText = ""
+    }
+
+    @MainActor
+    private func openChat(for call: InternetCall) async {
+        defer { selectedCallForActions = nil }
+        if call.isGroupCall {
+            guard let chat = await resolveExistingChat(for: call) else {
+                errorText = "Could not open chat."
+                return
+            }
+            errorText = ""
+            appState.routeToChat(chat)
+            return
+        }
+
+        guard let participantID = call.otherParticipant(for: appState.currentUser.id)?.id else {
+            errorText = "Could not open chat."
+            return
+        }
+
+        do {
+            let chat = try await environment.chatRepository.createDirectChat(
+                with: participantID,
+                currentUserID: appState.currentUser.id,
+                mode: .online
+            )
+            errorText = ""
+            appState.routeToChat(chat)
+        } catch {
+            errorText = error.localizedDescription.isEmpty ? "contact.chat.failed".localized : error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func redialAudio(for call: InternetCall) async {
+        defer {
+            selectedCallForActions = nil
+            selectedCallForRedial = nil
+        }
+
+        if call.isGroupCall {
+            guard let chat = await resolveExistingChat(for: call) else {
+                errorText = "calls.unavailable.start".localized
+                return
+            }
+            appState.routeToChat(chat)
+            errorText = ""
+            return
+        }
+
+        guard let participantID = call.otherParticipant(for: appState.currentUser.id)?.id else {
+            errorText = "calls.unavailable.start".localized
+            return
+        }
+
+        do {
+            try await internetCallManager.startOutgoingCall(to: participantID)
+            errorText = ""
+        } catch {
+            errorText = error.localizedDescription.isEmpty ? "calls.unavailable.start".localized : error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func redialVideo(for call: InternetCall) async {
+        defer {
+            selectedCallForActions = nil
+            selectedCallForRedial = nil
+        }
+
+        guard call.isGroupCall == false else {
+            errorText = "Group calls are audio-only right now."
+            return
+        }
+
+        guard let participantID = call.otherParticipant(for: appState.currentUser.id)?.id else {
+            errorText = "calls.unavailable.start".localized
+            return
+        }
+
+        do {
+            try await internetCallManager.startOutgoingCall(to: participantID)
+            internetCallManager.presentCallUI()
+            try? await Task.sleep(for: .milliseconds(180))
+            internetCallManager.toggleVideo()
+            errorText = ""
+        } catch {
+            errorText = error.localizedDescription.isEmpty ? "calls.unavailable.start".localized : error.localizedDescription
+        }
+    }
+
+    private func fallbackUser(from participant: InternetCallParticipant) -> User {
+        let displayName = participant.displayName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedDisplayName = (displayName?.isEmpty == false ? displayName : participant.username) ?? participant.username
+
+        return User(
+            id: participant.id,
+            profile: Profile(
+                displayName: resolvedDisplayName,
+                username: participant.username,
+                bio: "",
+                status: "Last seen recently",
+                birthday: nil,
+                email: nil,
+                phoneNumber: nil,
+                profilePhotoURL: participant.profilePhotoURL,
+                socialLink: nil
+            ),
+            identityMethods: [
+                IdentityMethod(type: .username, value: "@\(participant.username)", isVerified: true, isPubliclyDiscoverable: true)
+            ],
+            privacySettings: .defaultEmailOnly
+        )
+    }
+
+    @MainActor
+    private func resolveExistingChat(for call: InternetCall) async -> Chat? {
+        guard let chatID = call.chatID else { return nil }
+        let cached = await environment.chatRepository.cachedChats(mode: call.mode, for: appState.currentUser.id)
+        if let matchedCached = cached.first(where: { $0.id == chatID }) {
+            return matchedCached
+        }
+        if let fetched = try? await environment.chatRepository.fetchChats(mode: call.mode, for: appState.currentUser.id) {
+            return fetched.first(where: { $0.id == chatID })
+        }
+        return nil
     }
 
     private func refreshLoop() async {
@@ -381,8 +662,103 @@ private struct CallsView: View {
 
         let endDate = call.endedAt ?? Date.now
         let duration = max(Int(endDate.timeIntervalSince(answeredAt)), 0)
-        let minutes = duration / 60
+        let hours = duration / 3600
+        let minutes = (duration % 3600) / 60
         let seconds = duration % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+        }
         return "\(minutes):" + String(format: "%02d", seconds)
+    }
+}
+
+private struct CallHistorySwipeRow<Content: View>: View {
+    let onTap: () -> Void
+    let onSwipeLeft: () -> Void
+    let onSwipeRight: () -> Void
+    @ViewBuilder let content: () -> Content
+
+    @State private var offsetX: CGFloat = 0
+
+    private let actionTriggerThreshold: CGFloat = 86
+    private let maxOffset: CGFloat = 78
+
+    var body: some View {
+        ZStack {
+            swipeBackground
+            content()
+                .contentShape(Rectangle())
+                .offset(x: offsetX)
+        }
+        .contentShape(Rectangle())
+        .clipped()
+        .simultaneousGesture(dragGesture)
+        .onTapGesture {
+            onTap()
+        }
+        .animation(.spring(response: 0.24, dampingFraction: 0.82), value: offsetX)
+    }
+
+    private var swipeBackground: some View {
+        HStack(spacing: 10) {
+            swipeBadge(title: "Audio call", systemName: "phone.fill", tint: PrimeTheme.Colors.accent)
+            Spacer(minLength: 0)
+            swipeBadge(title: "Open chat", systemName: "bubble.left.and.bubble.right.fill", tint: PrimeTheme.Colors.smartAccent)
+        }
+        .padding(.horizontal, 10)
+        .background(PrimeTheme.Colors.elevated.opacity(0.9))
+    }
+
+    private func swipeBadge(title: String, systemName: String, tint: Color) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: systemName)
+                .font(.system(size: 11, weight: .semibold))
+            Text(title)
+                .font(.caption2.weight(.semibold))
+        }
+        .foregroundStyle(Color.white)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            Capsule(style: .continuous)
+                .fill(tint.opacity(0.92))
+        )
+    }
+
+    private var dragGesture: some Gesture {
+        #if os(tvOS)
+        TapGesture()
+        #else
+        DragGesture(minimumDistance: 18, coordinateSpace: .local)
+            .onChanged { value in
+                guard shouldTrackSwipe(translation: value.translation) else { return }
+                offsetX = min(max(value.translation.width * 0.45, -maxOffset), maxOffset)
+            }
+            .onEnded { value in
+                guard shouldTrackSwipe(translation: value.translation) else {
+                    withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
+                        offsetX = 0
+                    }
+                    return
+                }
+
+                if value.translation.width >= actionTriggerThreshold {
+                    onSwipeRight()
+                } else if value.translation.width <= -actionTriggerThreshold {
+                    onSwipeLeft()
+                }
+
+                withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
+                    offsetX = 0
+                }
+            }
+        #endif
+    }
+
+    private func shouldTrackSwipe(translation: CGSize) -> Bool {
+        let horizontal = abs(translation.width)
+        let vertical = abs(translation.height)
+        guard horizontal > 14 else { return false }
+        return horizontal > vertical * 1.5
     }
 }

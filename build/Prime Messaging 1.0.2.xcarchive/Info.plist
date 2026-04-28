@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>ApplicationProperties</key>
+	<dict>
+		<key>ApplicationPath</key>
+		<string>Applications/Prime Messaging.app</string>
+		<key>Architectures</key>
+		<array>
+			<string>arm64</string>
+		</array>
+		<key>CFBundleIdentifier</key>
+		<string>prime1.prime-Messaging</string>
+		<key>CFBundleShortVersionString</key>
+		<string>1.0.2</string>
+		<key>CFBundleVersion</key>
+		<string>2</string>
+		<key>SigningIdentity</key>
+		<string>Apple Development: m120610@icloud.com (RWQ92882R2)</string>
+		<key>Team</key>
+		<string>8HCKMUYNCN</string>
+	</dict>
+	<key>ArchiveVersion</key>
+	<integer>2</integer>
+	<key>CreationDate</key>
+	<date>2026-04-28T07:50:07Z</date>
+	<key>Name</key>
+	<string>Prime Messaging</string>
+	<key>SchemeName</key>
+	<string>Prime Messaging</string>
+</dict>
+</plist>

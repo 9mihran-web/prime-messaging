@@ -4,6 +4,7 @@ import OSLog
 
 enum ChatRepositoryError: LocalizedError {
     case backendUnavailable
+    case serverRejected(reason: String)
     case chatNotFound
     case userNotFound
     case messageNotFound
@@ -38,11 +39,14 @@ enum ChatRepositoryError: LocalizedError {
     case joinApprovalRequired
     case userBanned
     case officialBadgePermissionDenied
+    case historyImportNotSupported
 
     var errorDescription: String? {
         switch self {
         case .backendUnavailable:
             return "Messaging server is unavailable."
+        case let .serverRejected(reason):
+            return "Server rejected the message (\(reason))."
         case .chatNotFound:
             return "Chat not found."
         case .userNotFound:
@@ -111,6 +115,8 @@ enum ChatRepositoryError: LocalizedError {
             return "This user is banned from the group right now."
         case .officialBadgePermissionDenied:
             return "Only Mihran can mark a channel as official right now."
+        case .historyImportNotSupported:
+            return "This import is supported only for online direct chats right now."
         }
     }
 }
@@ -180,6 +186,14 @@ struct BackendChatRepository: ChatRepository {
                 userID: currentUserID,
                 baseURL: baseURL
             )
+            if let currentUserID {
+                await ChatMessagePageStore.shared.replaceMessages(
+                    mergedMessages,
+                    chatID: chatID,
+                    userID: currentUserID,
+                    mode: mode
+                )
+            }
             return mergedMessages
         } catch {
             if cachedMessages.isEmpty == false {
@@ -247,6 +261,65 @@ struct BackendChatRepository: ChatRepository {
             networkAccessKind: .chatSync,
             fallback: nil
         )
+    }
+
+    func importExternalHistory(_ messages: [Message], into chat: Chat, currentUser: User) async throws -> Chat {
+        guard messages.isEmpty == false else {
+            return await CommunityChatMetadataStore.shared.normalize([chat], ownerUserID: currentUser.id).first ?? chat
+        }
+        guard chat.mode == .online else {
+            throw ChatRepositoryError.historyImportNotSupported
+        }
+
+        let requestBody = try await makeImportHistoryRequest(
+            from: messages,
+            chat: chat,
+            currentUser: currentUser
+        )
+        let response: ImportHistoryResponse = try await request(
+            path: "/chats/\(chat.id.uuidString)/import-history",
+            method: "POST",
+            body: requestBody,
+            userID: currentUser.id,
+            networkAccessKind: requestBody.containsMedia ? .mediaUploads : .chatSync,
+            fallback: nil
+        )
+
+        let normalizedChat = await CommunityChatMetadataStore.shared.normalize([response.chat], ownerUserID: currentUser.id).first ?? response.chat
+        if let baseURL = BackendConfiguration.currentBaseURL {
+            let mergedMessages = mergeMessages(
+                cached: loadCachedMessages(chatID: chat.id, mode: .online, userID: currentUser.id, baseURL: baseURL) ?? [],
+                incoming: response.messages
+            )
+            saveCachedMessages(
+                mergedMessages,
+                chatID: chat.id,
+                mode: .online,
+                userID: currentUser.id,
+                baseURL: baseURL
+            )
+
+            let mergedChats = mergeChats(
+                cached: loadCachedChats(mode: .online, userID: currentUser.id, baseURL: baseURL) ?? [],
+                incoming: [normalizedChat]
+            )
+            saveCachedChats(mergedChats, mode: .online, userID: currentUser.id, baseURL: baseURL)
+        }
+
+        await ChatSnapshotStore.shared.saveMessages(
+            response.messages,
+            chatID: chat.id,
+            userID: currentUser.id,
+            mode: .online
+        )
+        await ChatMessagePageStore.shared.replaceMessages(
+            response.messages,
+            chatID: chat.id,
+            userID: currentUser.id,
+            mode: .online
+        )
+        await ChatSnapshotStore.shared.upsertChat(normalizedChat, userID: currentUser.id, mode: .online)
+        return normalizedChat
     }
 
     func sendMessage(_ text: String, in chatID: UUID, mode: ChatMode, senderID: UUID) async throws -> Message {
@@ -843,6 +916,10 @@ struct BackendChatRepository: ChatRepository {
         }
 
         guard 200 ..< 300 ~= httpResponse.statusCode else {
+            let responseBody = String(data: data, encoding: .utf8) ?? "<non-utf8>"
+            logger.error(
+                "backend.response.invalid status=\(httpResponse.statusCode, privacy: .public) body=\(responseBody, privacy: .public)"
+            )
             throw mappedError(statusCode: httpResponse.statusCode, data: data)
         }
     }
@@ -877,11 +954,71 @@ struct BackendChatRepository: ChatRepository {
             mode: mode.rawValue,
             kind: resolvedKind(for: draft).rawValue,
             attachments: attachments,
+            linkPreview: draft.linkPreview?.isDisabled == true || draft.linkPreview?.selectedURL != nil ? draft.linkPreview : nil,
             voiceMessage: voiceMessage,
             replyToMessageID: draft.replyToMessageID?.uuidString,
             replyPreview: draft.replyPreview,
             communityContext: draft.communityContext?.hasRoutingContext == true ? draft.communityContext : nil,
             deliveryOptions: draft.deliveryOptions.hasAdvancedBehavior ? draft.deliveryOptions : nil
+        )
+    }
+
+    private func makeImportHistoryRequest(
+        from messages: [Message],
+        chat: Chat,
+        currentUser: User
+    ) async throws -> ImportHistoryRequest {
+        let sortedMessages = messages.sorted { lhs, rhs in
+            if lhs.createdAt == rhs.createdAt {
+                return lhs.clientMessageID.uuidString < rhs.clientMessageID.uuidString
+            }
+            return lhs.createdAt < rhs.createdAt
+        }
+
+        var importedMessages: [ImportedMessageRequest] = []
+        importedMessages.reserveCapacity(sortedMessages.count)
+        for message in sortedMessages {
+            var attachments: [SendAttachmentRequest] = []
+            attachments.reserveCapacity(message.attachments.count)
+            for attachment in message.attachments {
+                attachments.append(try await makeSendAttachmentRequest(from: attachment, senderID: currentUser.id))
+            }
+
+            let voiceMessage: SendVoiceMessageRequest?
+            if let messageVoice = message.voiceMessage {
+                voiceMessage = try await makeSendVoiceMessageRequest(from: messageVoice, senderID: currentUser.id)
+            } else {
+                voiceMessage = nil
+            }
+
+            let senderOrigin: ImportedMessageRequest.SenderOrigin
+            if message.kind == .system {
+                senderOrigin = .system
+            } else if message.senderID == currentUser.id {
+                senderOrigin = .selfUser
+            } else {
+                senderOrigin = .counterparty
+            }
+
+            importedMessages.append(
+                ImportedMessageRequest(
+                clientMessageID: message.clientMessageID.uuidString,
+                senderOrigin: senderOrigin,
+                senderDisplayName: message.senderDisplayName,
+                kind: message.kind.rawValue,
+                text: message.text,
+                createdAt: message.createdAt.ISO8601Format(),
+                attachments: attachments,
+                voiceMessage: voiceMessage
+            )
+            )
+        }
+
+        return ImportHistoryRequest(
+            chatID: chat.id.uuidString,
+            importerID: currentUser.id.uuidString,
+            mode: chat.mode.rawValue,
+            messages: importedMessages
         )
     }
 
@@ -891,7 +1028,7 @@ struct BackendChatRepository: ChatRepository {
             : attachment.remoteURL
         let localFileURL = sourceURL?.isFileURL == true ? sourceURL : nil
         if let sourceURL {
-            logMediaUploadPreparation(
+            await logMediaUploadPreparation(
                 label: "attachment.upload.prepare",
                 sourceURL: sourceURL,
                 declaredByteSize: attachment.byteSize,
@@ -949,7 +1086,7 @@ struct BackendChatRepository: ChatRepository {
         let localFileURL = sourceURL?.isFileURL == true ? sourceURL : nil
         let resolvedDurationSeconds: Int
         if let localFileURL {
-            let assetDuration = AVURLAsset(url: localFileURL).duration.seconds
+            let assetDuration = await loadedDurationSeconds(for: localFileURL)
             if assetDuration.isFinite, assetDuration > 0 {
                 resolvedDurationSeconds = max(Int(assetDuration.rounded(.up)), voiceMessage.durationSeconds)
             } else {
@@ -959,7 +1096,7 @@ struct BackendChatRepository: ChatRepository {
             resolvedDurationSeconds = voiceMessage.durationSeconds
         }
         if let sourceURL {
-            logMediaUploadPreparation(
+            await logMediaUploadPreparation(
                 label: "voice.upload.prepare",
                 sourceURL: sourceURL,
                 declaredByteSize: voiceMessage.byteSize,
@@ -1140,13 +1277,19 @@ struct BackendChatRepository: ChatRepository {
         return data.base64EncodedString()
     }
 
-    private func logMediaUploadPreparation(label: String, sourceURL: URL, declaredByteSize: Int64?, kind: String) {
+    private func logMediaUploadPreparation(label: String, sourceURL: URL, declaredByteSize: Int64?, kind: String) async {
         let actualByteSize = Int64((try? sourceURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
-        let asset = AVURLAsset(url: sourceURL)
-        let duration = asset.duration.seconds
+        let duration = await loadedDurationSeconds(for: sourceURL)
         let durationText = duration.isFinite && duration > 0 ? String(format: "%.3f", duration) : "n/a"
         let declaredText = declaredByteSize.map(String.init) ?? "n/a"
         logger.info("\(label, privacy: .public) kind=\(kind, privacy: .public) file=\(sourceURL.lastPathComponent, privacy: .public) actualBytes=\(actualByteSize, privacy: .public) declaredBytes=\(declaredText, privacy: .public) duration=\(durationText, privacy: .public)")
+    }
+
+    private func loadedDurationSeconds(for sourceURL: URL) async -> Double {
+        let asset = AVURLAsset(url: sourceURL)
+        let duration = (try? await asset.load(.duration)) ?? .zero
+        let seconds = duration.seconds
+        return seconds.isFinite ? seconds : 0
     }
 
     private func resolvedKind(for draft: OutgoingMessageDraft) -> MessageKind {
@@ -1178,6 +1321,12 @@ struct BackendChatRepository: ChatRepository {
         let serverError = (try? JSONDecoder().decode(ServerErrorResponse.self, from: data))?.error
 
         switch (statusCode, serverError) {
+        case (401, "invalid_credentials"):
+            return ChatRepositoryError.serverRejected(reason: "invalid_credentials")
+        case (401, "invalid_token"):
+            return ChatRepositoryError.serverRejected(reason: "invalid_token")
+        case (401, "invalid_refresh_token"):
+            return ChatRepositoryError.serverRejected(reason: "invalid_refresh_token")
         case (404, "chat_not_found"):
             return ChatRepositoryError.chatNotFound
         case (404, "user_not_found"):
@@ -1196,12 +1345,26 @@ struct BackendChatRepository: ChatRepository {
             return ChatRepositoryError.groupPermissionDenied
         case (403, "group_invites_blocked"):
             return ChatRepositoryError.groupInvitesBlocked
+        case (403, "channel_posting_restricted"):
+            return ChatRepositoryError.channelPostingRestricted
+        case (403, "chat_admin_blocked"):
+            return ChatRepositoryError.serverRejected(reason: "chat_admin_blocked")
         case (403, "chat_not_public"):
             return ChatRepositoryError.chatNotPublic
         case (403, "user_banned"):
             return ChatRepositoryError.userBanned
         case (403, "official_badge_permission_denied"):
             return ChatRepositoryError.officialBadgePermissionDenied
+        case (409, "group_slow_mode_active"):
+            return ChatRepositoryError.serverRejected(reason: "group_slow_mode_active")
+        case (409, "group_media_restricted"):
+            return ChatRepositoryError.groupMediaRestricted
+        case (409, "group_links_restricted"):
+            return ChatRepositoryError.groupLinksRestricted
+        case (409, "spam_protection_triggered"):
+            return ChatRepositoryError.spamProtectionTriggered
+        case (409, "import_not_supported"):
+            return ChatRepositoryError.historyImportNotSupported
         case (409, "guest_request_pending"):
             return ChatRepositoryError.guestRequestPending
         case (409, "guest_request_approval_required"):
@@ -1231,6 +1394,9 @@ struct BackendChatRepository: ChatRepository {
         case (404, "invite_not_found"):
             return ChatRepositoryError.inviteNotFound
         default:
+            if let serverError, serverError.isEmpty == false {
+                return ChatRepositoryError.serverRejected(reason: serverError)
+            }
             return ChatRepositoryError.backendUnavailable
         }
     }
@@ -1343,7 +1509,17 @@ struct BackendChatRepository: ChatRepository {
     ) async throws -> [Chat] {
         var hydratedChats = chats
 
-        for index in hydratedChats.indices where hydratedChats[index].type == .direct && hydratedChats[index].participants.isEmpty {
+        for index in hydratedChats.indices where hydratedChats[index].type == .direct {
+            let existingDirectParticipant = hydratedChats[index].directParticipant(for: currentUserID)
+            let needsHydration =
+                hydratedChats[index].participants.isEmpty
+                || existingDirectParticipant == nil
+                || existingDirectParticipant?.photoURL == nil
+                || ((existingDirectParticipant?.displayName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
+                    && existingDirectParticipant?.username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false)
+
+            guard needsHydration else { continue }
+
             let participantIDs = hydratedChats[index].participantIDs
             var participants: [ChatParticipant] = []
             for participantID in participantIDs {
@@ -1377,7 +1553,8 @@ struct BackendChatRepository: ChatRepository {
         return ChatParticipant(
             id: user.id,
             username: user.profile.username,
-            displayName: user.profile.displayName
+            displayName: user.profile.displayName,
+            photoURL: user.profile.profilePhotoURL
         )
     }
 
@@ -1461,17 +1638,30 @@ struct BackendChatRepository: ChatRepository {
         networkAccessKind: NetworkUsagePolicy.AccessKind
     ) async throws -> Response {
         try validateNetworkAccess(for: networkAccessKind)
-        let (data, response) = try await BackendRequestTransport.authorizedRequest(
-            baseURL: baseURL,
-            path: path,
-            method: method,
-            body: bodyData,
-            userID: userID,
-            networkAccessKind: networkAccessKind
-        )
-        try validate(response: response, data: data)
-        await BackendTransportStrategyStore.shared.set(.authenticated, for: baseURL)
-        return try decoder.decode(Response.self, from: data)
+        do {
+            let (data, response) = try await BackendRequestTransport.authorizedRequest(
+                baseURL: baseURL,
+                path: path,
+                method: method,
+                body: bodyData,
+                userID: userID,
+                networkAccessKind: networkAccessKind
+            )
+            try validate(response: response, data: data)
+            await BackendTransportStrategyStore.shared.set(.authenticated, for: baseURL)
+            return try decoder.decode(Response.self, from: data)
+        } catch {
+            let (data, response) = try await legacyRequest(
+                baseURL: baseURL,
+                path: path,
+                method: method,
+                body: bodyData,
+                networkAccessKind: networkAccessKind
+            )
+            try validate(response: response, data: data)
+            await BackendTransportStrategyStore.shared.set(.legacy, for: baseURL)
+            return try decoder.decode(Response.self, from: data)
+        }
     }
 
     private func decodeLossyArray<Element: Decodable>(_ type: Element.Type, from data: Data) throws -> [Element] {
@@ -1708,6 +1898,7 @@ private struct SendMessageRequest: Encodable {
     let mode: String
     let kind: String
     let attachments: [SendAttachmentRequest]
+    let linkPreview: MessageLinkPreview?
     let voiceMessage: SendVoiceMessageRequest?
     let replyToMessageID: String?
     let replyPreview: ReplyPreviewSnapshot?
@@ -1725,6 +1916,7 @@ private struct SendMessageRequest: Encodable {
         case mode
         case kind
         case attachments
+        case linkPreview = "link_preview"
         case voiceMessage = "voice_message"
         case replyToMessageID = "reply_to_message_id"
         case replyPreview = "reply_preview"
@@ -1766,6 +1958,64 @@ private struct SendVoiceMessageRequest: Encodable {
         case fileName = "file_name"
         case dataBase64 = "data_base64"
         case remoteURL = "remote_url"
+    }
+}
+
+private struct ImportHistoryRequest: Encodable {
+    let chatID: String
+    let importerID: String
+    let mode: String
+    let messages: [ImportedMessageRequest]
+
+    enum CodingKeys: String, CodingKey {
+        case chatID = "chat_id"
+        case importerID = "importer_id"
+        case mode
+        case messages
+    }
+
+    var containsMedia: Bool {
+        messages.contains { $0.attachments.isEmpty == false || $0.voiceMessage != nil }
+    }
+}
+
+private struct ImportedMessageRequest: Encodable {
+    enum SenderOrigin: String, Encodable {
+        case selfUser = "self"
+        case counterparty
+        case system
+    }
+
+    let clientMessageID: String
+    let senderOrigin: SenderOrigin
+    let senderDisplayName: String?
+    let kind: String
+    let text: String?
+    let createdAt: String
+    let attachments: [SendAttachmentRequest]
+    let voiceMessage: SendVoiceMessageRequest?
+
+    enum CodingKeys: String, CodingKey {
+        case clientMessageID = "client_message_id"
+        case senderOrigin = "sender_origin"
+        case senderDisplayName = "sender_display_name"
+        case kind
+        case text
+        case createdAt = "created_at"
+        case attachments
+        case voiceMessage = "voice_message"
+    }
+}
+
+private struct ImportHistoryResponse: Decodable {
+    let chat: Chat
+    let messages: [Message]
+    let importedCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case chat
+        case messages
+        case importedCount = "imported_count"
     }
 }
 
@@ -1840,6 +2090,7 @@ private struct CommunityChatDetailsRequest: Encodable {
     let isPublic: Bool
     let topics: [CommunityTopicRequest]
     let inviteCode: String?
+    let publicHandle: String?
     let isOfficial: Bool
 
     nonisolated init(_ details: CommunityChatDetails) {
@@ -1849,6 +2100,7 @@ private struct CommunityChatDetailsRequest: Encodable {
         isPublic = details.isPublic
         topics = details.topics.map(CommunityTopicRequest.init)
         inviteCode = details.inviteCode
+        publicHandle = details.publicHandle
         isOfficial = details.isOfficial
     }
 
@@ -1859,6 +2111,7 @@ private struct CommunityChatDetailsRequest: Encodable {
         case isPublic = "is_public"
         case topics
         case inviteCode = "invite_code"
+        case publicHandle = "public_handle"
         case isOfficial = "is_official"
     }
 }

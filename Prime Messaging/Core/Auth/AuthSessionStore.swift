@@ -7,6 +7,9 @@ actor AuthSessionStore {
     private enum Constants {
         static let service = "miro.Prime-Messaging"
         static let account = "auth.sessions"
+        static let appGroupIdentifier = "group.prime1.prime-Messaging.shared"
+        static let rootDirectoryName = "IncomingShare"
+        static let mirroredSessionsFileName = "auth-sessions.json"
     }
 
     private let encoder = JSONEncoder()
@@ -54,12 +57,15 @@ actor AuthSessionStore {
             return [:]
         }
 
+        writeMirroredSessionData(data)
+
         return sessions
     }
 
     private func saveSessions(_ sessions: [String: AuthSession]) {
         guard let data = try? encoder.encode(sessions) else { return }
         writeKeychainData(data)
+        writeMirroredSessionData(data)
     }
 
     private func readKeychainData() -> Data? {
@@ -101,5 +107,20 @@ actor AuthSessionStore {
         insertQuery[kSecValueData as String] = data
         insertQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         SecItemAdd(insertQuery as CFDictionary, nil)
+    }
+
+    private func writeMirroredSessionData(_ data: Data) {
+        guard let mirroredSessionsURL = mirroredSessionsURL() else { return }
+        try? data.write(to: mirroredSessionsURL, options: .atomic)
+    }
+
+    private func mirroredSessionsURL() -> URL? {
+        let fileManager = FileManager.default
+        guard let containerURL = fileManager.containerURL(forSecurityApplicationGroupIdentifier: Constants.appGroupIdentifier) else {
+            return nil
+        }
+        let directory = containerURL.appendingPathComponent(Constants.rootDirectoryName, isDirectory: true)
+        try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory.appendingPathComponent(Constants.mirroredSessionsFileName, isDirectory: false)
     }
 }

@@ -69,6 +69,12 @@ struct NearbyAccessView: View {
             showsHomeNearbyPeers = preferences.showHomeCard
             nearbyPeersOfflineOnly = preferences.offlineOnly
         }
+        .onDisappear {
+            guard appState.selectedMode == .online, appState.isEmergencyModeEnabled == false else { return }
+            Task {
+                await environment.offlineTransport.stopScanning()
+            }
+        }
     }
 
     @MainActor

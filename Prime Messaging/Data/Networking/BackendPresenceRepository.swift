@@ -36,6 +36,10 @@ struct BackendPresenceRepository: PresenceRepository {
             return user.id
         }
 
-        return await AuthSessionStore.shared.mostRecentSession()?.userID
+        let sessions = await AuthSessionStore.shared.allSessions()
+        if sessions.count == 1, let session = sessions.first {
+            return session.userID
+        }
+        return nil
     }
 }

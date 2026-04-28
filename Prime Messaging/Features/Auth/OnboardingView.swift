@@ -1,6 +1,9 @@
 #if canImport(Contacts)
 import Contacts
 #endif
+#if canImport(AuthenticationServices)
+import AuthenticationServices
+#endif
 import SwiftUI
 
 struct OnboardingView: View {
@@ -23,7 +26,10 @@ struct OnboardingView: View {
 
     private enum Step: String {
         case entry
+        case signupEmail
+        case otp
         case password
+        case resetPasswordEmailOTP
         case createPassword
         case resetPassword
         case profile
@@ -39,19 +45,86 @@ struct OnboardingView: View {
     }
 
     private enum PendingIdentifierKind: String {
-        case phone
         case username
         case email
 
         var title: String {
             switch self {
-            case .phone:
-                return "Phone"
             case .username:
                 return "Username"
             case .email:
                 return "E-mail"
             }
+        }
+    }
+
+    private enum LoginCredentialMode: String {
+        case password
+        case otp
+
+        var title: String {
+            switch self {
+            case .password:
+                return "Password"
+            case .otp:
+                return "OTP"
+            }
+        }
+    }
+
+    private enum EntryActionTone {
+        case primary
+        case secondary
+    }
+
+    private struct EntryActionButtonStyle: ButtonStyle {
+        let tone: EntryActionTone
+        @Environment(\.isEnabled) private var isEnabled
+
+        func makeBody(configuration: Configuration) -> some View {
+            configuration.label
+                .font(.headline.weight(.semibold))
+                .foregroundStyle(foregroundColor)
+                .frame(maxWidth: .infinity)
+                .frame(height: 50)
+                .background(backgroundColor(isPressed: configuration.isPressed))
+                .overlay(
+                    RoundedRectangle(cornerRadius: PrimeTheme.Radius.card, style: .continuous)
+                        .stroke(borderColor(isPressed: configuration.isPressed), lineWidth: tone == .secondary ? 1 : 0)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: PrimeTheme.Radius.card, style: .continuous))
+                .animation(.easeOut(duration: 0.15), value: configuration.isPressed)
+        }
+
+        private var foregroundColor: Color {
+            switch tone {
+            case .primary:
+                return .white
+            case .secondary:
+                return isEnabled ? PrimeTheme.Colors.textPrimary : PrimeTheme.Colors.textSecondary
+            }
+        }
+
+        private func backgroundColor(isPressed: Bool) -> Color {
+            let base: Color = {
+                switch tone {
+                case .primary:
+                    return PrimeTheme.Colors.accent
+                case .secondary:
+                    return PrimeTheme.Colors.elevated
+                }
+            }()
+
+            guard isEnabled else {
+                return base.opacity(0.45)
+            }
+            return isPressed ? base.opacity(0.82) : base
+        }
+
+        private func borderColor(isPressed: Bool) -> Color {
+            guard tone == .secondary else { return .clear }
+            guard isEnabled else { return PrimeTheme.Colors.separator.opacity(0.24) }
+            return isPressed ? PrimeTheme.Colors.separator.opacity(0.28) : PrimeTheme.Colors.separator.opacity(0.42)
         }
     }
 
@@ -76,10 +149,14 @@ struct OnboardingView: View {
     @Environment(\.appEnvironment) private var environment
     @EnvironmentObject private var appState: AppState
 
+    private let restoresPersistedDraft: Bool
+
     @State private var mode: FlowMode = .standard
     @State private var step: Step = .entry
     @State private var selectedCountry = CountryDialCode.default
     @State private var localIdentifierInput = ""
+    @State private var usernameInput = ""
+    @State private var useUsernameLogin = false
     @State private var email = ""
     @State private var passwordInput = ""
     @State private var confirmPasswordInput = ""
@@ -89,14 +166,28 @@ struct OnboardingView: View {
     @State private var bio = ""
     @State private var birthDate = Calendar.autoupdatingCurrent.date(byAdding: .year, value: -18, to: .now) ?? .now
     @State private var pendingIdentifier = ""
+    @State private var pendingPostResetLoginIdentifier = ""
     @State private var pendingContactValue = ""
-    @State private var pendingIdentifierKind: PendingIdentifierKind = .phone
+    @State private var pendingIdentifierKind: PendingIdentifierKind = .email
     @State private var pendingLookup: AccountLookupResult?
     @State private var authError = ""
     @State private var isSubmitting = false
+    @State private var isSigningWithApple = false
+    @State private var isContactSyncEnabled = true
+    @State private var otpCodeInput = ""
+    @State private var loginCredentialMode: LoginCredentialMode = .password
+    @State private var pendingOTPChallenge: OTPChallenge?
+    @State private var pendingOTPPurpose: OTPPurpose?
+    @State private var pendingVerifiedSignupOTPChallengeID: String?
+    @State private var pendingVerifiedResetOTPChallengeID: String?
+    @State private var pendingAppleNewUserID: UUID?
     @State private var usernameAvailability: UsernameAvailability = .idle
     @State private var hasRestoredPersistedState = false
     @State private var onboardingPersistenceTask: Task<Void, Never>?
+
+    init(restoresPersistedDraft: Bool = false) {
+        self.restoresPersistedDraft = restoresPersistedDraft
+    }
 
     var body: some View {
         ScrollView {
@@ -106,8 +197,14 @@ struct OnboardingView: View {
                 switch step {
                 case .entry:
                     entryStep
+                case .signupEmail:
+                    signupEmailStep
+                case .otp:
+                    otpStep
                 case .password:
                     passwordStep
+                case .resetPasswordEmailOTP:
+                    resetPasswordEmailOTPStep
                 case .createPassword:
                     createPasswordStep
                 case .resetPassword:
@@ -141,6 +238,14 @@ struct OnboardingView: View {
             if normalized != newValue {
                 username = normalized
             }
+        }
+        .onChange(of: localIdentifierInput) { _ in
+            guard step == .entry else { return }
+            clearPendingLookupState()
+        }
+        .onChange(of: usernameInput) { _ in
+            guard step == .entry else { return }
+            clearPendingLookupState()
         }
         .onDisappear {
             onboardingPersistenceTask?.cancel()
@@ -176,7 +281,7 @@ struct OnboardingView: View {
     private var entryStep: some View {
         VStack(alignment: .leading, spacing: 22) {
             VStack(alignment: .leading, spacing: 10) {
-                Text(mode == .offlineOnly ? "Offline-Only Access" : "Enter Phone Number Or Username")
+                Text(mode == .offlineOnly ? "Offline-Only Access" : "Enter E-mail Or Username")
                     .font(.system(size: 34, weight: .bold, design: .rounded))
                     .foregroundStyle(PrimeTheme.Colors.textPrimary)
 
@@ -186,40 +291,57 @@ struct OnboardingView: View {
             }
 
             if mode == .standard {
-                HStack(spacing: 12) {
-                    Menu {
-                        ForEach(CountryDialCode.all) { country in
-                            Button("\(country.name) \(country.code)") {
-                                selectedCountry = country
-                            }
-                        }
-                    } label: {
-                        HStack(spacing: 8) {
-                            Text(selectedCountry.code)
-                                .font(.headline)
-                            Image(systemName: "chevron.down")
-                                .font(.caption.weight(.semibold))
-                        }
-                        .foregroundStyle(PrimeTheme.Colors.textPrimary)
-                        .frame(width: 112)
-                        .frame(minHeight: 58)
-                        .background(PrimeTheme.Colors.elevated)
-                        .clipShape(RoundedRectangle(cornerRadius: PrimeTheme.Radius.card, style: .continuous))
-                    }
-                    .buttonStyle(.plain)
+                TextField(useUsernameLogin ? "Username" : "E-mail", text: useUsernameLogin ? $usernameInput : $localIdentifierInput)
+                    .keyboardType(useUsernameLogin ? .asciiCapable : .emailAddress)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .padding(PrimeTheme.Spacing.large)
+                    .background(PrimeTheme.Colors.elevated)
+                    .clipShape(RoundedRectangle(cornerRadius: PrimeTheme.Radius.card, style: .continuous))
 
-                    TextField("Phone number or username", text: $localIdentifierInput)
-                        .keyboardType(.asciiCapable)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .padding(PrimeTheme.Spacing.large)
-                        .background(PrimeTheme.Colors.elevated)
-                        .clipShape(RoundedRectangle(cornerRadius: PrimeTheme.Radius.card, style: .continuous))
-                }
-
-                Text("Use phone in international format like +37499111222, or enter a username like @prime_user.")
+                Text(useUsernameLogin
+                    ? "Use your username like @prime_user. Existing users only."
+                    : "Use your account e-mail. New users continue through e-mail OTP verification.")
                     .font(.footnote)
                     .foregroundStyle(PrimeTheme.Colors.textSecondary)
+
+                if shouldShowIdentifierSwitchButton {
+                    Button(useUsernameLogin ? "Continue With E-mail" : "Continue With Username") {
+                        authError = ""
+                        useUsernameLogin.toggle()
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(PrimeTheme.Colors.textPrimary)
+                }
+
+                Toggle(isOn: $isContactSyncEnabled) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Sync Contacts")
+                            .font(.headline)
+                            .foregroundStyle(PrimeTheme.Colors.textPrimary)
+                        Text("Import your contacts on first login.")
+                            .font(.footnote)
+                            .foregroundStyle(PrimeTheme.Colors.textSecondary)
+                    }
+                }
+                .toggleStyle(.switch)
+                .padding(PrimeTheme.Spacing.large)
+                .background(PrimeTheme.Colors.elevated)
+                .clipShape(RoundedRectangle(cornerRadius: PrimeTheme.Radius.card, style: .continuous))
+
+                #if canImport(AuthenticationServices) && !os(tvOS) && !os(watchOS)
+                SignInWithAppleButton(.continue) { request in
+                    configureAppleSignIn(request: request)
+                } onCompletion: { result in
+                    handleAppleSignInResult(result)
+                }
+                .signInWithAppleButtonStyle(.black)
+                .frame(maxWidth: .infinity)
+                .frame(maxWidth: 375)
+                .frame(height: 50)
+                .clipShape(RoundedRectangle(cornerRadius: PrimeTheme.Radius.card, style: .continuous))
+                .disabled(isSubmitting || isSigningWithApple)
+                #endif
             } else {
                 TextField("E-mail", text: $email)
                     .keyboardType(.emailAddress)
@@ -229,29 +351,27 @@ struct OnboardingView: View {
                     .background(PrimeTheme.Colors.elevated)
                     .clipShape(RoundedRectangle(cornerRadius: PrimeTheme.Radius.card, style: .continuous))
 
-                Text("Phone number is not required for offline-only accounts. E-mail is mandatory.")
+                Text("E-mail is mandatory for offline-only accounts.")
                     .font(.footnote)
                     .foregroundStyle(PrimeTheme.Colors.textSecondary)
             }
 
-            Button(isSubmitting ? "Continuing..." : entryPrimaryButtonTitle) {
+            Button(isSubmitting ? "Continuing..." : "Continue") {
                 Task {
                     await continueFromEntry()
                 }
             }
-            .buttonStyle(.borderedProminent)
-            .tint(PrimeTheme.Colors.accent)
-            .disabled(isSubmitting || isEntryDisabled)
+            .buttonStyle(EntryActionButtonStyle(tone: .primary))
+            .disabled(isSubmitting || isSigningWithApple || isEntryDisabled)
 
             if mode == .standard {
-                Button("I Will Use Only Offline Mode") {
+                Button("Continue Offline") {
                     authError = ""
                     mode = .offlineOnly
                     email = ""
                     clearPasswordDrafts()
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(PrimeTheme.Colors.textPrimary)
+                .buttonStyle(EntryActionButtonStyle(tone: .secondary))
 
                 Button("Guest Mode") {
                     authError = ""
@@ -260,16 +380,14 @@ struct OnboardingView: View {
                     displayName = ""
                     clearPasswordDrafts()
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(PrimeTheme.Colors.textPrimary)
+                .buttonStyle(EntryActionButtonStyle(tone: .secondary))
             } else {
-                Button("Use Phone Number Instead") {
+                Button("Use E-mail Login") {
                     authError = ""
                     mode = .standard
                     clearPasswordDrafts()
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(PrimeTheme.Colors.textPrimary)
+                .buttonStyle(EntryActionButtonStyle(tone: .secondary))
 
                 Button("Guest Mode") {
                     authError = ""
@@ -278,8 +396,7 @@ struct OnboardingView: View {
                     displayName = ""
                     clearPasswordDrafts()
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(PrimeTheme.Colors.textPrimary)
+                .buttonStyle(EntryActionButtonStyle(tone: .secondary))
             }
         }
     }
@@ -318,7 +435,7 @@ struct OnboardingView: View {
                     authError = ""
                     passwordInput = ""
                     confirmPasswordInput = ""
-                    step = .resetPassword
+                    step = .resetPasswordEmailOTP
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(PrimeTheme.Colors.textPrimary)
@@ -329,25 +446,39 @@ struct OnboardingView: View {
                     authError = ""
                     passwordInput = ""
                     confirmPasswordInput = ""
-                    step = .resetPassword
+                    step = .resetPasswordEmailOTP
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(PrimeTheme.Colors.accent)
             }
 
             if mode == .standard {
-                if pendingIdentifierKind == .phone {
+                if pendingIdentifierKind == .email {
                     Button("Create New Account") {
                         authError = ""
                         pendingLookup = nil
                         clearPasswordDrafts()
-                        seedProfileDraftIfNeeded()
-                        step = .createPassword
+                        Task {
+                            let challenge = try? await environment.authRepository.requestOTP(
+                                identifier: pendingIdentifier,
+                                purpose: .signup
+                            )
+                            await MainActor.run {
+                                if let challenge {
+                                    pendingOTPChallenge = challenge
+                                    pendingOTPPurpose = .signup
+                                    otpCodeInput = ""
+                                    step = .otp
+                                } else {
+                                    authError = "Could not request OTP."
+                                }
+                            }
+                        }
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(PrimeTheme.Colors.textPrimary)
                 } else {
-                    Button("Use Phone Number To Register") {
+                    Button("Use E-mail To Register") {
                         authError = ""
                         step = .entry
                     }
@@ -355,6 +486,116 @@ struct OnboardingView: View {
                     .foregroundStyle(PrimeTheme.Colors.textPrimary)
                 }
             }
+        }
+    }
+
+    private var signupEmailStep: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Enter E-mail")
+                    .font(.system(size: 34, weight: .bold, design: .rounded))
+                    .foregroundStyle(PrimeTheme.Colors.textPrimary)
+
+                Text("E-mail is required for registration and recovery.")
+                    .font(.title3)
+                    .foregroundStyle(PrimeTheme.Colors.textSecondary)
+            }
+
+            TextField("E-mail", text: $email)
+                .keyboardType(.emailAddress)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .padding(PrimeTheme.Spacing.large)
+                .background(PrimeTheme.Colors.elevated)
+                .clipShape(RoundedRectangle(cornerRadius: PrimeTheme.Radius.card, style: .continuous))
+
+            Button(isSubmitting ? "Sending..." : "Send OTP To E-mail") {
+                Task {
+                    await requestSignupEmailOTP()
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(PrimeTheme.Colors.accent)
+            .disabled(isSubmitting || appState.isValidEmail(email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) == false)
+        }
+    }
+
+    private var otpStep: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Enter Verification Code")
+                    .font(.system(size: 34, weight: .bold, design: .rounded))
+                    .foregroundStyle(PrimeTheme.Colors.textPrimary)
+
+                Text("We sent an OTP code to \(pendingOTPChallenge?.destinationMasked ?? pendingContactValue).")
+                    .font(.title3)
+                    .foregroundStyle(PrimeTheme.Colors.textSecondary)
+            }
+
+            infoField(title: pendingIdentifierKind.title, value: pendingContactValue)
+
+            TextField("OTP Code", text: $otpCodeInput)
+                .keyboardType(.numberPad)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .padding(PrimeTheme.Spacing.large)
+                .background(PrimeTheme.Colors.elevated)
+                .clipShape(RoundedRectangle(cornerRadius: PrimeTheme.Radius.card, style: .continuous))
+
+            if let challenge = pendingOTPChallenge {
+                Text(otpMetaText(for: challenge))
+                    .font(.footnote)
+                    .foregroundStyle(PrimeTheme.Colors.textSecondary)
+            }
+
+            Button(isSubmitting ? "Verifying..." : "Verify And Continue") {
+                Task {
+                    await verifyOTPAndContinue()
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(PrimeTheme.Colors.accent)
+            .disabled(isSubmitting || otpCodeInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+            Button("Resend Code") {
+                Task {
+                    await resendOTPCode()
+                }
+            }
+            .buttonStyle(.bordered)
+            .tint(PrimeTheme.Colors.textPrimary)
+            .disabled(isSubmitting || canResendOTP == false)
+        }
+    }
+
+    private var resetPasswordEmailOTPStep: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Reset Password")
+                    .font(.system(size: 34, weight: .bold, design: .rounded))
+                    .foregroundStyle(PrimeTheme.Colors.textPrimary)
+
+                Text("Enter your account e-mail. We will send OTP to continue password reset.")
+                    .font(.title3)
+                    .foregroundStyle(PrimeTheme.Colors.textSecondary)
+            }
+
+            TextField("E-mail", text: $email)
+                .keyboardType(.emailAddress)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .padding(PrimeTheme.Spacing.large)
+                .background(PrimeTheme.Colors.elevated)
+                .clipShape(RoundedRectangle(cornerRadius: PrimeTheme.Radius.card, style: .continuous))
+
+            Button(isSubmitting ? "Sending..." : "Send OTP To E-mail") {
+                Task {
+                    await requestResetPasswordEmailOTP()
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(PrimeTheme.Colors.accent)
+            .disabled(isSubmitting || appState.isValidEmail(email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) == false)
         }
     }
 
@@ -503,7 +744,7 @@ struct OnboardingView: View {
                 .background(PrimeTheme.Colors.elevated)
                 .clipShape(RoundedRectangle(cornerRadius: PrimeTheme.Radius.card, style: .continuous))
 
-            Button(isSubmitting ? "Creating..." : "Create Account") {
+            Button(isSubmitting ? "Saving..." : profilePrimaryButtonTitle) {
                 Task {
                     await submitProfileRegistration()
                 }
@@ -550,40 +791,45 @@ struct OnboardingView: View {
     private var entrySubtitle: String {
         switch mode {
         case .standard:
-            return "Enter your phone number or username. Existing accounts go to password entry, and new phone numbers continue to account creation."
+            return "Use e-mail or Continue with Username. Existing users go to password, new users continue to e-mail OTP."
         case .offlineOnly:
-            return "This path skips phone login. E-mail is required and the account starts in offline mode."
+            return "E-mail is required and the account starts in offline mode."
         case .guest:
             return "Temporary guest access."
         }
     }
 
-    private var entryPrimaryButtonTitle: String {
-        if mode == .standard, standardEntryLooksLikeUsername {
-            return "Continue"
-        }
-        return mode == .standard ? "Sync Contacts And Continue" : "Continue"
-    }
-
     private var passwordSubtitle: String {
-        if let displayName = pendingLookup?.displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
-           displayName.isEmpty == false {
-            return "Welcome back, \(displayName)."
-        }
         switch pendingIdentifierKind {
-        case .phone:
-            return pendingLookup?.exists == false
-                ? "This phone number looks new. You can create a new account or try an existing password."
-                : "Enter the password for this phone number."
         case .username:
+            let usernameValue = pendingIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+            if usernameValue.isEmpty == false {
+                return "Enter the password for @\(usernameValue)."
+            }
             return "Enter the password for this username."
         case .email:
+            let emailValue = pendingIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+            if emailValue.isEmpty == false {
+                return "Enter the password for \(emailValue)."
+            }
             return "Enter the password for this e-mail."
         }
     }
 
     private var canGoBack: Bool {
         step != .entry || mode != .standard
+    }
+
+    private var shouldShowIdentifierSwitchButton: Bool {
+        if useUsernameLogin {
+            return usernameInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return localIdentifierInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var canResendOTP: Bool {
+        guard let challenge = pendingOTPChallenge else { return false }
+        return Date.now >= challenge.resendAvailableAt
     }
 
     private var isEntryDisabled: Bool {
@@ -602,12 +848,21 @@ struct OnboardingView: View {
         return trimmedPassword.isEmpty || confirmPasswordInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    private var isAppleProfileCompletionFlow: Bool {
+        pendingAppleNewUserID != nil
+    }
+
+    private var profilePrimaryButtonTitle: String {
+        isAppleProfileCompletionFlow ? "Finish Setup" : "Create Account"
+    }
+
     private var isProfileDisabled: Bool {
         let normalizedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let emailIsValid = mode == .standard ? appState.isValidEmail(normalizedEmail) : true
+        let requiresPassword = isAppleProfileCompletionFlow == false
 
         return displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-            pendingPassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+            (requiresPassword && pendingPassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) ||
             appState.isValidUsername(username) == false ||
             usernameAvailability != .available ||
             emailIsValid == false
@@ -645,14 +900,13 @@ struct OnboardingView: View {
         }
     }
 
-    private var standardEntryLooksLikeUsername: Bool {
-        isUsernameLikeEntry(localIdentifierInput)
-    }
+    private var standardEntryLooksLikeUsername: Bool { useUsernameLogin }
 
     private var persistedOnboardingState: OnboardingProgressStore.StoredState {
         OnboardingProgressStore.StoredState(
             modeRawValue: mode.rawValue,
             stepRawValue: step.rawValue,
+            isContactSyncEnabled: isContactSyncEnabled,
             selectedCountryCode: selectedCountry.code,
             localIdentifierInput: localIdentifierInput,
             email: email,
@@ -663,6 +917,7 @@ struct OnboardingView: View {
             pendingIdentifier: pendingIdentifier,
             pendingContactValue: pendingContactValue,
             pendingIdentifierKindRawValue: pendingIdentifierKind.rawValue,
+            loginCredentialModeRawValue: loginCredentialMode.rawValue,
             pendingLookup: pendingLookup.map {
                 OnboardingProgressStore.StoredLookup(
                     exists: $0.exists,
@@ -688,18 +943,17 @@ struct OnboardingView: View {
     }
 
     private func resolvedStandardEntry() -> (identifier: String, contactValue: String, kind: PendingIdentifierKind)? {
-        let trimmed = localIdentifierInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.isEmpty == false else { return nil }
-
-        if isUsernameLikeEntry(trimmed) {
+        if useUsernameLogin {
+            let trimmed = usernameInput.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.isEmpty == false else { return nil }
             let normalizedUsername = normalizedUsernameEntry(trimmed)
             guard appState.isValidLegacyUsername(normalizedUsername) else { return nil }
             return (normalizedUsername, "@\(normalizedUsername)", .username)
         }
 
-        let fullPhoneNumber = appState.normalizedInternationalPhoneNumber(countryCode: selectedCountry.code, localNumber: trimmed)
-        guard appState.isValidInternationalPhoneNumber(fullPhoneNumber) else { return nil }
-        return (fullPhoneNumber, fullPhoneNumber, .phone)
+        let normalizedEmail = localIdentifierInput.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard appState.isValidEmail(normalizedEmail) else { return nil }
+        return (normalizedEmail, normalizedEmail, .email)
     }
 
     @ViewBuilder
@@ -718,11 +972,80 @@ struct OnboardingView: View {
         .clipShape(RoundedRectangle(cornerRadius: PrimeTheme.Radius.card, style: .continuous))
     }
 
+    #if canImport(AuthenticationServices) && !os(tvOS) && !os(watchOS)
+    private func configureAppleSignIn(request: ASAuthorizationAppleIDRequest) {
+        request.requestedScopes = [.fullName, .email]
+    }
+
+    private func handleAppleSignInResult(_ result: Result<ASAuthorization, Error>) {
+        Task {
+            await submitAppleSignIn(result)
+        }
+    }
+
+    @MainActor
+    private func submitAppleSignIn(_ result: Result<ASAuthorization, Error>) async {
+        isSigningWithApple = true
+        authError = ""
+        defer { isSigningWithApple = false }
+
+        switch result {
+        case .failure(let error):
+            if let authorizationError = error as? ASAuthorizationError,
+               authorizationError.code == .canceled {
+                return
+            }
+            authError = error.localizedDescription.isEmpty ? "Sign in with Apple failed." : error.localizedDescription
+            return
+        case .success(let authorization):
+            guard let credential = authorization.credential as? ASAuthorizationAppleIDCredential else {
+                authError = "Sign in with Apple failed."
+                return
+            }
+            guard let tokenData = credential.identityToken,
+                  let identityToken = String(data: tokenData, encoding: .utf8),
+                  identityToken.isEmpty == false else {
+                authError = "Could not read Apple identity token."
+                return
+            }
+
+            if isContactSyncEnabled {
+                await requestContactsAccessIfNeeded()
+            }
+
+            let authorizationCode = credential.authorizationCode.flatMap { String(data: $0, encoding: .utf8) }
+            let email = credential.email?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let givenName = credential.fullName?.givenName?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let familyName = credential.fullName?.familyName?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            do {
+                let result = try await environment.authRepository.signInWithApple(
+                    identityToken: identityToken,
+                    authorizationCode: authorizationCode,
+                    appleUserID: credential.user,
+                    email: email,
+                    givenName: givenName,
+                    familyName: familyName
+                )
+                clearPasswordDrafts()
+                if result.isNewUser {
+                    prepareAppleProfileCompletion(using: result.user)
+                } else {
+                    await finalizeAuthentication(with: result.user)
+                }
+            } catch {
+                authError = error.localizedDescription.isEmpty ? "Sign in with Apple failed." : error.localizedDescription
+            }
+        }
+    }
+    #endif
+
     @MainActor
     private func continueFromEntry() async {
         isSubmitting = true
         authError = ""
         defer { isSubmitting = false }
+        clearPendingLookupState()
 
         let resolvedEntry: (identifier: String, contactValue: String, kind: PendingIdentifierKind)
         switch mode {
@@ -730,11 +1053,11 @@ struct OnboardingView: View {
             guard let standardEntry = resolvedStandardEntry() else {
                 authError = standardEntryLooksLikeUsername
                     ? "Enter a valid username using 3-32 symbols with only a-z, 0-9, or _."
-                    : "Enter the phone number in international format, for example +37499111222."
+                    : "Enter a valid e-mail address."
                 return
             }
             resolvedEntry = standardEntry
-            if standardEntry.kind == .phone {
+            if standardEntry.kind == .email, isContactSyncEnabled {
                 await requestContactsAccessIfNeeded()
             }
         case .offlineOnly:
@@ -752,26 +1075,47 @@ struct OnboardingView: View {
         pendingIdentifier = resolvedEntry.identifier
         pendingContactValue = resolvedEntry.contactValue
         pendingIdentifierKind = resolvedEntry.kind
+        pendingVerifiedSignupOTPChallengeID = nil
 
         do {
-            pendingLookup = try await environment.authRepository.lookupAccount(identifier: resolvedEntry.identifier)
+            do {
+                pendingLookup = try await environment.authRepository.lookupAccount(identifier: resolvedEntry.identifier)
+            } catch let authError as AuthRepositoryError {
+                // Some backend builds may return 404 for lookup even for "not exists".
+                // For phone/email entry we should continue into signup OTP instead of hard failing.
+                if case .accountNotFound = authError, resolvedEntry.kind != .username {
+                    pendingLookup = AccountLookupResult(exists: false, accountKind: nil, displayName: nil)
+                } else {
+                    throw authError
+                }
+            }
             clearPasswordDrafts()
+
+            if resolvedEntry.kind == .username {
+                if pendingLookup?.exists == true {
+                    step = .password
+                } else {
+                    authError = "This username was not found. Enter your e-mail to create a new account."
+                }
+                return
+            }
 
             if pendingLookup?.exists == true {
                 step = .password
             } else {
-                if resolvedEntry.kind == .username {
-                    authError = "This username was not found. Enter a phone number to create a new account."
-                    return
-                }
-
-                step = .createPassword
-                seedProfileDraftIfNeeded()
+                let challenge = try await environment.authRepository.requestOTP(
+                    identifier: resolvedEntry.identifier,
+                    purpose: .signup
+                )
+                pendingOTPChallenge = challenge
+                pendingOTPPurpose = .signup
+                otpCodeInput = ""
+                step = .otp
             }
         } catch {
             pendingLookup = nil
             clearPasswordDrafts()
-            step = .password
+            authError = error.localizedDescription.isEmpty ? "Could not continue." : error.localizedDescription
         }
     }
 
@@ -787,11 +1131,138 @@ struct OnboardingView: View {
             return
         }
 
+        print("auth.login.attempt identifier=\(pendingIdentifier) kind=\(pendingIdentifierKind.rawValue)")
         do {
             let user = try await environment.authRepository.logIn(identifier: pendingIdentifier, password: trimmedPassword)
+            print("auth.login.success identifier=\(pendingIdentifier) user_id=\(user.id.uuidString)")
             await finalizeAuthentication(with: user)
         } catch {
+            print("auth.login.failed identifier=\(pendingIdentifier) reason=\(error.localizedDescription)")
             authError = error.localizedDescription.isEmpty ? "Could not sign in." : error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func submitOTPLogin() async {
+        isSubmitting = true
+        authError = ""
+        defer { isSubmitting = false }
+
+        let trimmedOTP = otpCodeInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedOTP.isEmpty == false else {
+            authError = "Enter OTP code."
+            return
+        }
+
+        do {
+            if let user = try await environment.authRepository.authenticate(
+                identifier: pendingIdentifier,
+                otpCode: trimmedOTP,
+                challengeID: pendingOTPChallenge?.challengeID
+            ) {
+                await finalizeAuthentication(with: user)
+            } else {
+                authError = "Account not found for this identifier."
+            }
+        } catch {
+            authError = error.localizedDescription.isEmpty ? "Could not sign in with OTP." : error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func verifyOTPAndContinue() async {
+        let purpose = pendingOTPPurpose ?? .signup
+        switch purpose {
+        case .login, .signup:
+            await verifySignupOTPAndContinue()
+        case .resetPassword:
+            await verifyResetOTPAndContinue()
+        }
+    }
+
+    @MainActor
+    private func verifySignupOTPAndContinue() async {
+        isSubmitting = true
+        authError = ""
+        defer { isSubmitting = false }
+
+        let trimmedOTP = otpCodeInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedOTP.isEmpty == false else {
+            authError = "Enter OTP code."
+            return
+        }
+        guard let challengeID = pendingOTPChallenge?.challengeID else {
+            authError = "OTP challenge is missing. Request a new code."
+            step = .entry
+            return
+        }
+
+        do {
+            let verifiedChallenge = try await environment.authRepository.verifyOTPChallenge(
+                challengeID: challengeID,
+                otpCode: trimmedOTP
+            )
+            pendingOTPChallenge = verifiedChallenge
+            pendingVerifiedSignupOTPChallengeID = verifiedChallenge.challengeID
+            otpCodeInput = ""
+            step = .createPassword
+            seedProfileDraftIfNeeded()
+        } catch {
+            authError = error.localizedDescription.isEmpty ? "OTP verification failed." : error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func verifyResetOTPAndContinue() async {
+        isSubmitting = true
+        authError = ""
+        defer { isSubmitting = false }
+
+        let trimmedOTP = otpCodeInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedOTP.isEmpty == false else {
+            authError = "Enter OTP code."
+            return
+        }
+        guard let challengeID = pendingOTPChallenge?.challengeID else {
+            authError = "OTP challenge is missing. Request a new code."
+            step = .resetPasswordEmailOTP
+            return
+        }
+
+        do {
+            let verifiedChallenge = try await environment.authRepository.verifyOTPChallenge(
+                challengeID: challengeID,
+                otpCode: trimmedOTP
+            )
+            pendingOTPChallenge = verifiedChallenge
+            pendingVerifiedResetOTPChallengeID = verifiedChallenge.challengeID
+            otpCodeInput = ""
+            step = .resetPassword
+        } catch {
+            authError = error.localizedDescription.isEmpty ? "OTP verification failed." : error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func resendOTPCode() async {
+        guard canResendOTP else { return }
+        guard let purpose = pendingOTPPurpose else {
+            step = .entry
+            return
+        }
+        isSubmitting = true
+        authError = ""
+        defer { isSubmitting = false }
+
+        do {
+            let challenge = try await environment.authRepository.requestOTP(
+                identifier: pendingIdentifier,
+                purpose: purpose
+            )
+            pendingOTPChallenge = challenge
+            otpCodeInput = ""
+        } catch {
+            authError = error.localizedDescription.isEmpty ? "Could not resend OTP." : error.localizedDescription
         }
     }
 
@@ -819,6 +1290,67 @@ struct OnboardingView: View {
     }
 
     @MainActor
+    private func requestSignupEmailOTP() async {
+        isSubmitting = true
+        authError = ""
+        defer { isSubmitting = false }
+
+        let normalizedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard appState.isValidEmail(normalizedEmail) else {
+            authError = "Enter a valid e-mail address."
+            return
+        }
+
+        do {
+            let challenge = try await environment.authRepository.requestOTP(
+                identifier: normalizedEmail,
+                purpose: .signup
+            )
+            pendingIdentifier = normalizedEmail
+            pendingContactValue = normalizedEmail
+            pendingIdentifierKind = .email
+            pendingOTPChallenge = challenge
+            pendingOTPPurpose = .signup
+            pendingVerifiedSignupOTPChallengeID = nil
+            otpCodeInput = ""
+            step = .otp
+        } catch {
+            authError = error.localizedDescription.isEmpty ? "Could not request OTP." : error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func requestResetPasswordEmailOTP() async {
+        isSubmitting = true
+        authError = ""
+        defer { isSubmitting = false }
+
+        let normalizedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard appState.isValidEmail(normalizedEmail) else {
+            authError = "Enter a valid e-mail address."
+            return
+        }
+
+        do {
+            let challenge = try await environment.authRepository.requestOTP(
+                identifier: normalizedEmail,
+                purpose: .resetPassword
+            )
+            pendingPostResetLoginIdentifier = pendingIdentifier
+            pendingIdentifier = normalizedEmail
+            pendingContactValue = normalizedEmail
+            pendingIdentifierKind = .email
+            pendingOTPChallenge = challenge
+            pendingOTPPurpose = .resetPassword
+            pendingVerifiedResetOTPChallengeID = nil
+            otpCodeInput = ""
+            step = .otp
+        } catch {
+            authError = error.localizedDescription.isEmpty ? "Could not request OTP." : error.localizedDescription
+        }
+    }
+
+    @MainActor
     private func resetPasswordAndSignIn() async {
         isSubmitting = true
         authError = ""
@@ -837,8 +1369,15 @@ struct OnboardingView: View {
         }
 
         do {
-            try await environment.authRepository.resetPassword(identifier: pendingIdentifier, newPassword: trimmedPassword)
-            let user = try await environment.authRepository.logIn(identifier: pendingIdentifier, password: trimmedPassword)
+            try await environment.authRepository.resetPassword(
+                identifier: pendingIdentifier,
+                newPassword: trimmedPassword,
+                challengeID: pendingVerifiedResetOTPChallengeID
+            )
+            let loginIdentifier = pendingPostResetLoginIdentifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? pendingIdentifier
+                : pendingPostResetLoginIdentifier
+            let user = try await environment.authRepository.logIn(identifier: loginIdentifier, password: trimmedPassword)
             await finalizeAuthentication(with: user)
         } catch {
             authError = error.localizedDescription.isEmpty ? "Could not reset the password." : error.localizedDescription
@@ -866,13 +1405,31 @@ struct OnboardingView: View {
             authError = "Enter a valid e-mail address."
             return
         }
-        guard pendingPassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+        if isAppleProfileCompletionFlow == false,
+           pendingPassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             authError = "Create your password first."
             return
         }
 
-        let methodType: IdentityMethodType = mode == .standard ? .phone : .email
-        let contactValue = mode == .standard ? pendingContactValue : pendingContactValue.lowercased()
+        if let appleUserID = pendingAppleNewUserID {
+            do {
+                var appleUser = try await environment.authRepository.refreshUser(userID: appleUserID)
+                appleUser.profile.displayName = trimmedDisplayName
+                appleUser.profile.username = username
+                appleUser.profile.bio = bio.trimmingCharacters(in: .whitespacesAndNewlines)
+                appleUser.profile.birthday = birthDate
+                appleUser.profile.email = normalizedEmail
+                appleUser.profile.phoneNumber = nil
+                let updatedUser = try await environment.authRepository.updateProfile(appleUser.profile, for: appleUserID)
+                await finalizeAuthentication(with: updatedUser)
+            } catch {
+                authError = error.localizedDescription.isEmpty ? "Could not finish Apple setup." : error.localizedDescription
+            }
+            return
+        }
+
+        let methodType: IdentityMethodType = .email
+        let contactValue = pendingContactValue.lowercased()
 
         do {
             let createdUser = try await environment.authRepository.signUp(
@@ -881,7 +1438,9 @@ struct OnboardingView: View {
                 password: pendingPassword,
                 contactValue: contactValue,
                 methodType: methodType,
-                accountKind: mode.accountKind
+                accountKind: mode.accountKind,
+                otpChallengeID: mode == .guest ? nil : pendingVerifiedSignupOTPChallengeID,
+                signupEmail: mode == .standard ? normalizedEmail : nil
             )
 
             var profile = createdUser.profile
@@ -891,7 +1450,7 @@ struct OnboardingView: View {
             profile.status = mode == .offlineOnly ? "Offline only" : "Available"
             profile.birthday = birthDate
             profile.email = mode == .standard ? normalizedEmail : contactValue
-            profile.phoneNumber = mode == .standard ? contactValue : nil
+            profile.phoneNumber = nil
 
             let updatedUser = try await environment.authRepository.updateProfile(profile, for: createdUser.id)
             await finalizeAuthentication(with: updatedUser)
@@ -920,7 +1479,9 @@ struct OnboardingView: View {
                 password: guestUsername,
                 contactValue: guestUsername,
                 methodType: .username,
-                accountKind: .guest
+                accountKind: .guest,
+                otpChallengeID: nil,
+                signupEmail: nil
             )
             await finalizeAuthentication(with: guestUser)
         } catch {
@@ -948,7 +1509,7 @@ struct OnboardingView: View {
         usernameAvailability = .checking
 
         do {
-            let available = try await environment.settingsRepository.isUsernameAvailable(normalized, for: nil)
+            let available = try await environment.settingsRepository.isUsernameAvailable(normalized, for: pendingAppleNewUserID)
             usernameAvailability = available ? .available : .taken
         } catch {
             usernameAvailability = .unavailable
@@ -957,9 +1518,40 @@ struct OnboardingView: View {
 
     @MainActor
     private func finalizeAuthentication(with user: User) async {
+        pendingAppleNewUserID = nil
         await OnboardingProgressStore.shared.clear()
         let hasServerSession = await AuthSessionStore.shared.session(for: user.id) != nil
         appState.applyAuthenticatedUser(user, requiresServerSessionValidation: hasServerSession)
+    }
+
+    private func prepareAppleProfileCompletion(using user: User) {
+        pendingAppleNewUserID = user.id
+        mode = .standard
+        step = .profile
+        pendingLookup = AccountLookupResult(
+            exists: true,
+            accountKind: user.accountKind,
+            displayName: user.profile.displayName
+        )
+
+        let normalizedEmail = user.profile.email?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let normalizedEmail, normalizedEmail.isEmpty == false {
+            pendingIdentifier = normalizedEmail
+            pendingContactValue = normalizedEmail
+            pendingIdentifierKind = .email
+            email = normalizedEmail
+        } else {
+            pendingIdentifier = user.profile.username
+            pendingContactValue = "@\(user.profile.username)"
+            pendingIdentifierKind = .username
+            email = ""
+        }
+
+        displayName = user.profile.displayName
+        username = appState.normalizedUsername(user.profile.username)
+        bio = user.profile.bio
+        birthDate = user.profile.birthday ?? (Calendar.autoupdatingCurrent.date(byAdding: .year, value: -18, to: .now) ?? .now)
+        authError = ""
     }
 
     @MainActor
@@ -998,15 +1590,25 @@ struct OnboardingView: View {
 
         if mode == .offlineOnly {
             email = pendingContactValue.lowercased()
-        } else if email == pendingContactValue.lowercased() {
-            email = ""
+        } else if mode == .standard {
+            email = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         }
     }
 
     private func clearPasswordDrafts() {
         passwordInput = ""
         confirmPasswordInput = ""
+        otpCodeInput = ""
         pendingPassword = ""
+        pendingAppleNewUserID = nil
+        pendingOTPChallenge = nil
+        pendingOTPPurpose = nil
+        pendingVerifiedSignupOTPChallengeID = nil
+        pendingVerifiedResetOTPChallengeID = nil
+    }
+
+    private func clearPendingLookupState() {
+        pendingLookup = nil
     }
 
     @MainActor
@@ -1026,9 +1628,16 @@ struct OnboardingView: View {
         guard hasRestoredPersistedState == false else { return }
         hasRestoredPersistedState = true
 
+        guard restoresPersistedDraft else {
+            await OnboardingProgressStore.shared.clear()
+            resetStateForFreshStart()
+            return
+        }
+
         guard let storedState = await OnboardingProgressStore.shared.load() else { return }
 
         mode = FlowMode(rawValue: storedState.modeRawValue) ?? .standard
+        isContactSyncEnabled = storedState.isContactSyncEnabled ?? true
         selectedCountry = CountryDialCode.all.first(where: { $0.code == storedState.selectedCountryCode }) ?? .default
         localIdentifierInput = storedState.localIdentifierInput
         email = storedState.email
@@ -1038,7 +1647,8 @@ struct OnboardingView: View {
         birthDate = storedState.birthDate
         pendingIdentifier = storedState.pendingIdentifier
         pendingContactValue = storedState.pendingContactValue
-        pendingIdentifierKind = PendingIdentifierKind(rawValue: storedState.pendingIdentifierKindRawValue) ?? .phone
+        pendingIdentifierKind = PendingIdentifierKind(rawValue: storedState.pendingIdentifierKindRawValue) ?? .email
+        loginCredentialMode = LoginCredentialMode(rawValue: storedState.loginCredentialModeRawValue ?? "") ?? .password
         pendingLookup = storedState.pendingLookup.map {
             AccountLookupResult(
                 exists: $0.exists,
@@ -1048,17 +1658,55 @@ struct OnboardingView: View {
         }
 
         var restoredStep = Step(rawValue: storedState.stepRawValue) ?? .entry
-        let requiresResolvedIdentifier = restoredStep == .password || restoredStep == .createPassword || restoredStep == .resetPassword || restoredStep == .profile
+        let requiresResolvedIdentifier =
+            restoredStep == .signupEmail
+            || restoredStep == .otp
+            || restoredStep == .password
+            || restoredStep == .resetPasswordEmailOTP
+            || restoredStep == .createPassword
+            || restoredStep == .resetPassword
+            || restoredStep == .profile
         if requiresResolvedIdentifier && pendingIdentifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             restoredStep = .entry
         }
+        if restoredStep == .otp
+            || restoredStep == .password
+            || restoredStep == .createPassword
+            || restoredStep == .resetPasswordEmailOTP
+            || restoredStep == .resetPassword {
+            restoredStep = .entry
+        }
         if restoredStep == .profile {
-            restoredStep = .createPassword
+            restoredStep = .entry
         }
         if mode == .guest {
             restoredStep = .guestProfile
         }
         step = restoredStep
+    }
+
+    private func resetStateForFreshStart() {
+        mode = .standard
+        step = .entry
+        selectedCountry = .default
+        localIdentifierInput = ""
+        usernameInput = ""
+        useUsernameLogin = false
+        email = ""
+        displayName = ""
+        username = ""
+        bio = ""
+        birthDate = Calendar.autoupdatingCurrent.date(byAdding: .year, value: -18, to: .now) ?? .now
+        pendingIdentifier = ""
+        pendingPostResetLoginIdentifier = ""
+        pendingContactValue = ""
+        pendingIdentifierKind = .email
+        clearPendingLookupState()
+        authError = ""
+        loginCredentialMode = .password
+        usernameAvailability = .idle
+        isContactSyncEnabled = true
+        clearPasswordDrafts()
     }
 
     private func goBack() {
@@ -1067,26 +1715,62 @@ struct OnboardingView: View {
         switch step {
         case .entry:
             mode = .standard
-            pendingIdentifierKind = .phone
-            pendingLookup = nil
+            pendingIdentifierKind = .email
+            clearPendingLookupState()
             clearPasswordDrafts()
+            useUsernameLogin = false
+            usernameInput = ""
+        case .otp:
+            if pendingOTPPurpose == .resetPassword {
+                step = .resetPasswordEmailOTP
+            } else {
+                step = .entry
+            }
+            pendingOTPChallenge = nil
+            pendingOTPPurpose = nil
+            otpCodeInput = ""
+        case .signupEmail:
+            step = .entry
+            email = ""
         case .password, .createPassword:
             step = .entry
-            pendingIdentifierKind = .phone
-            pendingLookup = nil
+            pendingIdentifierKind = .email
+            clearPendingLookupState()
             clearPasswordDrafts()
-        case .resetPassword:
+        case .resetPasswordEmailOTP:
             step = .password
+            pendingOTPChallenge = nil
+            pendingOTPPurpose = nil
+            otpCodeInput = ""
+        case .resetPassword:
+            step = .resetPasswordEmailOTP
             passwordInput = ""
             confirmPasswordInput = ""
         case .profile:
-            step = .createPassword
+            if isAppleProfileCompletionFlow {
+                pendingAppleNewUserID = nil
+                step = .entry
+                pendingIdentifierKind = .email
+                clearPendingLookupState()
+                clearPasswordDrafts()
+            } else {
+                step = .createPassword
+            }
         case .guestProfile:
             step = .entry
             mode = .standard
-            pendingIdentifierKind = .phone
-            pendingLookup = nil
+            pendingIdentifierKind = .email
+            clearPendingLookupState()
             clearPasswordDrafts()
         }
+    }
+
+    private func otpMetaText(for challenge: OTPChallenge) -> String {
+        let expires = RelativeDateTimeFormatter().localizedString(for: challenge.expiresAt, relativeTo: .now)
+        if canResendOTP {
+            return "Code expires \(expires). You can resend now."
+        }
+        let resend = RelativeDateTimeFormatter().localizedString(for: challenge.resendAvailableAt, relativeTo: .now)
+        return "Code expires \(expires). Resend \(resend)."
     }
 }

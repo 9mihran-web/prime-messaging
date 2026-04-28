@@ -7,7 +7,7 @@ struct IdentityMethod: Identifiable, Codable, Hashable {
     let isVerified: Bool
     let isPubliclyDiscoverable: Bool
 
-    init(
+    nonisolated init(
         id: UUID = UUID(),
         type: IdentityMethodType,
         value: String,
@@ -19,5 +19,21 @@ struct IdentityMethod: Identifiable, Codable, Hashable {
         self.value = value
         self.isVerified = isVerified
         self.isPubliclyDiscoverable = isPubliclyDiscoverable
+    }
+
+    nonisolated static func == (lhs: IdentityMethod, rhs: IdentityMethod) -> Bool {
+        lhs.id == rhs.id
+            && lhs.type == rhs.type
+            && lhs.value == rhs.value
+            && lhs.isVerified == rhs.isVerified
+            && lhs.isPubliclyDiscoverable == rhs.isPubliclyDiscoverable
+    }
+
+    nonisolated func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(type)
+        hasher.combine(value)
+        hasher.combine(isVerified)
+        hasher.combine(isPubliclyDiscoverable)
     }
 }

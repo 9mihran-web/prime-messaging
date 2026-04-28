@@ -7,13 +7,12 @@ struct HomeView: View {
     }
 
     @Environment(\.appEnvironment) private var environment
+    @Environment(\.colorScheme) private var colorScheme
     @EnvironmentObject private var appState: AppState
     @ObservedObject private var appLockStore = AppLockStore.shared
     @State private var isOpeningNearbyChat = false
     @State private var isTransitioningMode = false
-    @State private var isShowingOfflineConfirmation = false
     @State private var isShowingNearbySearchFailureAlert = false
-    @State private var pendingModeSelection: ChatMode?
     @State private var modeTransitionError = ""
     @State private var nearbyPeers: [OfflinePeer] = []
     @State private var isSyncingEmergencyStatus = false
@@ -63,21 +62,6 @@ struct HomeView: View {
         .task(id: nearbyVisibilityTaskID) {
             await loadNearbyVisibilityPreferences()
         }
-        .alert("home.offline.confirm.title".localized, isPresented: $isShowingOfflineConfirmation) {
-            Button("home.offline.confirm.save".localized) {
-                Task {
-                    await applyModeSelection(pendingModeSelection ?? .offline)
-                }
-            }
-            Button("home.offline.confirm.continue_without_saving".localized) {
-                continueToOfflineWithoutSaving()
-            }
-            Button("common.cancel".localized, role: .cancel) {
-                pendingModeSelection = nil
-            }
-        } message: {
-            Text(offlineConfirmationMessage)
-        }
         .alert("home.offline.nearby.unavailable.title".localized, isPresented: $isShowingNearbySearchFailureAlert) {
             Button("common.try_again".localized) {
                 Task {
@@ -96,6 +80,44 @@ struct HomeView: View {
             }
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
+        }
+        .navigationDestination(for: Chat.self) { chat in
+            ChatView(chat: chat)
+        }
+        .navigationDestination(
+            isPresented: Binding(
+                get: { appState.routedChat != nil },
+                set: { isPresented in
+                    if isPresented == false {
+                        if let routedChat = appState.routedChat {
+                            let shouldKeepNotificationRoutePresented =
+                                appState.pendingNotificationRoute?.chatID == routedChat.id
+                                || appState.pendingResolvedNotificationChat?.id == routedChat.id
+                                || appState.hasPendingNotificationLaunchRoute(for: routedChat.id)
+
+                            if shouldKeepNotificationRoutePresented {
+                                return
+                            }
+                        }
+                        appState.clearRoutedChat()
+                        appState.clearPendingNotificationRoute()
+                    }
+                }
+            )
+        ) {
+            NotificationRouteChatDestinationView(routedChat: appState.routedChat)
+        }
+        .overlay {
+            if appState.pendingNotificationRoute != nil, appState.routedChat == nil {
+                NotificationRouteLoadingOverlayView()
+            }
+        }
+        .onAppear {
+            appState.setChatsRootReady(true)
+            Task { @MainActor in
+                await Task.yield()
+                _ = appState.commitQueuedNotificationNavigationIfPossible()
+            }
         }
     }
 
@@ -151,8 +173,8 @@ struct HomeView: View {
                                 Capsule(style: .continuous)
                                     .stroke(
                                         selectedFeedCategory == category
-                                            ? Color.white.opacity(0.14)
-                                            : PrimeTheme.Colors.glassStroke,
+                                            ? Color.white.opacity(colorScheme == .dark ? 0.14 : 0.26)
+                                            : PrimeTheme.Colors.bubbleIncomingBorder.opacity(colorScheme == .dark ? 0.72 : 0.96),
                                         lineWidth: 1
                                     )
                             )
@@ -362,8 +384,8 @@ struct HomeView: View {
                 availableModes: appState.availableModes,
                 selectedMode: appState.selectedMode,
                 isBusy: isTransitioningMode
-            ) { mode in
-                requestModeSelection(mode)
+            ) { mode, preserveChatsOnTransition in
+                requestModeSelection(mode, preserveChatsOnTransition: preserveChatsOnTransition)
             }
             .frame(maxWidth: .infinity)
 
@@ -411,30 +433,18 @@ struct HomeView: View {
         "\(appState.currentUser.id.uuidString)-nearby-visibility"
     }
 
-    private var offlineConfirmationMessage: String {
-        if let activeTransitionChat {
-            return String(
-                format: "home.offline.confirm.message.chat".localized,
-                activeTransitionChat.displayTitle(for: appState.currentUser.id)
-            )
-        }
-
-        return "home.offline.confirm.message.general".localized
-    }
-
-    private func requestModeSelection(_ mode: ChatMode) {
+    private func requestModeSelection(_ mode: ChatMode, preserveChatsOnTransition: Bool = false) {
         guard appState.availableModes.contains(mode) else { return }
         guard mode != appState.selectedMode else { return }
         guard isTransitioningMode == false else { return }
 
-        if mode == .offline {
-            pendingModeSelection = mode
-            isShowingOfflineConfirmation = true
+        if mode == .offline, preserveChatsOnTransition == false {
+            continueToOfflineWithoutSaving()
             return
         }
 
         Task {
-            await applyModeSelection(mode)
+            await applyModeSelection(mode, preserveChatsOnTransition: preserveChatsOnTransition)
         }
     }
 
@@ -442,15 +452,19 @@ struct HomeView: View {
     private func continueToOfflineWithoutSaving() {
         appState.updateSelectedMode(.offline)
         modeTransitionError = ""
-        pendingModeSelection = nil
     }
 
     @MainActor
-    private func applyModeSelection(_ mode: ChatMode) async {
+    private func applyModeSelection(_ mode: ChatMode, preserveChatsOnTransition: Bool = false) async {
         guard mode != appState.selectedMode else { return }
         guard isTransitioningMode == false else { return }
 
         if mode == .offline {
+            if preserveChatsOnTransition == false {
+                continueToOfflineWithoutSaving()
+                return
+            }
+
             let request = ChatModeTransitionRequest(
                 fromMode: appState.selectedMode,
                 toMode: mode,
@@ -459,7 +473,6 @@ struct HomeView: View {
             )
             appState.updateSelectedMode(.offline)
             modeTransitionError = ""
-            pendingModeSelection = nil
 
             Task(priority: .utility) {
                 do {
@@ -478,7 +491,6 @@ struct HomeView: View {
         if mode == .online, NetworkUsagePolicy.isActuallyOffline() {
             appState.updateSelectedMode(.online)
             modeTransitionError = ""
-            pendingModeSelection = nil
             return
         }
 
@@ -491,7 +503,6 @@ struct HomeView: View {
             )
             appState.updateSelectedMode(mode)
             modeTransitionError = ""
-            pendingModeSelection = nil
 
             Task(priority: .utility) {
                 do {
@@ -513,7 +524,6 @@ struct HomeView: View {
         isTransitioningMode = true
         defer {
             isTransitioningMode = false
-            pendingModeSelection = nil
         }
 
         do {
@@ -667,16 +677,58 @@ struct HomeView: View {
     }
 }
 
+private struct NotificationRouteChatDestinationView: View {
+    let routedChat: Chat?
+
+    var body: some View {
+        if let routedChat {
+            ChatView(chat: routedChat)
+        } else {
+            NotificationRouteLoadingOverlayView()
+        }
+    }
+}
+
+private struct NotificationRouteLoadingOverlayView: View {
+    var body: some View {
+        VStack(spacing: 14) {
+            ProgressView()
+            Text("Opening chat…")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(PrimeTheme.Colors.textSecondary)
+        }
+        .padding(.horizontal, 22)
+        .padding(.vertical, 18)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(PrimeTheme.Colors.separator.opacity(0.24), lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(0.18), radius: 20, y: 10)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(
+            PrimeTheme.Colors.background
+                .opacity(0.35)
+                .ignoresSafeArea()
+        )
+        .allowsHitTesting(false)
+        .transition(.opacity.combined(with: .scale(scale: 0.96)))
+    }
+}
+
 struct ModeSelectorView: View {
     let availableModes: [ChatMode]
     let selectedMode: ChatMode
     var isBusy = false
-    let onSelectMode: (ChatMode) -> Void
+    let onSelectMode: (ChatMode, Bool) -> Void
     @Namespace private var selectionAnimationNamespace
     @State private var expandingMode: ChatMode?
     @State private var collapsingMode: ChatMode?
     @State private var transitionTask: Task<Void, Never>?
     @State private var lastObservedSelectedMode: ChatMode?
+    @State private var longPressTriggeredMode: ChatMode?
+
+    private let offlineSaveHoldDuration: Double = 2.0
 
     var body: some View {
         GeometryReader { geometry in
@@ -706,7 +758,10 @@ struct ModeSelectorView: View {
 
     private func modeButton(_ mode: ChatMode, width: CGFloat) -> some View {
         Button {
-            onSelectMode(mode)
+            let consumedByLongPress = longPressTriggeredMode == mode
+            longPressTriggeredMode = nil
+            guard consumedByLongPress == false else { return }
+            onSelectMode(mode, false)
         } label: {
             ZStack {
                 Capsule(style: .continuous)
@@ -746,6 +801,12 @@ struct ModeSelectorView: View {
         }
         .buttonStyle(.plain)
         .disabled(isBusy)
+        .onLongPressGesture(minimumDuration: offlineSaveHoldDuration, maximumDistance: 18) {
+            guard mode == .offline else { return }
+            guard isBusy == false else { return }
+            longPressTriggeredMode = mode
+            onSelectMode(mode, true)
+        }
     }
 
     private func collapsedTitle(for mode: ChatMode) -> String {
@@ -980,12 +1041,12 @@ private struct QuickCreateSheet: View {
     var body: some View {
         List {
             Section {
-                Text("Open something new fast.")
+                Text("quickcreate.subtitle".localized)
                     .font(.footnote)
                     .foregroundStyle(PrimeTheme.Colors.textSecondary)
             }
 
-            Section("Create") {
+            Section("common.create".localized) {
                 NavigationLink {
                     if isOfflineMode {
                         AddContactView()
@@ -993,35 +1054,35 @@ private struct QuickCreateSheet: View {
                         GlobalChatSearchView(mode: appState.selectedMode)
                     }
                 } label: {
-                    quickActionRow(title: "New Contact", subtitle: "Find by username or create a direct chat", systemName: "person.badge.plus")
+                    quickActionRow(title: "quickcreate.new_contact.title".localized, subtitle: "quickcreate.new_contact.subtitle".localized, systemName: "person.badge.plus")
                 }
 
                 NavigationLink {
                     NewGroupView(initialCommunityKind: .group)
                 } label: {
-                    quickActionRow(title: "New Group", subtitle: "Start a normal group chat", systemName: "person.3.fill")
+                    quickActionRow(title: "quickcreate.new_group.title".localized, subtitle: "quickcreate.new_group.subtitle".localized, systemName: "person.3.fill")
                 }
 
                 if isOfflineMode == false {
                     NavigationLink {
                         NewGroupView(initialCommunityKind: .channel)
                     } label: {
-                        quickActionRow(title: "New Channel", subtitle: "Broadcast updates to subscribers", systemName: "megaphone.fill")
+                        quickActionRow(title: "quickcreate.new_channel.title".localized, subtitle: "quickcreate.new_channel.subtitle".localized, systemName: "megaphone.fill")
                     }
 
                     NavigationLink {
                         NewGroupView(initialCommunityKind: .community)
                     } label: {
-                        quickActionRow(title: "New Community", subtitle: "Build a bigger public space", systemName: "bubble.left.and.bubble.right.fill")
+                        quickActionRow(title: "quickcreate.new_community.title".localized, subtitle: "quickcreate.new_community.subtitle".localized, systemName: "bubble.left.and.bubble.right.fill")
                     }
 
                     NavigationLink {
                         NewGroupView(initialCommunityKind: .supergroup)
                     } label: {
-                        quickActionRow(title: "New Supergroup", subtitle: "Create a larger managed group", systemName: "person.3.sequence.fill")
+                        quickActionRow(title: "quickcreate.new_supergroup.title".localized, subtitle: "quickcreate.new_supergroup.subtitle".localized, systemName: "person.3.sequence.fill")
                     }
                 } else {
-                    Text("Offline mode only supports normal groups.")
+                    Text("quickcreate.offline_only_groups".localized)
                         .font(.footnote)
                         .foregroundStyle(PrimeTheme.Colors.textSecondary)
                 }
@@ -1035,9 +1096,9 @@ private struct QuickCreateSheet: View {
                 }
             }
 
-            Section("Saved Contacts") {
+            Section("quickcreate.saved_contacts".localized) {
                 if contacts.isEmpty {
-                    Text("Saved contacts will appear here.")
+                    Text("quickcreate.saved_contacts.empty".localized)
                         .foregroundStyle(PrimeTheme.Colors.textSecondary)
                 } else {
                     ForEach(contacts) { contact in
@@ -1076,7 +1137,7 @@ private struct QuickCreateSheet: View {
                 }
             }
         }
-        .navigationTitle("Create")
+        .navigationTitle("common.create".localized)
         .task(id: appState.currentUser.id) {
             contacts = await ContactAliasStore.shared.contacts(ownerUserID: appState.currentUser.id)
         }
@@ -1120,7 +1181,7 @@ private struct QuickCreateSheet: View {
             dismiss()
             appState.routeToChatAfterCurrentTransition(chat)
         } catch {
-            errorText = error.localizedDescription.isEmpty ? "Could not open this contact." : error.localizedDescription
+            errorText = error.localizedDescription.isEmpty ? "quickcreate.open_failed".localized : error.localizedDescription
         }
     }
 }

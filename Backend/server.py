@@ -2,9 +2,11 @@
 import base64
 import hashlib
 import hmac
+import html
 import json
 import mimetypes
 import os
+import re
 import secrets
 import shutil
 import smtplib
@@ -12,11 +14,12 @@ import struct
 import subprocess
 import threading
 import time
+import traceback
 import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from email.message import EmailMessage
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 try:
     import httpx
@@ -39,7 +42,13 @@ except Exception:
 
 
 BASE_DIR = os.path.dirname(__file__)
-WEBSITE_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "Website"))
+WEBSITE_DIR_CANDIDATES = [
+    os.path.abspath(os.path.join(BASE_DIR, "Support")),
+    os.path.abspath(os.path.join(BASE_DIR, "..", "Support")),
+    os.path.abspath(os.path.join(BASE_DIR, "Website")),
+    os.path.abspath(os.path.join(BASE_DIR, "..", "Website")),
+]
+WEBSITE_DIR = next((path for path in WEBSITE_DIR_CANDIDATES if os.path.isdir(path)), WEBSITE_DIR_CANDIDATES[0])
 DATA_DIR = os.path.join(BASE_DIR, "data")
 DATA_FILE = os.path.join(DATA_DIR, "database.json")
 AVATAR_DIR = os.path.join(DATA_DIR, "avatars")
@@ -57,7 +66,55 @@ PUBLIC_BASE_URL = (
     os.environ.get("PRIME_MESSAGING_PUBLIC_BASE_URL", "").strip().rstrip("/")
     or (f"https://{RAILWAY_PUBLIC_DOMAIN}" if RAILWAY_PUBLIC_DOMAIN else "")
 )
+APP_STORE_URL = (
+    os.environ.get("PRIME_MESSAGING_APP_STORE_URL", "").strip()
+    or "https://apps.apple.com/am/app/prime-messaging/id6761887670"
+)
+LATEST_APP_VERSION = (os.environ.get("PRIME_MESSAGING_LATEST_APP_VERSION", "1.1") or "1.1").strip()
+MINIMUM_SUPPORTED_APP_VERSION = (
+    os.environ.get("PRIME_MESSAGING_MINIMUM_SUPPORTED_APP_VERSION", "1.0.2") or "1.0.2"
+).strip()
+APP_UPDATE_TITLE = (
+    os.environ.get("PRIME_MESSAGING_APP_UPDATE_TITLE", "Update Available")
+    or "Update Available"
+).strip()
+APP_UPDATE_MESSAGE = (
+    os.environ.get("PRIME_MESSAGING_APP_UPDATE_MESSAGE", "A newer version of Prime Messaging is available.")
+    or "A newer version of Prime Messaging is available."
+).strip()
+APP_UPDATE_REQUIRED_TITLE = (
+    os.environ.get("PRIME_MESSAGING_APP_UPDATE_REQUIRED_TITLE", "Update Required")
+    or "Update Required"
+).strip()
+APP_UPDATE_REQUIRED_MESSAGE = (
+    os.environ.get(
+        "PRIME_MESSAGING_APP_UPDATE_REQUIRED_MESSAGE",
+        "Please update Prime Messaging to continue.",
+    )
+    or "Please update Prime Messaging to continue."
+).strip()
 LOCK = threading.Lock()
+DB_CACHE = None
+DB_CACHE_MTIME_NS = None
+DB_CACHE_SIZE = None
+CALL_EVENTS_INDEX = None
+CALL_EVENTS_INDEX_DB_REF = None
+CALL_EVENTS_INDEX_EVENT_COUNT = -1
+try:
+    TERMINAL_CALL_EVENT_RETENTION_SECONDS = max(
+        60,
+        int(os.environ.get("PRIME_CALL_TERMINAL_EVENT_RETENTION_SECONDS", "1200") or "1200"),
+    )
+except ValueError:
+    TERMINAL_CALL_EVENT_RETENTION_SECONDS = 1200
+try:
+    CALL_SIGNAL_DB_FLUSH_INTERVAL_SECONDS = max(
+        0.0,
+        float(os.environ.get("PRIME_CALL_SIGNAL_DB_FLUSH_INTERVAL_SECONDS", "1.0") or "1.0"),
+    )
+except ValueError:
+    CALL_SIGNAL_DB_FLUSH_INTERVAL_SECONDS = 1.0
+LAST_CALL_SIGNAL_DB_FLUSH_AT = 0.0
 ACCESS_TOKEN_TTL_SECONDS = 60 * 60
 REFRESH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30
 SESSION_ACTIVITY_TOUCH_INTERVAL_SECONDS = 15
@@ -79,6 +136,16 @@ SMTP_USERNAME = (os.environ.get("PRIME_MESSAGING_SMTP_USERNAME", "") or "").stri
 SMTP_PASSWORD = (os.environ.get("PRIME_MESSAGING_SMTP_PASSWORD", "") or "").strip()
 SMTP_FROM = (os.environ.get("PRIME_MESSAGING_SMTP_FROM", "") or "").strip()
 SMTP_USE_TLS = ((os.environ.get("PRIME_MESSAGING_SMTP_USE_TLS", "1") or "1").strip().lower() in {"1", "true", "yes"})
+SMTP_USE_SSL = ((os.environ.get("PRIME_MESSAGING_SMTP_USE_SSL", "0") or "0").strip().lower() in {"1", "true", "yes"})
+try:
+    SMTP_TIMEOUT_SECONDS = max(5.0, float((os.environ.get("PRIME_MESSAGING_SMTP_TIMEOUT_SECONDS", "20") or "20").strip()))
+except ValueError:
+    SMTP_TIMEOUT_SECONDS = 20.0
+SUPPORT_CONTACT_EMAIL = (os.environ.get("PRIME_MESSAGING_SUPPORT_CONTACT_EMAIL", "schwitt.shot@yahoo.com") or "schwitt.shot@yahoo.com").strip()
+SUPPORT_CONTACT_SUBJECT_PREFIX = (
+    os.environ.get("PRIME_MESSAGING_SUPPORT_CONTACT_SUBJECT_PREFIX", "Prime Messaging Support")
+    or "Prime Messaging Support"
+).strip()
 SENDGRID_API_KEY = (os.environ.get("PRIME_MESSAGING_SENDGRID_API_KEY", "") or "").strip()
 SENDGRID_FROM_EMAIL = (os.environ.get("PRIME_MESSAGING_SENDGRID_FROM_EMAIL", "") or "").strip()
 SENDGRID_FROM_NAME = (os.environ.get("PRIME_MESSAGING_SENDGRID_FROM_NAME", "Prime Messaging") or "Prime Messaging").strip()
@@ -213,6 +280,102 @@ def log_event(name, **fields):
         **fields,
     }
     print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def version_parts(raw_value):
+    cleaned_value = (str(raw_value or "").strip())
+    if not cleaned_value:
+        return [0]
+    parts = []
+    for component in cleaned_value.split("."):
+        try:
+            parts.append(int(component))
+        except ValueError:
+            parts.append(0)
+    return parts or [0]
+
+
+def compare_versions(lhs, rhs):
+    lhs_parts = version_parts(lhs)
+    rhs_parts = version_parts(rhs)
+    max_count = max(len(lhs_parts), len(rhs_parts))
+    for index in range(max_count):
+        lhs_value = lhs_parts[index] if index < len(lhs_parts) else 0
+        rhs_value = rhs_parts[index] if index < len(rhs_parts) else 0
+        if lhs_value < rhs_value:
+            return -1
+        if lhs_value > rhs_value:
+            return 1
+    return 0
+
+
+def app_version_policy_payload(current_version=None):
+    normalized_current_version = normalized_optional_string(current_version)
+    requires_update = False
+    update_available = False
+    if normalized_current_version:
+        if MINIMUM_SUPPORTED_APP_VERSION:
+            requires_update = compare_versions(normalized_current_version, MINIMUM_SUPPORTED_APP_VERSION) < 0
+        if LATEST_APP_VERSION:
+            update_available = compare_versions(normalized_current_version, LATEST_APP_VERSION) < 0
+
+    return {
+        "latestVersion": LATEST_APP_VERSION,
+        "minimumSupportedVersion": MINIMUM_SUPPORTED_APP_VERSION or None,
+        "appStoreURL": APP_STORE_URL,
+        "title": APP_UPDATE_TITLE,
+        "message": APP_UPDATE_MESSAGE,
+        "requiredTitle": APP_UPDATE_REQUIRED_TITLE,
+        "requiredMessage": APP_UPDATE_REQUIRED_MESSAGE,
+        "currentVersion": normalized_current_version,
+        "updateAvailable": update_available,
+        "requiresUpdate": requires_update,
+    }
+
+
+def stored_app_version_policy(database):
+    stored = database.get("appVersionPolicy") if isinstance(database, dict) else None
+    if not isinstance(stored, dict):
+        stored = {}
+
+    latest_version = normalized_optional_string(stored.get("latestVersion")) or LATEST_APP_VERSION
+    minimum_supported_version = normalized_optional_string(stored.get("minimumSupportedVersion")) or MINIMUM_SUPPORTED_APP_VERSION or None
+    app_store_url = normalized_optional_string(stored.get("appStoreURL")) or APP_STORE_URL
+    title = normalized_optional_string(stored.get("title")) or APP_UPDATE_TITLE
+    message = normalized_optional_string(stored.get("message")) or APP_UPDATE_MESSAGE
+    required_title = normalized_optional_string(stored.get("requiredTitle")) or APP_UPDATE_REQUIRED_TITLE
+    required_message = normalized_optional_string(stored.get("requiredMessage")) or APP_UPDATE_REQUIRED_MESSAGE
+
+    return {
+        "latestVersion": latest_version,
+        "minimumSupportedVersion": minimum_supported_version,
+        "appStoreURL": app_store_url,
+        "title": title,
+        "message": message,
+        "requiredTitle": required_title,
+        "requiredMessage": required_message,
+    }
+
+
+def app_version_policy_payload_from_database(database, current_version=None):
+    policy = stored_app_version_policy(database)
+    normalized_current_version = normalized_optional_string(current_version)
+    requires_update = False
+    update_available = False
+    if normalized_current_version:
+        minimum_version = normalized_optional_string(policy.get("minimumSupportedVersion"))
+        latest_version = normalized_optional_string(policy.get("latestVersion"))
+        if minimum_version:
+            requires_update = compare_versions(normalized_current_version, minimum_version) < 0
+        if latest_version:
+            update_available = compare_versions(normalized_current_version, latest_version) < 0
+
+    return {
+        **policy,
+        "currentVersion": normalized_current_version,
+        "updateAvailable": update_available,
+        "requiresUpdate": requires_update,
+    }
 
 
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -1255,6 +1418,18 @@ def ensure_storage():
 
 def load_db():
     ensure_storage()
+    global DB_CACHE, DB_CACHE_MTIME_NS, DB_CACHE_SIZE
+    file_stat = os.stat(DATA_FILE)
+    file_mtime_ns = getattr(file_stat, "st_mtime_ns", int(file_stat.st_mtime * 1_000_000_000))
+    file_size = file_stat.st_size
+
+    if (
+        DB_CACHE is not None
+        and DB_CACHE_MTIME_NS == file_mtime_ns
+        and DB_CACHE_SIZE == file_size
+    ):
+        return DB_CACHE
+
     with open(DATA_FILE, "r", encoding="utf-8") as file:
         database = json.load(file)
 
@@ -1264,13 +1439,79 @@ def load_db():
 
     if did_update:
         save_db(database)
+    else:
+        DB_CACHE = database
+        DB_CACHE_MTIME_NS = file_mtime_ns
+        DB_CACHE_SIZE = file_size
 
     return database
 
 
 def save_db(database):
-    with open(DATA_FILE, "w", encoding="utf-8") as file:
+    global DB_CACHE, DB_CACHE_MTIME_NS, DB_CACHE_SIZE
+    ensure_storage()
+    temp_path = f"{DATA_FILE}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as file:
         json.dump(database, file, indent=2, sort_keys=True)
+        file.flush()
+        os.fsync(file.fileno())
+    os.replace(temp_path, DATA_FILE)
+    file_stat = os.stat(DATA_FILE)
+    DB_CACHE = database
+    DB_CACHE_MTIME_NS = getattr(file_stat, "st_mtime_ns", int(file_stat.st_mtime * 1_000_000_000))
+    DB_CACHE_SIZE = file_stat.st_size
+
+
+def mark_call_events_index_dirty():
+    global CALL_EVENTS_INDEX, CALL_EVENTS_INDEX_DB_REF, CALL_EVENTS_INDEX_EVENT_COUNT
+    CALL_EVENTS_INDEX = None
+    CALL_EVENTS_INDEX_DB_REF = None
+    CALL_EVENTS_INDEX_EVENT_COUNT = -1
+
+
+def rebuild_call_events_index(database):
+    global CALL_EVENTS_INDEX, CALL_EVENTS_INDEX_DB_REF, CALL_EVENTS_INDEX_EVENT_COUNT
+    index = {}
+    events = database.get("callEvents", [])
+    for event in events:
+        call_id = normalized_entity_id(event.get("callID"))
+        if not call_id:
+            continue
+        index.setdefault(call_id, []).append(event)
+    CALL_EVENTS_INDEX = index
+    CALL_EVENTS_INDEX_DB_REF = id(database)
+    CALL_EVENTS_INDEX_EVENT_COUNT = len(events)
+    return index
+
+
+def ensure_call_events_index(database):
+    global CALL_EVENTS_INDEX, CALL_EVENTS_INDEX_DB_REF, CALL_EVENTS_INDEX_EVENT_COUNT
+    events = database.get("callEvents", [])
+    if (
+        CALL_EVENTS_INDEX is None
+        or CALL_EVENTS_INDEX_DB_REF != id(database)
+        or CALL_EVENTS_INDEX_EVENT_COUNT != len(events)
+    ):
+        return rebuild_call_events_index(database)
+    return CALL_EVENTS_INDEX
+
+
+def save_db_for_call_signal(database, force=False):
+    global LAST_CALL_SIGNAL_DB_FLUSH_AT
+    if force:
+        save_db(database)
+        LAST_CALL_SIGNAL_DB_FLUSH_AT = time.monotonic()
+        return True
+    if CALL_SIGNAL_DB_FLUSH_INTERVAL_SECONDS <= 0:
+        save_db(database)
+        LAST_CALL_SIGNAL_DB_FLUSH_AT = time.monotonic()
+        return True
+    now_monotonic = time.monotonic()
+    if (now_monotonic - LAST_CALL_SIGNAL_DB_FLUSH_AT) >= CALL_SIGNAL_DB_FLUSH_INTERVAL_SECONDS:
+        save_db(database)
+        LAST_CALL_SIGNAL_DB_FLUSH_AT = now_monotonic
+        return True
+    return False
 
 
 def normalized_entity_id(value):
@@ -1298,6 +1539,59 @@ def unique_entity_ids(values):
     return normalized_values
 
 
+def prune_stale_call_events(database, retention_seconds=TERMINAL_CALL_EVENT_RETENTION_SECONDS):
+    calls_by_id = {
+        normalized_entity_id(call.get("id")): call
+        for call in database.get("calls", [])
+        if normalized_entity_id(call.get("id"))
+    }
+    if not calls_by_id:
+        if database.get("callEvents"):
+            database["callEvents"] = []
+            mark_call_events_index_dirty()
+            return True
+        return False
+
+    now = datetime.now(timezone.utc)
+    retained_events = []
+    did_prune = False
+    for event in database.get("callEvents", []):
+        call_id = normalized_entity_id(event.get("callID"))
+        if not call_id:
+            did_prune = True
+            continue
+
+        call = calls_by_id.get(call_id)
+        if call is None:
+            did_prune = True
+            continue
+
+        call_state = normalized_optional_string(call.get("state")) or "ringing"
+        if call_state in ACTIVE_CALL_STATES:
+            retained_events.append(event)
+            continue
+
+        terminal_at = (
+            parse_iso_timestamp(call.get("updatedAt"))
+            or parse_iso_timestamp(call.get("endedAt"))
+            or parse_iso_timestamp(call.get("answeredAt"))
+            or parse_iso_timestamp(call.get("createdAt"))
+        )
+        if terminal_at is not None and terminal_at.tzinfo is None:
+            terminal_at = terminal_at.replace(tzinfo=timezone.utc)
+
+        if terminal_at is not None and (now - terminal_at).total_seconds() > retention_seconds:
+            did_prune = True
+            continue
+
+        retained_events.append(event)
+
+    if did_prune:
+        database["callEvents"] = retained_events
+        mark_call_events_index_dirty()
+    return did_prune
+
+
 def ensure_database_schema(database):
     did_update = False
 
@@ -1310,6 +1604,9 @@ def ensure_database_schema(database):
         did_update = True
 
     if prune_otp_challenges(database):
+        did_update = True
+
+    if prune_stale_call_events(database):
         did_update = True
 
     return did_update
@@ -2017,6 +2314,16 @@ def normalize_database_entities(database):
             call["endedByUserID"] = ended_by_user_id
             did_update = True
 
+        accepted_by_session_id = normalized_entity_id(call.get("acceptedBySessionID"))
+        if call.get("acceptedBySessionID") != accepted_by_session_id:
+            call["acceptedBySessionID"] = accepted_by_session_id
+            did_update = True
+
+        accepted_by_device_id = normalized_device_identifier(call.get("acceptedByDeviceID"))
+        if call.get("acceptedByDeviceID") != accepted_by_device_id:
+            call["acceptedByDeviceID"] = accepted_by_device_id
+            did_update = True
+
         if not normalized_optional_string(call.get("mode")):
             call["mode"] = "online"
             did_update = True
@@ -2028,6 +2335,30 @@ def normalize_database_entities(database):
         if not normalized_optional_string(call.get("state")):
             call["state"] = "ringing"
             did_update = True
+
+        scope_value = normalized_optional_string(call.get("scope")) or "direct"
+        if call.get("scope") != scope_value:
+            call["scope"] = scope_value
+            did_update = True
+
+        participant_ids = [
+            user_id_map.get(normalized_optional_string(participant_id), normalized_entity_id(participant_id))
+            for participant_id in (call.get("participantIDs") or [])
+        ]
+        participant_ids = unique_entity_ids(participant_ids)
+        if scope_value == "group":
+            if participant_ids != unique_entity_ids(call.get("participantIDs") or []):
+                call["participantIDs"] = participant_ids
+                did_update = True
+
+            joined_participant_ids = [
+                user_id_map.get(normalized_optional_string(participant_id), normalized_entity_id(participant_id))
+                for participant_id in (call.get("joinedParticipantIDs") or [])
+            ]
+            joined_participant_ids = unique_entity_ids(joined_participant_ids)
+            if joined_participant_ids != unique_entity_ids(call.get("joinedParticipantIDs") or []):
+                call["joinedParticipantIDs"] = joined_participant_ids
+                did_update = True
 
         try:
             last_event_sequence = int(call.get("lastEventSequence") or 0)
@@ -2074,6 +2405,16 @@ def normalize_database_entities(database):
         sender_id = user_id_map.get(normalized_optional_string(event.get("senderID")), normalized_entity_id(event.get("senderID")))
         if sender_id and event.get("senderID") != sender_id:
             event["senderID"] = sender_id
+            did_update = True
+
+        payload = event.get("payload") or {}
+        target_user_id = user_id_map.get(
+            normalized_optional_string(payload.get("targetUserID")),
+            normalized_entity_id(payload.get("targetUserID"))
+        )
+        if payload.get("targetUserID") != target_user_id:
+            payload["targetUserID"] = target_user_id
+            event["payload"] = payload
             did_update = True
 
         try:
@@ -2167,6 +2508,7 @@ def session_device_metadata_from_headers(headers):
         return normalized_optional_string(headers.get(name))
 
     platform = clean_header("X-Prime-Platform")
+    device_id = normalized_device_identifier(clean_header("X-Prime-Device-ID"))
     device_name = clean_header("X-Prime-Device-Name")
     device_model = clean_header("X-Prime-Device-Model")
     os_name = clean_header("X-Prime-OS-Name")
@@ -2190,6 +2532,7 @@ def session_device_metadata_from_headers(headers):
 
     return {
         "platform": platform or "unknown",
+        "deviceID": device_id,
         "deviceName": device_name,
         "deviceModel": device_model,
         "osName": os_name,
@@ -2204,6 +2547,7 @@ def apply_session_device_metadata(session, metadata):
 
     for source_key, target_key in (
         ("platform", "platform"),
+        ("deviceID", "deviceID"),
         ("deviceName", "deviceName"),
         ("deviceModel", "deviceModel"),
         ("osName", "osName"),
@@ -2891,11 +3235,7 @@ def otp_provider_send_code(identifier, channel, otp_code, purpose, challenge_id,
                 "If you did not request this code, please ignore this e-mail."
             )
 
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
-                if SMTP_USE_TLS:
-                    smtp.starttls()
-                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
-                smtp.send_message(message)
+            smtp_send_message(message)
             return True, None
         except Exception as error:
             return False, str(error)
@@ -2973,6 +3313,136 @@ def otp_provider_send_code(identifier, channel, otp_code, purpose, challenge_id,
             return False, str(error)
 
     return False, "unsupported_otp_provider"
+
+
+def support_contact_send_email(name, email, subject, message_text, locale="en", page_url=None):
+    normalized_name = normalized_optional_string(name) or "Website visitor"
+    normalized_email = normalize_email(email)
+    normalized_subject = normalized_optional_string(subject) or "Support request"
+    normalized_message = normalized_optional_string(message_text) or ""
+    normalized_locale = normalized_optional_string(locale) or "en"
+    normalized_page_url = normalized_optional_string(page_url)
+
+    if not normalized_email or not is_valid_email(normalized_email):
+        return False, "invalid_email"
+    if len(normalized_message) < 10:
+        return False, "invalid_message"
+
+    mail_subject = f"{SUPPORT_CONTACT_SUBJECT_PREFIX} — {normalized_subject}"
+    text_lines = [
+        "A new support request was submitted from the Prime Messaging website.",
+        "",
+        f"Name: {normalized_name}",
+        f"Email: {normalized_email}",
+        f"Subject: {normalized_subject}",
+        f"Locale: {normalized_locale}",
+    ]
+    if normalized_page_url:
+        text_lines.append(f"Page URL: {normalized_page_url}")
+    text_lines.extend(["", "Message:", normalized_message])
+    text_body = "\n".join(text_lines)
+
+    escaped_name = html.escape(normalized_name)
+    escaped_email = html.escape(normalized_email)
+    escaped_subject = html.escape(normalized_subject)
+    escaped_locale = html.escape(normalized_locale)
+    escaped_message = html.escape(normalized_message)
+    escaped_page_url = html.escape(normalized_page_url) if normalized_page_url else ""
+    page_url_row = ""
+    if escaped_page_url:
+        page_url_row = (
+            "<tr><td style=\"padding:8px 0;color:#8b90a0;\">Page URL</td>"
+            f"<td style=\"padding:8px 0;color:#f2f2f7;\">{escaped_page_url}</td></tr>"
+        )
+
+    html_body = f"""
+    <html>
+      <body style="margin:0;padding:24px;background:#0b0b0f;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;color:#f2f2f7;">
+        <div style="max-width:680px;margin:0 auto;background:#12131a;border:1px solid #2a2d38;border-radius:18px;padding:24px;">
+          <div style="font-size:12px;letter-spacing:0.08em;text-transform:uppercase;color:#8b90a0;margin-bottom:12px;">Prime Messaging Support</div>
+          <h1 style="margin:0 0 18px;font-size:24px;line-height:1.2;">New support request</h1>
+          <table style="width:100%;border-collapse:collapse;margin-bottom:18px;">
+            <tr><td style="padding:8px 0;color:#8b90a0;width:120px;">Name</td><td style="padding:8px 0;color:#f2f2f7;">{escaped_name}</td></tr>
+            <tr><td style="padding:8px 0;color:#8b90a0;">Email</td><td style="padding:8px 0;color:#f2f2f7;">{escaped_email}</td></tr>
+            <tr><td style="padding:8px 0;color:#8b90a0;">Subject</td><td style="padding:8px 0;color:#f2f2f7;">{escaped_subject}</td></tr>
+            <tr><td style="padding:8px 0;color:#8b90a0;">Locale</td><td style="padding:8px 0;color:#f2f2f7;">{escaped_locale}</td></tr>
+            {page_url_row}
+          </table>
+          <div style="border-top:1px solid #2a2d38;padding-top:18px;">
+            <div style="font-size:12px;letter-spacing:0.08em;text-transform:uppercase;color:#8b90a0;margin-bottom:10px;">Message</div>
+            <div style="white-space:pre-wrap;color:#f2f2f7;line-height:1.6;">{escaped_message}</div>
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+
+    if SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD and SMTP_FROM:
+        try:
+            email_message = EmailMessage()
+            email_message["Subject"] = mail_subject
+            email_message["From"] = SMTP_FROM
+            email_message["To"] = SUPPORT_CONTACT_EMAIL
+            email_message["Reply-To"] = normalized_email
+            email_message.set_content(text_body)
+            email_message.add_alternative(html_body, subtype="html")
+
+            smtp_send_message(email_message)
+            return True, None
+        except Exception as error:
+            return False, str(error)
+
+    if SENDGRID_API_KEY and SENDGRID_FROM_EMAIL:
+        if httpx is None:
+            return False, "httpx_not_installed"
+        payload = {
+            "personalizations": [{
+                "to": [{"email": SUPPORT_CONTACT_EMAIL}],
+            }],
+            "from": {
+                "email": SENDGRID_FROM_EMAIL,
+                "name": SENDGRID_FROM_NAME,
+            },
+            "reply_to": {"email": normalized_email},
+            "subject": mail_subject,
+            "content": [
+                {"type": "text/plain", "value": text_body},
+                {"type": "text/html", "value": html_body},
+            ],
+        }
+        headers = {
+            "Authorization": f"Bearer {SENDGRID_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        try:
+            with httpx.Client(timeout=15.0) as client:
+                response = client.post("https://api.sendgrid.com/v3/mail/send", json=payload, headers=headers)
+            if response.status_code == 202:
+                return True, None
+            response_body = (response.text or "").strip()
+            if response_body:
+                return False, f"sendgrid_http_{response.status_code}_{response_body[:180]}"
+            return False, f"sendgrid_http_{response.status_code}"
+        except Exception as error:
+            return False, str(error)
+
+    return False, "support_email_not_configured"
+
+
+def smtp_send_message(email_message):
+    if SMTP_USE_SSL:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as smtp:
+            smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(email_message)
+        return
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as smtp:
+        smtp.ehlo()
+        if SMTP_USE_TLS:
+            smtp.starttls()
+            smtp.ehlo()
+        smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+        smtp.send_message(email_message)
 
 
 def latest_otp_challenge(database, identifier, purpose):
@@ -3264,7 +3734,49 @@ def invite_link_for_code(invite_code):
     normalized_code = normalized_invite_code(invite_code)
     if not normalized_code:
         return None
-    return f"primemessaging://join/{normalized_code}"
+    return f"https://primemsg.site/join/{normalized_code}"
+
+
+def normalize_invite_link(link, invite_code):
+    normalized_link = normalized_optional_string(link)
+    normalized_code = normalized_invite_code(invite_code)
+
+    if normalized_link:
+        parsed = urlparse(normalized_link)
+        scheme = (parsed.scheme or "").strip().lower()
+        host = (parsed.netloc or "").strip().lower()
+        path_parts = [part for part in parsed.path.split("/") if part]
+
+        if scheme == "primemessaging" and host == "join":
+            rewritten_code = normalized_invite_code(path_parts[0] if path_parts else normalized_code)
+            if rewritten_code:
+                return invite_link_for_code(rewritten_code)
+
+        if scheme in {"http", "https"} and host in {"primemsg.site", "www.primemsg.site"} and len(path_parts) >= 2:
+            if path_parts[0].lower() in {"join", "invite"}:
+                rewritten_code = normalized_invite_code(path_parts[1]) or normalized_code
+                if rewritten_code:
+                    return invite_link_for_code(rewritten_code)
+
+        return normalized_link
+
+    return invite_link_for_code(normalized_code)
+
+
+def public_community_handle_taken(database, handle, excluding_chat_id=None):
+    normalized_handle = normalized_public_handle(handle)
+    if not normalized_handle:
+        return False
+
+    for chat in database.get("chats", []):
+        if chat.get("type") != "group":
+            continue
+        if excluding_chat_id and ids_equal(chat.get("id"), excluding_chat_id):
+            continue
+        if public_community_handle(chat) == normalized_handle:
+            return True
+
+    return False
 
 
 def sanitized_community_topic(topic):
@@ -3317,6 +3829,16 @@ def normalized_community_details(raw_details, database, existing_details=None, r
         database,
         raw_details.get("inviteCode") or raw_details.get("invite_code") or existing_details.get("inviteCode")
     )
+    public_handle = normalized_public_handle(
+        raw_details.get("publicHandle")
+        if "publicHandle" in raw_details
+        else raw_details.get("public_handle", existing_details.get("publicHandle"))
+    )
+    existing_chat_id = normalized_entity_id(existing_details.get("chatID"))
+    if public_handle and not is_valid_username(public_handle):
+        raise ValueError("invalid_public_handle")
+    if public_handle and public_community_handle_taken(database, public_handle, excluding_chat_id=existing_chat_id):
+        raise ValueError("public_handle_taken")
 
     previous_is_official = bool(existing_details.get("isOfficial"))
     incoming_is_official = bool(
@@ -3354,6 +3876,7 @@ def normalized_community_details(raw_details, database, existing_details=None, r
         "topics": topics,
         "inviteCode": invite_code,
         "inviteLink": invite_link_for_code(invite_code),
+        "publicHandle": public_handle or None,
         "isOfficial": incoming_is_official,
         "isBlockedByAdmin": incoming_admin_blocked,
     }
@@ -3377,7 +3900,8 @@ def sanitized_community_details(details):
     ]
 
     invite_code = normalized_invite_code(details.get("inviteCode") or details.get("invite_code"))
-    invite_link = normalized_optional_string(details.get("inviteLink") or details.get("invite_link")) or invite_link_for_code(invite_code)
+    invite_link = normalize_invite_link(details.get("inviteLink") or details.get("invite_link"), invite_code)
+    public_handle = normalized_public_handle(details.get("publicHandle") or details.get("public_handle"))
 
     return {
         "kind": kind,
@@ -3387,6 +3911,7 @@ def sanitized_community_details(details):
         "topics": topics,
         "inviteCode": invite_code,
         "inviteLink": invite_link,
+        "publicHandle": public_handle or None,
         "isOfficial": bool(details.get("isOfficial")),
         "isBlockedByAdmin": bool(details.get("isBlockedByAdmin")),
     }
@@ -3448,6 +3973,557 @@ def delete_chat_and_related_records(database, chat_id):
 def chat_is_publicly_joinable(chat):
     community_details = sanitized_community_details(chat.get("communityDetails"))
     return bool((community_details or {}).get("isPublic"))
+
+
+def normalized_public_handle(value):
+    return normalize_username(value)
+
+
+def public_community_handle(chat):
+    details = sanitized_community_details(chat.get("communityDetails")) or {}
+    configured_handle = normalized_public_handle(
+        details.get("publicHandle")
+        or details.get("public_handle")
+        or ""
+    )
+    if configured_handle:
+        return configured_handle
+
+    invite_code = normalized_invite_code(details.get("inviteCode") or details.get("invite_code"))
+    if invite_code:
+        return invite_code.lower()
+
+    return ""
+
+
+def community_kind_for_route(chat):
+    details = sanitized_community_details(chat.get("communityDetails")) or {}
+    kind = normalized_optional_string(details.get("kind")) or "group"
+    return "c" if kind == "channel" else "g"
+
+
+def public_profile_path_for_user(username, user_id=None):
+    normalized_username = normalize_username(username)
+    if normalized_username:
+        return f"/@{normalized_username}"
+
+    normalized_user_id = normalized_entity_id(user_id)
+    if normalized_user_id:
+        return f"/u/{normalized_user_id}"
+
+    return "/"
+
+
+def public_profile_path_for_chat(chat):
+    handle = public_community_handle(chat)
+    if not handle:
+        return "/"
+    return f"/{community_kind_for_route(chat)}/{handle}"
+
+
+def public_profile_url(base_url, path):
+    normalized_base = (base_url or "").rstrip("/")
+    normalized_path = path if path.startswith("/") else f"/{path}"
+    return f"{normalized_base}{normalized_path}" if normalized_base else normalized_path
+
+
+def public_avatar_placeholder_initials(value):
+    text = normalized_optional_string(value) or ""
+    if not text:
+        return "PM"
+
+    parts = [part for part in text.replace("_", " ").replace("-", " ").split() if part]
+    if len(parts) >= 2:
+        initials = f"{parts[0][:1]}{parts[1][:1]}"
+    else:
+        compact = "".join(character for character in text if character.isalnum())
+        initials = compact[:2] if compact else text[:2]
+    return initials.upper() or "PM"
+
+
+def public_avatar_placeholder_colors(seed):
+    palette = [
+        ("#5B8CFF", "#315BDB"),
+        ("#23B5A5", "#157A6E"),
+        ("#FF8A5B", "#E4572E"),
+        ("#7C6CFF", "#5241E6"),
+        ("#F25F8B", "#C93B6C"),
+        ("#4CC26C", "#2F8F4A"),
+        ("#F3B23C", "#D68A00"),
+    ]
+    digest = hashlib.sha256((seed or "prime-messaging").encode("utf-8")).digest()
+    return palette[digest[0] % len(palette)]
+
+
+def public_avatar_placeholder_kind(entity):
+    if not isinstance(entity, dict):
+        return "user"
+    if isinstance(entity.get("profile"), dict):
+        return "user"
+    details = sanitized_community_details(entity.get("communityDetails")) or {}
+    kind = normalized_optional_string(details.get("kind")) or "group"
+    return "channel" if kind == "channel" else "group"
+
+
+def public_entity_title(entity):
+    if not isinstance(entity, dict):
+        return "Prime Messaging"
+    profile = entity.get("profile") or {}
+    if isinstance(profile, dict):
+        username = normalize_username(profile.get("username"))
+        return (
+            normalized_optional_string(profile.get("displayName"))
+            or username
+            or "Prime User"
+        )
+    group = entity.get("group") or {}
+    if isinstance(group, dict):
+        return normalized_optional_string(group.get("title")) or "Prime Community"
+    return "Prime Messaging"
+
+
+def rewrite_public_asset_url(url, fallback_base_url):
+    normalized_url = normalized_optional_url_string(url)
+    if not normalized_url:
+        return None
+
+    parsed = urlparse(normalized_url)
+    if not parsed.scheme and normalized_url.startswith("/"):
+        return public_profile_url(fallback_base_url, normalized_url)
+
+    if parsed.path.startswith("/avatars/"):
+        return public_profile_url(fallback_base_url, parsed.path)
+
+    return normalized_url
+
+
+def public_entity_avatar_placeholder_url(entity, fallback_base_url):
+    kind = public_avatar_placeholder_kind(entity)
+    title = public_entity_title(entity)
+    query = f"kind={quote(kind)}&title={quote(title)}"
+    return public_profile_url(fallback_base_url, f"/public/avatar-placeholder.svg?{query}")
+
+
+def public_entity_avatar_url(entity, fallback_base_url):
+    if not isinstance(entity, dict):
+        return public_profile_url(fallback_base_url, "/public/avatar-placeholder.svg?kind=user&title=Prime%20Messaging")
+
+    avatar_url = None
+    profile = entity.get("profile") or {}
+    if isinstance(profile, dict):
+        avatar_url = normalized_optional_url_string(
+            profile.get("profilePhotoURL")
+            if "profilePhotoURL" in profile
+            else profile.get("profile_photo_url")
+        )
+
+    if not avatar_url:
+        group = entity.get("group") or {}
+        if isinstance(group, dict):
+            avatar_url = normalized_optional_url_string(
+                group.get("photoURL")
+                if "photoURL" in group
+                else group.get("photo_url")
+            )
+
+    return rewrite_public_asset_url(avatar_url, fallback_base_url) or public_entity_avatar_placeholder_url(entity, fallback_base_url)
+
+
+def is_public_user_profile(user):
+    if not isinstance(user, dict):
+        return False
+    username = normalize_username((user.get("profile") or {}).get("username"))
+    return bool(username)
+
+
+def resolve_public_user_by_username(database, username):
+    normalized_username = normalize_username(username)
+    if not normalized_username:
+        return None
+
+    for user in database.get("users", []):
+        if not is_public_user_profile(user):
+            continue
+        profile_username = normalize_username((user.get("profile") or {}).get("username"))
+        if profile_username == normalized_username:
+            return user
+
+    return None
+
+
+def resolve_public_user_by_id(database, user_id):
+    normalized_user_id = normalized_entity_id(user_id)
+    if not normalized_user_id:
+        return None
+
+    for user in database.get("users", []):
+        if normalized_entity_id(user.get("id")) == normalized_user_id:
+            return user
+
+    return None
+
+
+def resolve_public_chat_by_handle(database, handle, kind_hint=None):
+    normalized_handle = normalized_public_handle(handle)
+    if not normalized_handle:
+        return None
+
+    normalized_kind_hint = (kind_hint or "").strip().lower() or None
+    for chat in database.get("chats", []):
+        if chat.get("type") != "group" or not chat_is_publicly_joinable(chat):
+            continue
+
+        details = sanitized_community_details(chat.get("communityDetails")) or {}
+        kind = normalized_optional_string(details.get("kind")) or "group"
+        if normalized_kind_hint == "channel" and kind != "channel":
+            continue
+        if normalized_kind_hint in {"group", "community", "supergroup"} and kind == "channel":
+            continue
+
+        if public_community_handle(chat) == normalized_handle:
+            return chat
+
+    return None
+
+
+def public_user_payload(user, base_url):
+    profile = user.get("profile") or {}
+    user_id = normalized_entity_id(user.get("id"))
+    username = normalize_username(profile.get("username"))
+    display_name = normalized_optional_string(profile.get("displayName")) or username or "Prime user"
+    bio = normalized_optional_string(profile.get("bio")) or "Prime Messaging profile"
+    path = public_profile_path_for_user(username, user_id)
+    return {
+        "entityType": "user",
+        "userID": user_id,
+        "username": username,
+        "title": display_name,
+        "subtitle": f"@{username}" if username else "Prime Messaging",
+        "description": bio,
+        "avatarURL": public_entity_avatar_url(user, base_url),
+        "deepLinkURL": f"primemessaging://user/{username or user_id}" if (username or user_id) else "primemessaging://",
+        "webPath": path,
+        "webURL": public_profile_url(base_url, path),
+        "ogType": "profile",
+        "kindLabel": "Profile",
+        "ctaLabel": "View in Prime Messaging",
+        "inviteCode": None,
+        "communityKind": None,
+        "memberCount": None,
+    }
+
+
+def public_chat_payload(chat, base_url):
+    details = sanitized_community_details(chat.get("communityDetails")) or {}
+    kind = normalized_optional_string(details.get("kind")) or "group"
+    invite_code = normalized_invite_code(details.get("inviteCode"))
+    handle = public_community_handle(chat)
+    group = chat.get("group") or {}
+    title = normalized_optional_string(group.get("title")) or "Prime community"
+    members = group.get("members") or []
+    member_count = max(len(members), 1)
+    if kind == "channel":
+        subtitle = f"{member_count} subscriber" if member_count == 1 else f"{member_count} subscribers"
+        description = normalized_optional_string(group.get("description")) or f"Public channel on Prime Messaging"
+        path = f"/c/{handle}" if handle else (f"/join/{invite_code}" if invite_code else "/")
+        kind_label = "Channel"
+    else:
+        subtitle = f"{member_count} member" if member_count == 1 else f"{member_count} members"
+        description = normalized_optional_string(group.get("description")) or f"Public {kind} on Prime Messaging"
+        path = f"/g/{handle}" if handle else (f"/join/{invite_code}" if invite_code else "/")
+        kind_label = "Group" if kind == "group" else "Community"
+
+    return {
+        "entityType": "community",
+        "username": handle,
+        "title": title,
+        "subtitle": subtitle,
+        "description": description,
+        "avatarURL": public_entity_avatar_url(chat, base_url),
+        "deepLinkURL": f"primemessaging://join/{invite_code}" if invite_code else "primemessaging://",
+        "webPath": path,
+        "webURL": public_profile_url(base_url, path),
+        "ogType": "website",
+        "kindLabel": kind_label,
+        "ctaLabel": f"View in Prime Messaging",
+        "inviteCode": invite_code,
+        "communityKind": kind,
+        "memberCount": member_count,
+        "chatID": normalized_entity_id(chat.get("id")),
+    }
+
+
+def resolve_public_entity(database, username=None, user_id=None, community_handle=None, kind_hint=None):
+    if username:
+        user = resolve_public_user_by_username(database, username)
+        if user:
+            return ("user", user)
+
+    if user_id:
+        user = resolve_public_user_by_id(database, user_id)
+        if user:
+            return ("user", user)
+
+    if community_handle:
+        chat = resolve_public_chat_by_handle(database, community_handle, kind_hint=kind_hint)
+        if chat:
+            return ("community", chat)
+
+    return (None, None)
+
+
+def public_app_store_url(base_url):
+    return public_profile_url(base_url, "/download/")
+
+
+def escape_html(value):
+    return html.escape(str(value or ""), quote=True)
+
+
+def render_public_entity_page(payload, base_url):
+    title = escape_html(payload.get("title"))
+    subtitle = escape_html(payload.get("subtitle"))
+    description = escape_html(payload.get("description"))
+    avatar_url = escape_html(payload.get("avatarURL"))
+    canonical_url = escape_html(payload.get("webURL"))
+    deep_link_url = escape_html(payload.get("deepLinkURL"))
+    app_store_url = escape_html(public_app_store_url(base_url))
+    kind_label = escape_html(payload.get("kindLabel"))
+    cta_label = escape_html(payload.get("ctaLabel"))
+    og_type = escape_html(payload.get("ogType") or "website")
+    page_title = f"{title} — {kind_label} on Prime Messaging"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{escape_html(page_title)}</title>
+    <meta name="description" content="{description}" />
+    <meta name="robots" content="index,follow,max-image-preview:large" />
+    <link rel="canonical" href="{canonical_url}" />
+    <meta property="og:type" content="{og_type}" />
+    <meta property="og:site_name" content="Prime Messaging" />
+    <meta property="og:title" content="{escape_html(page_title)}" />
+    <meta property="og:description" content="{description}" />
+    <meta property="og:url" content="{canonical_url}" />
+    <meta property="og:image" content="{avatar_url}" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="{escape_html(page_title)}" />
+    <meta name="twitter:description" content="{description}" />
+    <meta name="twitter:image" content="{avatar_url}" />
+    <meta name="theme-color" content="#971b23" />
+    <style>
+      :root {{
+        color-scheme: light;
+        --bg: #f6efe8;
+        --surface: rgba(255,255,255,0.86);
+        --surface-border: rgba(151,27,35,0.14);
+        --text: #1f1614;
+        --muted: #72635e;
+        --accent: #971b23;
+        --accent-strong: #7d151d;
+      }}
+      * {{ box-sizing: border-box; }}
+      body {{
+        margin: 0;
+        min-height: 100vh;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
+        background:
+          radial-gradient(circle at top left, rgba(151,27,35,0.18), transparent 34%),
+          radial-gradient(circle at bottom right, rgba(37,93,138,0.16), transparent 30%),
+          var(--bg);
+        color: var(--text);
+        display: grid;
+        place-items: center;
+        padding: 24px;
+      }}
+      .card {{
+        width: min(100%, 520px);
+        background: var(--surface);
+        backdrop-filter: blur(16px);
+        border: 1px solid var(--surface-border);
+        border-radius: 28px;
+        padding: 28px;
+        box-shadow: 0 24px 80px rgba(20, 12, 11, 0.14);
+      }}
+      .brand {{
+        font-size: 12px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--muted);
+        margin-bottom: 20px;
+      }}
+      .hero {{
+        display: grid;
+        justify-items: center;
+        text-align: center;
+        gap: 14px;
+      }}
+      .avatar {{
+        width: 112px;
+        height: 112px;
+        border-radius: 28px;
+        object-fit: cover;
+        background: #f2d9d0;
+        border: 1px solid rgba(151,27,35,0.12);
+      }}
+      h1 {{
+        margin: 0;
+        font-size: clamp(28px, 5vw, 40px);
+        line-height: 1.05;
+      }}
+      .subtitle {{
+        margin: 0;
+        color: var(--muted);
+        font-size: 16px;
+      }}
+      .description {{
+        margin: 0;
+        color: var(--text);
+        font-size: 16px;
+        line-height: 1.6;
+      }}
+      .actions {{
+        display: grid;
+        gap: 12px;
+        margin-top: 24px;
+      }}
+      .btn {{
+        display: inline-flex;
+        justify-content: center;
+        align-items: center;
+        min-height: 52px;
+        border-radius: 16px;
+        text-decoration: none;
+        font-weight: 700;
+        padding: 0 18px;
+      }}
+      .btn-primary {{
+        background: var(--accent);
+        color: white;
+      }}
+      .btn-primary:hover {{
+        background: var(--accent-strong);
+      }}
+      .btn-secondary {{
+        background: white;
+        color: var(--text);
+        border: 1px solid rgba(151,27,35,0.12);
+      }}
+      .foot {{
+        margin-top: 16px;
+        text-align: center;
+        color: var(--muted);
+        font-size: 13px;
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <div class="brand">Prime Messaging</div>
+      <section class="hero">
+        <img class="avatar" src="{avatar_url}" alt="" />
+        <div class="eyebrow">{kind_label}</div>
+        <h1>{title}</h1>
+        <p class="subtitle">{subtitle}</p>
+        <p class="description">{description}</p>
+      </section>
+      <div class="actions">
+        <a class="btn btn-primary" href="{deep_link_url}">{cta_label}</a>
+        <a class="btn btn-secondary" href="{app_store_url}">Download Prime Messaging</a>
+      </div>
+      <p class="foot">Open this link on iPhone to jump straight into Prime Messaging.</p>
+    </main>
+  </body>
+</html>
+"""
+
+
+def render_public_not_found_page(base_url):
+    app_store_url = escape_html(public_app_store_url(base_url))
+    return f"""<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Not found — Prime Messaging</title>
+    <meta name="robots" content="noindex,nofollow" />
+    <style>
+      body {{
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
+        background: #f7f0eb;
+        color: #211816;
+      }}
+      .card {{
+        max-width: 480px;
+        background: white;
+        border-radius: 24px;
+        padding: 28px;
+        box-shadow: 0 20px 60px rgba(0,0,0,0.08);
+        text-align: center;
+      }}
+      a {{
+        color: white;
+        background: #971b23;
+        text-decoration: none;
+        padding: 14px 18px;
+        border-radius: 14px;
+        display: inline-block;
+        margin-top: 16px;
+        font-weight: 700;
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <h1>Prime Messaging link not found</h1>
+      <p>This public profile or community is unavailable, private, or no longer exists.</p>
+      <a href="{app_store_url}">Download Prime Messaging</a>
+    </main>
+  </body>
+</html>
+"""
+
+
+def render_public_avatar_placeholder_svg(kind, title):
+    normalized_kind = (kind or "user").strip().lower()
+    label = title or "Prime Messaging"
+    initials = public_avatar_placeholder_initials(label)
+    start_color, end_color = public_avatar_placeholder_colors(f"{normalized_kind}:{label}")
+    icon_svg = ""
+    if normalized_kind == "channel":
+        icon_svg = '<path d="M74 57 L184 18 L152 128 L116 92 L86 118 Z" fill="rgba(255,255,255,0.20)" />'
+    elif normalized_kind == "group":
+        icon_svg = (
+            '<circle cx="92" cy="82" r="24" fill="rgba(255,255,255,0.18)" />'
+            '<circle cx="164" cy="82" r="24" fill="rgba(255,255,255,0.18)" />'
+            '<path d="M56 160c8-28 34-42 56-42s48 14 56 42" fill="rgba(255,255,255,0.14)" />'
+            '<path d="M128 160c8-28 34-42 56-42s48 14 56 42" fill="rgba(255,255,255,0.10)" />'
+        )
+    else:
+        icon_svg = (
+            '<circle cx="128" cy="86" r="34" fill="rgba(255,255,255,0.18)" />'
+            '<path d="M64 182c10-36 40-54 64-54s54 18 64 54" fill="rgba(255,255,255,0.12)" />'
+        )
+
+    escaped_initials = escape_html(initials)
+    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="24" y1="24" x2="232" y2="232" gradientUnits="userSpaceOnUse">
+      <stop stop-color="{start_color}"/>
+      <stop offset="1" stop-color="{end_color}"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="64" fill="url(#bg)"/>
+  {icon_svg}
+  <text x="128" y="150" text-anchor="middle" fill="white" font-size="68" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-weight="700">{escaped_initials}</text>
+</svg>"""
 
 
 def normalized_group_moderation_settings(raw_settings, existing_settings=None):
@@ -4315,6 +5391,7 @@ def chat_participant_payload(database, user_id):
         "id": user_id,
         "username": user["profile"].get("username") or "",
         "displayName": resolved_user_display_name(user),
+        "photoURL": normalized_optional_url_string(user["profile"].get("profilePhotoURL")),
     }
 
 
@@ -4711,7 +5788,7 @@ def message_preview(message):
         return "Message deleted"
 
     if message.get("text"):
-        return message["text"]
+        return strip_rich_message_markup(message["text"])
 
     if message.get("voiceMessage"):
         return "Voice message"
@@ -4730,6 +5807,32 @@ def message_preview(message):
         "location": "Location",
     }
     return previews.get(first_type, "Attachment")
+
+
+def strip_rich_message_markup(value):
+    text = normalized_optional_string(value)
+    if not text:
+        return text
+
+    text = re.sub(r"<a\s+href=\"[^\"]+\">(.*?)</a>", r"\1", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"</?(b|i|u|s|code|spoiler)>", "", text, flags=re.IGNORECASE)
+    text = text.replace("[ ] ", "☐ ").replace("[x] ", "☑ ").replace("[X] ", "☑ ")
+    return text
+
+
+def sanitized_link_preview(link_preview):
+    if not isinstance(link_preview, dict):
+        return None
+
+    selected_url = normalized_optional_url_string(link_preview.get("selectedURL") or link_preview.get("selected_url"))
+    is_disabled = bool(link_preview.get("isDisabled") or link_preview.get("is_disabled"))
+    if not selected_url and not is_disabled:
+        return None
+
+    return {
+        "selectedURL": selected_url,
+        "isDisabled": is_disabled,
+    }
 
 
 def sender_display_name_for(message, database):
@@ -5037,6 +6140,7 @@ def serialize_message(message, database):
         "kind": message.get("kind", "text"),
         "text": None if is_deleted else message["text"],
         "attachments": [] if is_deleted else sanitized_attachments(message.get("attachments", [])),
+        "linkPreview": None if is_deleted else sanitized_link_preview(message.get("linkPreview")),
         "replyToMessageID": message.get("replyToMessageID"),
         "replyPreview": None if is_deleted else sanitized_reply_preview(message.get("replyPreview")),
         "communityContext": None if is_deleted else sanitized_community_message_context(message.get("communityContext")),
@@ -5090,6 +6194,26 @@ def realtime_publish_message_event(database, chat, message, event_type, actor_us
             },
             chat_id=chat.get("id"),
             dispatch_kind="message",
+        )
+
+
+def realtime_publish_chat_resync_event(database, chat, actor_user_id=None):
+    if not chat:
+        return
+
+    participant_ids = unique_entity_ids(chat.get("participantIDs") or [])
+    for participant_id in participant_ids:
+        REALTIME_HUB.enqueue_event(
+            participant_id,
+            {
+                "type": "chat.resync_required",
+                "chatID": chat.get("id"),
+                "mode": chat.get("mode"),
+                "actorUserID": normalized_entity_id(actor_user_id),
+                "chat": serialize_chat(chat, participant_id, database),
+            },
+            chat_id=chat.get("id"),
+            dispatch_kind="chat",
         )
 
 
@@ -5458,10 +6582,26 @@ def is_ios_apns_target(entry):
 
 
 def push_payload_for_message(chat, message, database):
-    title = (
-        (chat.get("group") or {}).get("title")
+    sender = find_user(database, message.get("senderID"))
+    sender_profile = (sender or {}).get("profile") or {}
+    group = chat.get("group") or {}
+    community_kind = normalized_optional_string((chat.get("communityDetails") or {}).get("kind"))
+    is_channel = community_kind == "channel"
+    sender_name = None if is_channel else sender_display_name_for(message, database)
+    group_title = (
+        normalized_optional_string(group.get("title"))
         if chat.get("type") == "group"
-        else sender_display_name_for(message, database)
+        else None
+    )
+    group_photo_url = (
+        normalized_optional_url_string(group.get("photoURL"))
+        if chat.get("type") == "group"
+        else None
+    )
+    title = (
+        group_title
+        if chat.get("type") == "group"
+        else sender_name
     ) or "Prime Messaging"
 
     return {
@@ -5471,6 +6611,12 @@ def push_payload_for_message(chat, message, database):
         "chat_type": chat["type"],
         "title": title,
         "body": message_preview(message) or "New message",
+        "sender_id": normalized_optional_string(message.get("senderID")),
+        "sender_name": sender_name,
+        "sender_photo_url": normalized_optional_url_string(sender_profile.get("profilePhotoURL")),
+        "group_title": group_title,
+        "group_photo_url": group_photo_url,
+        "community_kind": community_kind,
     }
 
 
@@ -5517,11 +6663,18 @@ def apns_payload_for_message(payload, badge_count):
             },
             "sound": "default",
             "badge": max(0, int(badge_count or 0)),
+            "mutable-content": 1,
         },
         "chat_id": payload["chat_id"],
         "message_id": payload["message_id"],
         "mode": payload["mode"],
         "chat_type": payload["chat_type"],
+        "sender_id": payload.get("sender_id"),
+        "sender_name": payload.get("sender_name"),
+        "sender_photo_url": payload.get("sender_photo_url"),
+        "group_title": payload.get("group_title"),
+        "group_photo_url": payload.get("group_photo_url"),
+        "community_kind": payload.get("community_kind"),
     }
 
 
@@ -5570,20 +6723,48 @@ def push_payload_for_call(call, database, recipient_user_id=None):
     caller_name = resolved_user_display_name(caller) if caller else "Someone"
     issued_at = now_iso()
     normalized_recipient_user_id = normalized_entity_id(recipient_user_id)
+    scope = normalized_optional_string(call.get("scope")) or "direct"
+    chat_title = None
+    call_display_name = caller_name
+    notification_type = "incoming_call"
+    title = "Incoming call"
+    body = f"{caller_name} is calling"
+
+    if scope == "group":
+        chat = find_chat(database, call.get("chatID"))
+        if chat:
+            chat_title = normalized_optional_string(
+                chat_title_for(
+                    chat,
+                    normalized_recipient_user_id or call.get("callerID"),
+                    database,
+                )
+            )
+        call_display_name = chat_title or "Group Call"
+        notification_type = "incoming_group_call"
+        title = "Group call"
+        if chat_title:
+            body = f"{caller_name} started a call in {chat_title}"
+        else:
+            body = f"{caller_name} started a group call"
+
     return {
         "call_id": call["id"],
         "chat_id": call.get("chatID"),
         "mode": call.get("mode") or "online",
         "kind": call.get("kind") or "audio",
+        "scope": scope,
         "caller_id": call.get("callerID"),
         "callee_id": call.get("calleeID"),
         "recipient_user_id": normalized_recipient_user_id or call.get("calleeID"),
         "caller_name": caller_name,
+        "call_display_name": call_display_name,
+        "chat_title": chat_title,
         "call_event_id": str(uuid.uuid4()),
         "issued_at": issued_at,
-        "notification_type": "incoming_call",
-        "title": "Incoming call",
-        "body": f"{caller_name} is calling",
+        "notification_type": notification_type,
+        "title": title,
+        "body": body,
     }
 
 
@@ -5597,10 +6778,13 @@ def apns_payload_for_call(payload, badge_count, push_type="alert"):
             "chat_id": payload["chat_id"],
             "mode": payload["mode"],
             "kind": payload.get("kind") or "audio",
+            "scope": payload.get("scope") or "direct",
             "caller_id": payload.get("caller_id"),
             "callee_id": payload.get("callee_id"),
             "recipient_user_id": payload.get("recipient_user_id"),
             "caller_name": payload.get("caller_name"),
+            "call_display_name": payload.get("call_display_name"),
+            "chat_title": payload.get("chat_title"),
             "call_event_id": payload.get("call_event_id"),
             "issued_at": payload.get("issued_at"),
             "notification_type": payload.get("notification_type") or "incoming_call",
@@ -5622,10 +6806,13 @@ def apns_payload_for_call(payload, badge_count, push_type="alert"):
         "chat_id": payload["chat_id"],
         "mode": payload["mode"],
         "kind": payload.get("kind") or "audio",
+        "scope": payload.get("scope") or "direct",
         "caller_id": payload.get("caller_id"),
         "callee_id": payload.get("callee_id"),
         "recipient_user_id": payload.get("recipient_user_id"),
         "caller_name": payload.get("caller_name"),
+        "call_display_name": payload.get("call_display_name"),
+        "chat_title": payload.get("chat_title"),
         "call_event_id": payload.get("call_event_id"),
         "issued_at": payload.get("issued_at"),
         "notification_type": payload.get("notification_type") or "incoming_call",
@@ -5948,10 +7135,30 @@ def log_push_dispatch_attempt(database, chat, message):
 
 
 ACTIVE_CALL_STATES = {"ringing", "active"}
+EARLY_CALLEE_HANGUP_GUARD_SECONDS = float(
+    os.environ.get("PRIME_CALL_EARLY_CALLEE_HANGUP_GUARD_SECONDS", "3.0")
+)
+EARLY_CALLEE_FOREIGN_SESSION_HANGUP_GUARD_SECONDS = float(
+    os.environ.get("PRIME_CALL_EARLY_CALLEE_FOREIGN_SESSION_HANGUP_GUARD_SECONDS", "45.0")
+)
 
 
 def call_involves_user(call, user_id):
-    return ids_equal(call.get("callerID"), user_id) or ids_equal(call.get("calleeID"), user_id)
+    return normalized_entity_id(user_id) in set(call_participant_ids(call))
+
+
+def call_participant_ids(call):
+    participant_ids = unique_entity_ids((call or {}).get("participantIDs") or [])
+    if participant_ids:
+        return participant_ids
+    return unique_entity_ids([(call or {}).get("callerID"), (call or {}).get("calleeID")])
+
+
+def call_joined_participant_ids(call):
+    joined_participant_ids = unique_entity_ids((call or {}).get("joinedParticipantIDs") or [])
+    if joined_participant_ids:
+        return joined_participant_ids
+    return []
 
 
 def visible_call_for_client(call):
@@ -5981,10 +7188,12 @@ def call_participant_payload(database, user_id):
 
 def serialize_call(call, viewer_id, database):
     participants = [
-        payload for payload in (
-            call_participant_payload(database, call.get("callerID")),
-            call_participant_payload(database, call.get("calleeID")),
-        ) if payload is not None
+        payload
+        for payload in (
+            call_participant_payload(database, participant_id)
+            for participant_id in call_participant_ids(call)
+        )
+        if payload is not None
     ]
     latest_remote_offer = latest_remote_offer_event_for_viewer(database, call, viewer_id)
 
@@ -5997,6 +7206,7 @@ def serialize_call(call, viewer_id, database):
         "callerID": call.get("callerID"),
         "calleeID": call.get("calleeID"),
         "participants": participants,
+        "joinedParticipantIDs": call_joined_participant_ids(call),
         "createdAt": call.get("createdAt"),
         "answeredAt": call.get("answeredAt"),
         "endedAt": call.get("endedAt"),
@@ -6019,6 +7229,7 @@ def serialize_call_event(event):
         "sequence": int(event.get("sequence") or 0),
         "type": event.get("type"),
         "senderID": event.get("senderID"),
+        "targetUserID": payload.get("targetUserID"),
         "sdp": payload.get("sdp"),
         "candidate": payload.get("candidate"),
         "sdpMid": payload.get("sdpMid"),
@@ -6030,6 +7241,7 @@ def serialize_call_event(event):
 
 
 def append_call_event(database, call, event_type, sender_id=None, payload=None):
+    global CALL_EVENTS_INDEX_EVENT_COUNT
     next_sequence = int(call.get("lastEventSequence") or 0) + 1
     event = {
         "id": str(uuid.uuid4()),
@@ -6041,19 +7253,28 @@ def append_call_event(database, call, event_type, sender_id=None, payload=None):
         "createdAt": now_iso(),
     }
     database["callEvents"].append(event)
+    indexed_call_id = normalized_entity_id(call.get("id"))
+    if indexed_call_id:
+        ensure_call_events_index(database).setdefault(indexed_call_id, []).append(event)
+        CALL_EVENTS_INDEX_EVENT_COUNT = len(database.get("callEvents", []))
     call["lastEventSequence"] = next_sequence
     call["updatedAt"] = event["createdAt"]
     return event
 
 
 def call_events_for(database, call_id, since_sequence):
-    return sorted(
-        [
-            event for event in database.get("callEvents", [])
-            if ids_equal(event.get("callID"), call_id) and int(event.get("sequence") or 0) > since_sequence
-        ],
-        key=lambda item: int(item.get("sequence") or 0),
-    )
+    normalized_call_id = normalized_entity_id(call_id)
+    if not normalized_call_id:
+        return []
+
+    events_for_call = ensure_call_events_index(database).get(normalized_call_id, [])
+    if since_sequence <= 0:
+        return list(events_for_call)
+
+    return [
+        event for event in events_for_call
+        if int(event.get("sequence") or 0) > since_sequence
+    ]
 
 
 def latest_remote_offer_event_for_viewer(database, call, viewer_id):
@@ -6064,9 +7285,7 @@ def latest_remote_offer_event_for_viewer(database, call, viewer_id):
 
     latest_event = None
     latest_sequence = -1
-    for event in database.get("callEvents", []):
-        if not ids_equal(event.get("callID"), call_id):
-            continue
+    for event in ensure_call_events_index(database).get(call_id, []):
         if normalized_optional_string(event.get("type")) != "offer":
             continue
 
@@ -6075,6 +7294,9 @@ def latest_remote_offer_event_for_viewer(database, call, viewer_id):
             continue
 
         payload = event.get("payload") or {}
+        target_user_id = normalized_entity_id(payload.get("targetUserID"))
+        if target_user_id and not ids_equal(target_user_id, viewer_id):
+            continue
         sdp = normalized_optional_string(payload.get("sdp"))
         if not sdp:
             continue
@@ -6160,6 +7382,8 @@ def group_invite_requires_saved_contact(database, inviter, invitee):
 def active_call_between(database, caller_id, callee_id, mode):
     participant_ids = {normalized_entity_id(caller_id), normalized_entity_id(callee_id)}
     for call in database.get("calls", []):
+        if normalized_optional_string(call.get("scope")) == "group":
+            continue
         if call.get("mode") != mode:
             continue
         if normalized_optional_string(call.get("state")) not in ACTIVE_CALL_STATES:
@@ -6167,6 +7391,33 @@ def active_call_between(database, caller_id, callee_id, mode):
         if {normalized_entity_id(call.get("callerID")), normalized_entity_id(call.get("calleeID"))} == participant_ids:
             return call
     return None
+
+
+def active_group_call_for_chat(database, chat_id, user_id=None, mode="online"):
+    normalized_chat_id = normalized_entity_id(chat_id)
+    normalized_user_id = normalized_entity_id(user_id)
+    if not normalized_chat_id:
+        return None
+
+    candidates = []
+    for call in database.get("calls", []):
+        if normalized_optional_string(call.get("scope")) != "group":
+            continue
+        if not ids_equal(call.get("chatID"), normalized_chat_id):
+            continue
+        if call.get("mode") != mode:
+            continue
+        if normalized_optional_string(call.get("state")) not in ACTIVE_CALL_STATES:
+            continue
+        if normalized_user_id and normalized_user_id not in set(call_participant_ids(call)):
+            continue
+        candidates.append(call)
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item.get("createdAt") or "", reverse=True)
+    return candidates[0]
 
 
 def can_manage_call(call, user_id):
@@ -6252,6 +7503,100 @@ def log_call_dispatch_attempt(database, call):
         )
 
 
+def log_group_call_dispatch_attempt(database, call, initiator_user_id=None):
+    if normalized_optional_string(call.get("scope")) != "group":
+        return
+    if normalized_optional_string(call.get("state")) not in ACTIVE_CALL_STATES:
+        return
+
+    initiator_user_id = normalized_entity_id(initiator_user_id)
+    joined_participant_ids = set(call_joined_participant_ids(call))
+    recipient_ids = [
+        participant_id
+        for participant_id in call_participant_ids(call)
+        if not ids_equal(participant_id, initiator_user_id)
+        and participant_id not in joined_participant_ids
+    ]
+
+    if not recipient_ids:
+        return
+
+    log_event(
+        "group_call.dispatch.provider_state",
+        configured=APNS_PROVIDER.is_configured,
+        configuration_error=APNS_PROVIDER.configuration_error,
+        configured_environment=APNS_PROVIDER.environment,
+        topic=APNS_PROVIDER.topic,
+        voip_topic=(APNS_VOIP_TOPIC or None),
+        call_id=call["id"],
+        recipient_count=len(recipient_ids),
+        recipient_ids=recipient_ids,
+    )
+
+    for recipient_id in recipient_ids:
+        device_tokens = [
+            token for token in database.get("deviceTokens", [])
+            if ids_equal(token.get("userID"), recipient_id)
+        ]
+        deduplicated = []
+        seen_tokens = set()
+        seen_user_devices = set()
+        for entry in device_tokens:
+            token_value = normalized_apns_device_token(entry.get("token"))
+            if not token_value or token_value in seen_tokens:
+                continue
+            normalized_recipient_user_id = normalized_entity_id(entry.get("userID"))
+            recipient_device_id = normalized_device_identifier(entry.get("deviceID"))
+            token_type = normalized_device_token_type(entry.get("tokenType"))
+            user_device_key = (
+                normalized_recipient_user_id,
+                recipient_device_id,
+                token_type,
+            ) if normalized_recipient_user_id and recipient_device_id else None
+            if user_device_key and user_device_key in seen_user_devices:
+                continue
+            seen_tokens.add(token_value)
+            if user_device_key:
+                seen_user_devices.add(user_device_key)
+            deduplicated.append(entry)
+
+        voip_device_tokens = [token for token in deduplicated if is_voip_device_token_entry(token)]
+        alert_device_tokens = [token for token in deduplicated if is_alert_device_token_entry(token)]
+        if not voip_device_tokens and not alert_device_tokens:
+            log_event(
+                "group_call.dispatch.skipped",
+                reason="no_device_tokens",
+                call_id=call["id"],
+                recipient_id=recipient_id,
+            )
+            continue
+
+        payload = push_payload_for_call(call, database, recipient_user_id=recipient_id)
+        context = {
+            "call_id": call["id"],
+            "recipient_id": recipient_id,
+            "scope": "group",
+        }
+        log_event(
+            "group_call.dispatch.queued",
+            voip_recipient_count=len(voip_device_tokens),
+            alert_recipient_count=len(alert_device_tokens),
+            **context,
+        )
+        if voip_device_tokens:
+            schedule_apns_dispatch("call", voip_device_tokens, payload, context)
+        if alert_device_tokens:
+            schedule_apns_dispatch(
+                "call_alert",
+                alert_device_tokens,
+                payload,
+                {
+                    **context,
+                    "fallback": "alert",
+                },
+            )
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
@@ -6296,11 +7641,26 @@ class Handler(BaseHTTPRequestHandler):
             if did_prune_self_destruct:
                 save_db(database)
 
+            if parsed.path == "/app/version-policy":
+                params = parse_qs(parsed.query)
+                current_version = (
+                    normalized_optional_string((params.get("version") or [""])[0])
+                    or normalized_optional_string(self.headers.get("X-Prime-App-Version"))
+                )
+                return self.respond(200, app_version_policy_payload_from_database(database, current_version=current_version))
+
             if parsed.path == "/admin/summary":
                 admin_error = admin_request_error(database, self.headers)
                 if admin_error:
                     return self.respond(401 if admin_error in {"admin_not_configured", "admin_token_required", "admin_auth_required"} else 403, {"error": admin_error})
                 return self.respond(200, admin_summary_payload(database))
+
+            if parsed.path == "/admin/app-version-policy":
+                admin_error = admin_request_error(database, self.headers)
+                if admin_error:
+                    return self.respond(401 if admin_error in {"admin_not_configured", "admin_token_required", "admin_auth_required"} else 403, {"error": admin_error})
+                current_version = normalized_optional_string(self.headers.get("X-Prime-App-Version"))
+                return self.respond(200, app_version_policy_payload_from_database(database, current_version=current_version))
 
             if parsed.path == "/admin/users":
                 admin_error = admin_request_error(database, self.headers)
@@ -6460,6 +7820,32 @@ class Handler(BaseHTTPRequestHandler):
                 user_id = normalized_entity_id((params.get("user_id") or [""])[0].strip() or None)
                 available = bool(username) and is_valid_username(normalize_username(username)) and not username_taken(database, username, user_id)
                 return self.respond(200, {"available": available})
+
+            if parsed.path == "/public/resolve":
+                params = parse_qs(parsed.query)
+                username = (params.get("username") or [""])[0].strip()
+                user_id = (params.get("user_id") or [""])[0].strip()
+                community_handle = (
+                    (params.get("community") or [""])[0].strip()
+                    or (params.get("handle") or [""])[0].strip()
+                )
+                kind_hint = (
+                    (params.get("kind") or [""])[0].strip().lower()
+                    or None
+                )
+
+                entity_type, entity = resolve_public_entity(
+                    database,
+                    username=username,
+                    user_id=user_id,
+                    community_handle=community_handle,
+                    kind_hint=kind_hint,
+                )
+                if entity_type == "user":
+                    return self.respond(200, public_user_payload(entity, self.base_url()))
+                if entity_type == "community":
+                    return self.respond(200, public_chat_payload(entity, self.base_url()))
+                return self.respond(404, {"error": "public_entity_not_found"})
 
             if parsed.path == "/users/search":
                 params = parse_qs(parsed.query)
@@ -6694,7 +8080,9 @@ class Handler(BaseHTTPRequestHandler):
                 calls = [
                     serialize_call(call, current_user["id"], database)
                     for call in database.get("calls", [])
-                    if call_involves_user(call, current_user["id"]) and visible_call_for_client(call)
+                    if normalized_optional_string(call.get("scope")) != "group"
+                    and call_involves_user(call, current_user["id"])
+                    and visible_call_for_client(call)
                 ]
                 calls.sort(key=lambda item: item.get("createdAt") or "", reverse=True)
                 return self.respond(200, calls)
@@ -6727,6 +8115,40 @@ class Handler(BaseHTTPRequestHandler):
                     reverse=True,
                 )
                 return self.respond(200, calls)
+
+            if parsed.path == "/group-calls/active":
+                params = parse_qs(parsed.query)
+                fallback_user_id = (
+                    (params.get("user_id") or [""])[0].strip()
+                    or (params.get("viewer_id") or [""])[0].strip()
+                    or None
+                )
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    fallback_user_id,
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                chat_id = normalized_entity_id((params.get("chat_id") or [""])[0].strip())
+                if not chat_id:
+                    return self.respond(200, None)
+
+                mode = (params.get("mode") or ["online"])[0].strip() or "online"
+                active_call = active_group_call_for_chat(
+                    database,
+                    chat_id=chat_id,
+                    user_id=current_user["id"],
+                    mode=mode,
+                )
+                return self.respond(
+                    200,
+                    serialize_call(active_call, current_user["id"], database) if active_call else None,
+                )
 
             if parsed.path.startswith("/calls/") and parsed.path.endswith("/events"):
                 params = parse_qs(parsed.query)
@@ -6768,6 +8190,39 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return self.respond(200, events)
 
+            if parsed.path.startswith("/group-calls/") and parsed.path.endswith("/events"):
+                params = parse_qs(parsed.query)
+                fallback_user_id = (
+                    (params.get("user_id") or [""])[0].strip()
+                    or (params.get("viewer_id") or [""])[0].strip()
+                    or None
+                )
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    fallback_user_id,
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                call_id = normalized_entity_id(parsed.path.split("/")[2])
+                call = find_call(database, call_id)
+                if not call or normalized_optional_string(call.get("scope")) != "group":
+                    return self.respond(404, {"error": "call_not_found"})
+                if not can_manage_call(call, current_user["id"]):
+                    return self.respond(403, {"error": "call_permission_denied"})
+
+                try:
+                    since_sequence = int((params.get("since") or ["0"])[0])
+                except ValueError:
+                    since_sequence = 0
+
+                events = [serialize_call_event(event) for event in call_events_for(database, call_id, since_sequence)]
+                return self.respond(200, events)
+
             if parsed.path.startswith("/calls/"):
                 params = parse_qs(parsed.query)
                 fallback_user_id = (
@@ -6789,6 +8244,33 @@ class Handler(BaseHTTPRequestHandler):
                 call_id = normalized_entity_id(parsed.path.split("/")[2])
                 call = find_call(database, call_id)
                 if not call:
+                    return self.respond(404, {"error": "call_not_found"})
+                if not can_manage_call(call, current_user["id"]):
+                    return self.respond(403, {"error": "call_permission_denied"})
+
+                return self.respond(200, serialize_call(call, current_user["id"], database))
+
+            if parsed.path.startswith("/group-calls/"):
+                params = parse_qs(parsed.query)
+                fallback_user_id = (
+                    (params.get("user_id") or [""])[0].strip()
+                    or (params.get("viewer_id") or [""])[0].strip()
+                    or None
+                )
+                current_user, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    fallback_user_id,
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                call_id = normalized_entity_id(parsed.path.split("/")[2])
+                call = find_call(database, call_id)
+                if not call or normalized_optional_string(call.get("scope")) != "group":
                     return self.respond(404, {"error": "call_not_found"})
                 if not can_manage_call(call, current_user["id"]):
                     return self.respond(403, {"error": "call_permission_denied"})
@@ -6892,6 +8374,9 @@ class Handler(BaseHTTPRequestHandler):
 
                 return self.respond(200, moderation_dashboard_payload(chat, database))
 
+        if self.serve_public_web_route(parsed, database):
+            return
+
         if self.serve_website_route(parsed.path):
             return
 
@@ -6909,6 +8394,8 @@ class Handler(BaseHTTPRequestHandler):
                 method="POST",
                 path=self.path,
                 error=type(error).__name__,
+                detail=str(error),
+                traceback=traceback.format_exc(),
             )
             return self.respond(500, {"error": "internal_server_error"})
 
@@ -7096,6 +8583,48 @@ class Handler(BaseHTTPRequestHandler):
             if did_prune_self_destruct:
                 save_db(database)
 
+            if method == "POST" and parsed.path == "/support/contact":
+                name = normalized_optional_string(payload.get("name")) or "Website visitor"
+                email = normalize_email(payload.get("email"))
+                subject = (
+                    normalized_optional_string(payload.get("subject"))
+                    or normalized_optional_string(payload.get("topic"))
+                    or "Support request"
+                )
+                message_text = (
+                    normalized_optional_string(payload.get("message"))
+                    or normalized_optional_string(payload.get("body"))
+                )
+                locale = normalized_optional_string(payload.get("locale")) or "en"
+                page_url = normalized_optional_string(payload.get("page_url")) or normalized_optional_string(payload.get("pageURL"))
+
+                if not email or not is_valid_email(email):
+                    return self.respond(409, {"error": "invalid_email"})
+                if not message_text or len(message_text) < 10:
+                    return self.respond(409, {"error": "invalid_message"})
+
+                ok, delivery_error = support_contact_send_email(
+                    name=name,
+                    email=email,
+                    subject=subject,
+                    message_text=message_text,
+                    locale=locale,
+                    page_url=page_url,
+                )
+                log_event(
+                    "support.contact.submitted",
+                    sender_name=name,
+                    sender_email=email,
+                    subject=subject,
+                    locale=locale,
+                    page_url=page_url,
+                    delivered=ok,
+                    error=delivery_error,
+                )
+                if not ok:
+                    return self.respond(503, {"error": delivery_error or "support_delivery_failed"})
+                return self.respond(200, {"ok": True})
+
             if method == "POST" and parsed.path == "/admin/cleanup/legacy-placeholders":
                 admin_error = admin_request_error(database, self.headers)
                 if admin_error:
@@ -7213,6 +8742,44 @@ class Handler(BaseHTTPRequestHandler):
                     "broadcastID": broadcast_payload["broadcast_id"],
                 })
 
+            if method == "PATCH" and parsed.path == "/admin/app-version-policy":
+                admin_error = admin_request_error(database, self.headers)
+                if admin_error:
+                    return self.respond(401 if admin_error in {"admin_not_configured", "admin_token_required", "admin_auth_required"} else 403, {"error": admin_error})
+
+                existing_policy = stored_app_version_policy(database)
+                latest_version = normalized_optional_string(payload.get("latestVersion")) or normalized_optional_string(existing_policy.get("latestVersion"))
+                minimum_supported_version = normalized_optional_string(payload.get("minimumSupportedVersion"))
+                app_store_url = normalized_optional_string(payload.get("appStoreURL")) or normalized_optional_string(existing_policy.get("appStoreURL")) or APP_STORE_URL
+                title = normalized_optional_string(payload.get("title")) or APP_UPDATE_TITLE
+                message = normalized_optional_string(payload.get("message")) or APP_UPDATE_MESSAGE
+                required_title = normalized_optional_string(payload.get("requiredTitle")) or APP_UPDATE_REQUIRED_TITLE
+                required_message = normalized_optional_string(payload.get("requiredMessage")) or APP_UPDATE_REQUIRED_MESSAGE
+
+                if not latest_version:
+                    return self.respond(409, {"error": "invalid_latest_version"})
+                if minimum_supported_version and compare_versions(minimum_supported_version, latest_version) > 0:
+                    return self.respond(409, {"error": "minimum_version_above_latest"})
+
+                database["appVersionPolicy"] = {
+                    "latestVersion": latest_version,
+                    "minimumSupportedVersion": minimum_supported_version,
+                    "appStoreURL": app_store_url,
+                    "title": title,
+                    "message": message,
+                    "requiredTitle": required_title,
+                    "requiredMessage": required_message,
+                    "updatedAt": now_iso(),
+                }
+                save_db(database)
+                log_event(
+                    "admin.app_version_policy.updated",
+                    latest_version=latest_version,
+                    minimum_supported_version=minimum_supported_version,
+                    app_store_url=app_store_url,
+                )
+                return self.respond(200, app_version_policy_payload_from_database(database))
+
             if method == "POST" and parsed.path.startswith("/admin/users/") and parsed.path.endswith("/ban"):
                 admin_error = admin_request_error(database, self.headers)
                 if admin_error:
@@ -7257,6 +8824,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(409, {"error": "invalid_group_chat"})
 
                 existing_details = sanitized_community_details(chat.get("communityDetails")) or {}
+                existing_details["chatID"] = chat.get("id")
                 if existing_details.get("kind") not in {"channel", "community"}:
                     return self.respond(409, {"error": "invalid_group_chat"})
 
@@ -7277,6 +8845,8 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 except PermissionError as error:
                     return self.respond(403, {"error": str(error)})
+                except ValueError as error:
+                    return self.respond(409, {"error": str(error)})
 
                 chat["communityDetails"] = updated_details
                 save_db(database)
@@ -7299,6 +8869,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(409, {"error": "invalid_group_chat"})
 
                 existing_details = sanitized_community_details(chat.get("communityDetails")) or {}
+                existing_details["chatID"] = chat.get("id")
                 admin_user, _, auth_error = authenticated_user(database, self.headers)
                 if auth_error or not admin_user:
                     return self.respond(401, {"error": "admin_auth_required"})
@@ -7319,6 +8890,8 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 except PermissionError as error:
                     return self.respond(403, {"error": str(error)})
+                except ValueError as error:
+                    return self.respond(409, {"error": str(error)})
 
                 chat["communityDetails"] = updated_details
                 save_db(database)
@@ -8320,12 +9893,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, {"ok": True, "replacedCount": replaced_count})
 
             if method == "POST" and parsed.path == "/calls":
-                caller, _, auth_error = request_user_with_fallback(
-                    database,
-                    self.headers,
-                    payload_string(payload, "caller_id", "callerID", "user_id", "userID"),
-                    create_if_missing=True
-                )
+                caller, _, auth_error = authenticated_user(database, self.headers)
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
@@ -8363,6 +9931,8 @@ class Handler(BaseHTTPRequestHandler):
                     "answeredAt": None,
                     "endedAt": None,
                     "endedByUserID": None,
+                    "acceptedBySessionID": None,
+                    "acceptedByDeviceID": None,
                     "lastEventSequence": 0,
                 }
                 database["calls"].append(call)
@@ -8371,14 +9941,249 @@ class Handler(BaseHTTPRequestHandler):
                 log_call_dispatch_attempt(database, call)
                 return self.respond(200, serialize_call(call, caller_id, database))
 
+            if method == "POST" and parsed.path == "/group-calls":
+                caller, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                chat_id = normalized_entity_id(payload_string(payload, "chat_id", "chatID"))
+                if not chat_id:
+                    return self.respond(404, {"error": "chat_not_found"})
+
+                chat = find_chat(database, chat_id)
+                if not chat:
+                    return self.respond(404, {"error": "chat_not_found"})
+                if normalized_optional_string(chat.get("type")) != "group":
+                    return self.respond(409, {"error": "invalid_call_operation"})
+
+                participant_ids = unique_entity_ids(chat.get("participantIDs") or [])
+                caller_id = caller["id"]
+                if caller_id not in participant_ids:
+                    return self.respond(403, {"error": "call_permission_denied"})
+
+                mode = payload_string(payload, "mode", "call_mode", "callMode") or chat.get("mode") or "online"
+                existing_call = active_group_call_for_chat(database, chat_id=chat_id, user_id=caller_id, mode=mode)
+                if existing_call:
+                    return self.respond(200, serialize_call(existing_call, caller_id, database))
+
+                call = {
+                    "id": str(uuid.uuid4()),
+                    "scope": "group",
+                    "mode": mode,
+                    "kind": payload_string(payload, "kind") or "audio",
+                    "state": "active",
+                    "chatID": chat_id,
+                    "callerID": caller_id,
+                    "calleeID": caller_id,
+                    "participantIDs": participant_ids,
+                    "joinedParticipantIDs": [caller_id],
+                    "createdAt": now_iso(),
+                    "updatedAt": now_iso(),
+                    "answeredAt": now_iso(),
+                    "endedAt": None,
+                    "endedByUserID": None,
+                    "acceptedBySessionID": None,
+                    "acceptedByDeviceID": None,
+                    "lastEventSequence": 0,
+                }
+                database["calls"].append(call)
+                append_call_event(database, call, "created", sender_id=caller_id)
+                save_db(database)
+                log_group_call_dispatch_attempt(database, call, initiator_user_id=caller_id)
+                return self.respond(200, serialize_call(call, caller_id, database))
+
+            if method == "POST" and parsed.path.startswith("/group-calls/") and parsed.path.endswith("/join"):
+                call_id = normalized_entity_id(parsed.path.split("/")[2])
+                requester, requester_session, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                call = find_call(database, call_id)
+                if not call or normalized_optional_string(call.get("scope")) != "group":
+                    return self.respond(404, {"error": "call_not_found"})
+                if not can_manage_call(call, requester["id"]):
+                    return self.respond(403, {"error": "call_permission_denied"})
+                if normalized_optional_string(call.get("state")) == "ended":
+                    return self.respond(409, {"error": "invalid_call_operation"})
+
+                joined_participant_ids = set(call_joined_participant_ids(call))
+                joined_participant_ids.add(requester["id"])
+                call["joinedParticipantIDs"] = list(joined_participant_ids)
+                call["state"] = "active"
+                call["answeredAt"] = call.get("answeredAt") or now_iso()
+                call["updatedAt"] = now_iso()
+                call["acceptedBySessionID"] = normalized_entity_id((requester_session or {}).get("id"))
+                call["acceptedByDeviceID"] = session_device_metadata_from_headers(self.headers).get("deviceID")
+                append_call_event(database, call, "accepted", sender_id=requester["id"])
+                save_db(database)
+                return self.respond(200, serialize_call(call, requester["id"], database))
+
+            if method == "POST" and parsed.path.startswith("/group-calls/") and parsed.path.endswith("/leave"):
+                call_id = normalized_entity_id(parsed.path.split("/")[2])
+                requester, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                call = find_call(database, call_id)
+                if not call or normalized_optional_string(call.get("scope")) != "group":
+                    return self.respond(404, {"error": "call_not_found"})
+                if not can_manage_call(call, requester["id"]):
+                    return self.respond(403, {"error": "call_permission_denied"})
+                if normalized_optional_string(call.get("state")) not in ACTIVE_CALL_STATES:
+                    return self.respond(409, {"error": "invalid_call_operation"})
+
+                joined_participant_ids = [
+                    participant_id
+                    for participant_id in call_joined_participant_ids(call)
+                    if not ids_equal(participant_id, requester["id"])
+                ]
+                call["joinedParticipantIDs"] = joined_participant_ids
+                if joined_participant_ids:
+                    call["state"] = "active"
+                    call["updatedAt"] = now_iso()
+                else:
+                    call["state"] = "ended"
+                    call["endedAt"] = now_iso()
+                    call["endedByUserID"] = requester["id"]
+                    call["updatedAt"] = call["endedAt"]
+                append_call_event(database, call, "ended", sender_id=requester["id"])
+                save_db(database)
+                return self.respond(200, serialize_call(call, requester["id"], database))
+
+            if method == "POST" and parsed.path.startswith("/group-calls/") and parsed.path.endswith("/offer"):
+                call_id = normalized_entity_id(parsed.path.split("/")[2])
+                requester, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                call = find_call(database, call_id)
+                if not call or normalized_optional_string(call.get("scope")) != "group":
+                    return self.respond(404, {"error": "call_not_found"})
+                if not can_manage_call(call, requester["id"]):
+                    return self.respond(403, {"error": "call_permission_denied"})
+                if normalized_optional_string(call.get("state")) not in ACTIVE_CALL_STATES:
+                    return self.respond(409, {"error": "invalid_call_operation"})
+
+                event = append_call_event(
+                    database,
+                    call,
+                    "offer",
+                    sender_id=requester["id"],
+                    payload={
+                        "sdp": payload_string(payload, "sdp"),
+                        "targetUserID": normalized_entity_id(payload_string(payload, "target_user_id", "targetUserID")),
+                    }
+                )
+                save_db(database)
+                return self.respond(200, serialize_call_event(event))
+
+            if method == "POST" and parsed.path.startswith("/group-calls/") and parsed.path.endswith("/answer"):
+                call_id = normalized_entity_id(parsed.path.split("/")[2])
+                requester, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                call = find_call(database, call_id)
+                if not call or normalized_optional_string(call.get("scope")) != "group":
+                    return self.respond(404, {"error": "call_not_found"})
+                if not can_manage_call(call, requester["id"]):
+                    return self.respond(403, {"error": "call_permission_denied"})
+                if normalized_optional_string(call.get("state")) not in ACTIVE_CALL_STATES:
+                    return self.respond(409, {"error": "invalid_call_operation"})
+
+                event = append_call_event(
+                    database,
+                    call,
+                    "answer",
+                    sender_id=requester["id"],
+                    payload={
+                        "sdp": payload_string(payload, "sdp"),
+                        "targetUserID": normalized_entity_id(payload_string(payload, "target_user_id", "targetUserID")),
+                    }
+                )
+                save_db(database)
+                return self.respond(200, serialize_call_event(event))
+
+            if method == "POST" and parsed.path.startswith("/group-calls/") and parsed.path.endswith("/ice"):
+                call_id = normalized_entity_id(parsed.path.split("/")[2])
+                requester, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                call = find_call(database, call_id)
+                if not call or normalized_optional_string(call.get("scope")) != "group":
+                    return self.respond(404, {"error": "call_not_found"})
+                if not can_manage_call(call, requester["id"]):
+                    return self.respond(403, {"error": "call_permission_denied"})
+                if normalized_optional_string(call.get("state")) not in ACTIVE_CALL_STATES:
+                    return self.respond(409, {"error": "invalid_call_operation"})
+
+                event = append_call_event(
+                    database,
+                    call,
+                    "ice",
+                    sender_id=requester["id"],
+                    payload={
+                        "candidate": payload_string(payload, "candidate"),
+                        "sdpMid": payload_string(payload, "sdp_mid", "sdpMid"),
+                        "sdpMLineIndex": payload.get("sdp_mline_index", payload.get("sdpMLineIndex")),
+                        "targetUserID": normalized_entity_id(payload_string(payload, "target_user_id", "targetUserID")),
+                    }
+                )
+                save_db_for_call_signal(database, force=False)
+                return self.respond(200, serialize_call_event(event))
+
+            if method == "POST" and parsed.path.startswith("/group-calls/") and parsed.path.endswith("/media-state"):
+                call_id = normalized_entity_id(parsed.path.split("/")[2])
+                requester, _, auth_error = authenticated_user(database, self.headers)
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                call = find_call(database, call_id)
+                if not call or normalized_optional_string(call.get("scope")) != "group":
+                    return self.respond(404, {"error": "call_not_found"})
+                if not can_manage_call(call, requester["id"]):
+                    return self.respond(403, {"error": "call_permission_denied"})
+                if normalized_optional_string(call.get("state")) not in ACTIVE_CALL_STATES:
+                    return self.respond(409, {"error": "invalid_call_operation"})
+
+                is_muted = normalized_optional_bool(payload.get("is_muted", payload.get("isMuted")))
+                is_video_enabled = normalized_optional_bool(
+                    payload.get("is_video_enabled", payload.get("isVideoEnabled"))
+                )
+                if is_muted is None or is_video_enabled is None:
+                    return self.respond(409, {"error": "invalid_media_state_payload"})
+
+                event = append_call_event(
+                    database,
+                    call,
+                    "media_state",
+                    sender_id=requester["id"],
+                    payload={
+                        "isMuted": is_muted,
+                        "isVideoEnabled": is_video_enabled,
+                    }
+                )
+                save_db_for_call_signal(database, force=False)
+                return self.respond(200, serialize_call_event(event))
+
             if method == "POST" and parsed.path.startswith("/calls/") and parsed.path.endswith("/accept"):
                 call_id = normalized_entity_id(parsed.path.split("/")[2])
-                requester, _, auth_error = request_user_with_fallback(
-                    database,
-                    self.headers,
-                    payload_string(payload, "user_id", "userID", "requester_id", "requesterID"),
-                    create_if_missing=True
-                )
+                requester, requester_session, auth_error = authenticated_user(database, self.headers)
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
@@ -8414,9 +10219,13 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return self.respond(409, {"error": "invalid_call_operation"})
 
+                requester_session_id = normalized_entity_id((requester_session or {}).get("id"))
+                client_metadata = session_device_metadata_from_headers(self.headers)
                 call["state"] = "active"
                 call["answeredAt"] = now_iso()
                 call["updatedAt"] = call["answeredAt"]
+                call["acceptedBySessionID"] = requester_session_id
+                call["acceptedByDeviceID"] = client_metadata.get("deviceID")
                 append_call_event(database, call, "accepted", sender_id=requester["id"])
                 save_db(database)
                 log_event(
@@ -8426,17 +10235,18 @@ class Handler(BaseHTTPRequestHandler):
                     caller_id=call.get("callerID"),
                     callee_id=call.get("calleeID"),
                     answered_at=call.get("answeredAt"),
+                    requester_session_id=requester_session_id,
+                    accepted_device_id=client_metadata.get("deviceID"),
+                    platform=client_metadata.get("platform"),
+                    device_name=client_metadata.get("deviceName"),
+                    device_model=client_metadata.get("deviceModel"),
+                    app_version=client_metadata.get("appVersion"),
                 )
                 return self.respond(200, serialize_call(call, requester["id"], database))
 
             if method == "POST" and parsed.path.startswith("/calls/") and parsed.path.endswith("/reject"):
                 call_id = normalized_entity_id(parsed.path.split("/")[2])
-                requester, _, auth_error = request_user_with_fallback(
-                    database,
-                    self.headers,
-                    payload_string(payload, "user_id", "userID", "requester_id", "requesterID"),
-                    create_if_missing=True
-                )
+                requester, requester_session, auth_error = authenticated_user(database, self.headers)
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
@@ -8460,12 +10270,7 @@ class Handler(BaseHTTPRequestHandler):
 
             if method == "POST" and parsed.path.startswith("/calls/") and parsed.path.endswith("/hangup"):
                 call_id = normalized_entity_id(parsed.path.split("/")[2])
-                requester, _, auth_error = request_user_with_fallback(
-                    database,
-                    self.headers,
-                    payload_string(payload, "user_id", "userID", "requester_id", "requesterID"),
-                    create_if_missing=True
-                )
+                requester, requester_session, auth_error = authenticated_user(database, self.headers)
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
@@ -8476,12 +10281,28 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(404, {"error": "call_not_found"})
                 if not can_manage_call(call, requester["id"]):
                     return self.respond(403, {"error": "call_permission_denied"})
-                if normalized_optional_string(call.get("state")) not in ACTIVE_CALL_STATES:
+                state_before_hangup = normalized_optional_string(call.get("state"))
+                if state_before_hangup not in ACTIVE_CALL_STATES:
                     return self.respond(409, {"error": "invalid_call_operation"})
+                requester_is_caller = ids_equal(call.get("callerID"), requester["id"])
+                requester_is_callee = ids_equal(call.get("calleeID"), requester["id"])
+                requester_session_id = normalized_entity_id((requester_session or {}).get("id"))
+                accepted_session_id = normalized_entity_id(call.get("acceptedBySessionID"))
+                accepted_device_id = normalized_device_identifier(call.get("acceptedByDeviceID"))
+                answered_at = parse_iso_datetime(call.get("answeredAt"))
+                if answered_at and answered_at.tzinfo is None:
+                    answered_at = answered_at.replace(tzinfo=timezone.utc)
+                elapsed_since_answer = None
+                if answered_at:
+                    elapsed_since_answer = max(
+                        0.0,
+                        (datetime.now(timezone.utc) - answered_at).total_seconds(),
+                    )
+                client_metadata = session_device_metadata_from_headers(self.headers)
 
-                if normalized_optional_string(call.get("state")) == "ringing" and ids_equal(call.get("callerID"), requester["id"]):
+                if state_before_hangup == "ringing" and requester_is_caller:
                     call["state"] = "cancelled"
-                elif normalized_optional_string(call.get("state")) == "ringing":
+                elif state_before_hangup == "ringing":
                     # Incoming ringing must be declined through /reject only.
                     # This prevents accidental /hangup paths from auto-ending an incoming call.
                     log_event(
@@ -8493,22 +10314,90 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return self.respond(409, {"error": "invalid_call_operation"})
                 else:
+                    if (
+                        requester_is_callee
+                        and elapsed_since_answer is not None
+                        and elapsed_since_answer < EARLY_CALLEE_HANGUP_GUARD_SECONDS
+                    ):
+                        log_event(
+                            "call.state.hangup.blocked_early_callee",
+                            call_id=call.get("id"),
+                            requester_id=requester.get("id"),
+                            caller_id=call.get("callerID"),
+                            callee_id=call.get("calleeID"),
+                            elapsed_since_answer=round(elapsed_since_answer, 3),
+                            guard_seconds=EARLY_CALLEE_HANGUP_GUARD_SECONDS,
+                            platform=client_metadata.get("platform"),
+                            device_name=client_metadata.get("deviceName"),
+                            device_model=client_metadata.get("deviceModel"),
+                            app_version=client_metadata.get("appVersion"),
+                        )
+                        return self.respond(409, {"error": "invalid_call_operation"})
+                    requester_device_id = client_metadata.get("deviceID")
+                    if (
+                        requester_is_callee
+                        and elapsed_since_answer is not None
+                        and elapsed_since_answer < EARLY_CALLEE_FOREIGN_SESSION_HANGUP_GUARD_SECONDS
+                    ):
+                        session_mismatch = (
+                            accepted_session_id
+                            and requester_session_id
+                            and not ids_equal(accepted_session_id, requester_session_id)
+                        )
+                        device_mismatch = (
+                            accepted_device_id
+                            and requester_device_id
+                            and accepted_device_id.lower() != requester_device_id.lower()
+                        )
+                        if session_mismatch or device_mismatch:
+                            log_event(
+                                "call.state.hangup.blocked_non_accepting_session",
+                                call_id=call.get("id"),
+                                requester_id=requester.get("id"),
+                                caller_id=call.get("callerID"),
+                                callee_id=call.get("calleeID"),
+                                elapsed_since_answer=round(elapsed_since_answer, 3),
+                                guard_seconds=EARLY_CALLEE_FOREIGN_SESSION_HANGUP_GUARD_SECONDS,
+                                accepted_session_id=accepted_session_id,
+                                requester_session_id=requester_session_id,
+                                accepted_device_id=accepted_device_id,
+                                requester_device_id=requester_device_id,
+                                platform=client_metadata.get("platform"),
+                                device_name=client_metadata.get("deviceName"),
+                                device_model=client_metadata.get("deviceModel"),
+                                app_version=client_metadata.get("appVersion"),
+                            )
+                            return self.respond(409, {"error": "invalid_call_operation"})
                     call["state"] = "ended"
                 call["endedAt"] = now_iso()
                 call["endedByUserID"] = requester["id"]
                 call["updatedAt"] = call["endedAt"]
                 append_call_event(database, call, "ended", sender_id=requester["id"])
                 save_db(database)
+                log_event(
+                    "call.state.hangup",
+                    call_id=call.get("id"),
+                    requester_id=requester.get("id"),
+                    caller_id=call.get("callerID"),
+                    callee_id=call.get("calleeID"),
+                    requester_role=("caller" if requester_is_caller else "callee" if requester_is_callee else "unknown"),
+                    previous_state=state_before_hangup,
+                    final_state=call.get("state"),
+                    elapsed_since_answer=(round(elapsed_since_answer, 3) if elapsed_since_answer is not None else None),
+                    requester_session_id=requester_session_id,
+                    accepted_session_id=accepted_session_id,
+                    requester_device_id=client_metadata.get("deviceID"),
+                    accepted_device_id=accepted_device_id,
+                    platform=client_metadata.get("platform"),
+                    device_name=client_metadata.get("deviceName"),
+                    device_model=client_metadata.get("deviceModel"),
+                    app_version=client_metadata.get("appVersion"),
+                )
                 return self.respond(200, serialize_call(call, requester["id"], database))
 
             if method == "POST" and parsed.path.startswith("/calls/") and parsed.path.endswith("/offer"):
                 call_id = normalized_entity_id(parsed.path.split("/")[2])
-                requester, _, auth_error = request_user_with_fallback(
-                    database,
-                    self.headers,
-                    payload_string(payload, "user_id", "userID", "requester_id", "requesterID"),
-                    create_if_missing=True
-                )
+                requester, _, auth_error = authenticated_user(database, self.headers)
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
@@ -8541,12 +10430,7 @@ class Handler(BaseHTTPRequestHandler):
 
             if method == "POST" and parsed.path.startswith("/calls/") and parsed.path.endswith("/answer"):
                 call_id = normalized_entity_id(parsed.path.split("/")[2])
-                requester, _, auth_error = request_user_with_fallback(
-                    database,
-                    self.headers,
-                    payload_string(payload, "user_id", "userID", "requester_id", "requesterID"),
-                    create_if_missing=True
-                )
+                requester, _, auth_error = authenticated_user(database, self.headers)
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
@@ -8608,12 +10492,7 @@ class Handler(BaseHTTPRequestHandler):
 
             if method == "POST" and parsed.path.startswith("/calls/") and parsed.path.endswith("/ice"):
                 call_id = normalized_entity_id(parsed.path.split("/")[2])
-                requester, _, auth_error = request_user_with_fallback(
-                    database,
-                    self.headers,
-                    payload_string(payload, "user_id", "userID", "requester_id", "requesterID"),
-                    create_if_missing=True
-                )
+                requester, _, auth_error = authenticated_user(database, self.headers)
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
@@ -8638,7 +10517,7 @@ class Handler(BaseHTTPRequestHandler):
                         "sdpMLineIndex": payload.get("sdp_mline_index", payload.get("sdpMLineIndex")),
                     }
                 )
-                save_db(database)
+                save_db_for_call_signal(database, force=False)
                 log_event(
                     "call.signal.ice.received",
                     call_id=call.get("id"),
@@ -8652,12 +10531,7 @@ class Handler(BaseHTTPRequestHandler):
 
             if method == "POST" and parsed.path.startswith("/calls/") and parsed.path.endswith("/media-state"):
                 call_id = normalized_entity_id(parsed.path.split("/")[2])
-                requester, _, auth_error = request_user_with_fallback(
-                    database,
-                    self.headers,
-                    payload_string(payload, "user_id", "userID", "requester_id", "requesterID"),
-                    create_if_missing=True
-                )
+                requester, _, auth_error = authenticated_user(database, self.headers)
                 if auth_error == "user_not_found":
                     return self.respond(404, {"error": "user_not_found"})
                 if auth_error:
@@ -8688,7 +10562,7 @@ class Handler(BaseHTTPRequestHandler):
                         "isVideoEnabled": is_video_enabled,
                     }
                 )
-                save_db(database)
+                save_db_for_call_signal(database, force=False)
                 log_event(
                     "call.signal.media_state.received",
                     call_id=call.get("id"),
@@ -9014,7 +10888,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 remove_file_for_url(current_user["profile"].get("profilePhotoURL"), AVATAR_DIR)
                 raw = base64.b64decode(payload.get("image_base64", ""))
-                avatar_name = f"{user_id}.png"
+                avatar_name = f"{user_id}-{int(time.time() * 1000)}.png"
                 avatar_path = os.path.join(AVATAR_DIR, avatar_name)
                 with open(avatar_path, "wb") as file:
                     file.write(raw)
@@ -9271,6 +11145,8 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 except PermissionError as error:
                     return self.respond(403, {"error": str(error)})
+                except ValueError as error:
+                    return self.respond(409, {"error": str(error)})
 
                 group_id = str(uuid.uuid4())
                 group = {
@@ -9365,11 +11241,16 @@ class Handler(BaseHTTPRequestHandler):
                     community_details = normalized_community_details(
                         payload.get("community_details"),
                         database,
-                        existing_details=chat.get("communityDetails"),
+                        existing_details={
+                            **((chat.get("communityDetails") or {}) if isinstance(chat.get("communityDetails"), dict) else {}),
+                            "chatID": chat.get("id"),
+                        },
                         requester=requester
                     )
                 except PermissionError as error:
                     return self.respond(403, {"error": str(error)})
+                except ValueError as error:
+                    return self.respond(409, {"error": str(error)})
 
                 if not community_details:
                     return self.respond(409, {"error": "invalid_group_operation"})
@@ -10067,6 +11948,253 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 return self.respond(200, {"ok": True})
 
+            if method == "POST" and parsed.path.startswith("/chats/") and parsed.path.endswith("/import-history"):
+                chat_id = normalized_entity_id(parsed.path.split("/")[2])
+                importer, _, auth_error = request_user_with_fallback(
+                    database,
+                    self.headers,
+                    payload.get("importer_id"),
+                    create_if_missing=True
+                )
+                if auth_error == "user_not_found":
+                    return self.respond(404, {"error": "user_not_found"})
+                if auth_error:
+                    return self.respond(401, {"error": auth_error})
+
+                chat = find_chat(database, chat_id)
+                if not chat:
+                    return self.respond(404, {"error": "chat_not_found"})
+                if not any(ids_equal(importer["id"], participant_id) for participant_id in (chat.get("participantIDs") or [])):
+                    return self.respond(403, {"error": "sender_not_in_chat"})
+                if chat.get("mode") != "online":
+                    return self.respond(409, {"error": "import_not_supported"})
+                if chat.get("type") not in {"direct", "selfChat"}:
+                    return self.respond(409, {"error": "import_not_supported"})
+
+                participant_ids = unique_entity_ids(chat.get("participantIDs") or [])
+                other_participant_id = next(
+                    (
+                        participant_id
+                        for participant_id in participant_ids
+                        if not ids_equal(participant_id, importer["id"])
+                    ),
+                    None,
+                )
+                if chat.get("type") == "direct" and not other_participant_id:
+                    return self.respond(409, {"error": "invalid_direct_chat"})
+
+                raw_import_messages = payload.get("messages")
+                if not isinstance(raw_import_messages, list):
+                    raw_import_messages = []
+
+                imported_messages = []
+                created_messages = []
+                updated_messages = []
+                latest_imported_at = None
+                did_change = False
+
+                for raw_message in raw_import_messages:
+                    if not isinstance(raw_message, dict):
+                        continue
+
+                    sender_origin = str(raw_message.get("sender_origin") or "self").strip().lower()
+                    if sender_origin == "counterparty" and other_participant_id:
+                        sender_id = other_participant_id
+                    else:
+                        sender_id = importer["id"]
+
+                    sender_display_name = normalized_optional_string(raw_message.get("sender_display_name"))
+                    kind = str(raw_message.get("kind", "text")).strip() or "text"
+                    text = normalized_optional_string(raw_message.get("text"))
+                    client_message_id = normalized_entity_id(raw_message.get("client_message_id")) or str(uuid.uuid4())
+                    created_at_value = parse_iso_timestamp(raw_message.get("created_at")) or datetime.now(timezone.utc)
+                    created_at = created_at_value.isoformat()
+                    if latest_imported_at is None or created_at_value > latest_imported_at:
+                        latest_imported_at = created_at_value
+
+                    attachments = []
+                    for attachment in raw_message.get("attachments", []):
+                        file_name = attachment.get("file_name") or "attachment.bin"
+                        attachment_type = attachment.get("type", "document")
+                        attachment_mime_type = attachment.get("mime_type", "application/octet-stream")
+                        remote_url = None
+                        byte_size = int(attachment.get("byte_size") or 0)
+                        if attachment.get("data_base64"):
+                            try:
+                                media_name, detected_size = save_base64_blob(
+                                    MEDIA_DIR,
+                                    file_name,
+                                    attachment.get("data_base64"),
+                                    mime_type=attachment_mime_type,
+                                    upload_kind=attachment_type or "attachment",
+                                )
+                            except ValueError as error:
+                                return self.respond(409, {"error": str(error)})
+                            remote_url = f"{self.base_url()}/media/{media_name}"
+                            byte_size = detected_size
+                        elif attachment.get("remote_url"):
+                            remote_url = normalized_optional_string(attachment.get("remote_url"))
+                            file_info = media_file_info_for_url(remote_url, MEDIA_DIR)
+                            if not file_info:
+                                return self.respond(409, {"error": "uploaded_media_not_found"})
+                            byte_size = file_info["byteSize"]
+
+                        attachments.append(
+                            {
+                                "id": str(uuid.uuid4()),
+                                "type": attachment_type,
+                                "fileName": file_name,
+                                "mimeType": attachment_mime_type,
+                                "localURL": None,
+                                "remoteURL": remote_url,
+                                "byteSize": byte_size,
+                            }
+                        )
+
+                    voice_payload = raw_message.get("voice_message")
+                    voice_message = None
+                    if voice_payload:
+                        remote_url = None
+                        byte_size = int(voice_payload.get("byte_size") or 0)
+                        if voice_payload.get("data_base64"):
+                            try:
+                                media_name, detected_size = save_base64_blob(
+                                    MEDIA_DIR,
+                                    voice_payload.get("file_name") or "voice.m4a",
+                                    voice_payload.get("data_base64"),
+                                    mime_type=voice_payload.get("mime_type") or "audio/mp4",
+                                    upload_kind="voice",
+                                )
+                            except ValueError as error:
+                                return self.respond(409, {"error": str(error)})
+                            remote_url = f"{self.base_url()}/media/{media_name}"
+                            byte_size = detected_size
+                        elif voice_payload.get("remote_url"):
+                            remote_url = normalized_optional_string(voice_payload.get("remote_url"))
+                            file_info = media_file_info_for_url(remote_url, MEDIA_DIR)
+                            if not file_info:
+                                return self.respond(409, {"error": "uploaded_media_not_found"})
+                            byte_size = file_info["byteSize"]
+
+                        voice_message = {
+                            "durationSeconds": int(voice_payload.get("duration_seconds") or 0),
+                            "waveformSamples": voice_payload.get("waveform_samples") or [],
+                            "byteSize": byte_size,
+                            "localFileURL": None,
+                            "remoteFileURL": remote_url,
+                        }
+
+                    existing_message = next(
+                        (
+                            item
+                            for item in database["messages"]
+                            if ids_equal(item.get("chatID"), chat["id"])
+                            and ids_equal(item.get("senderID"), sender_id)
+                            and ids_equal(item.get("clientMessageID"), client_message_id)
+                        ),
+                        None,
+                    )
+
+                    if existing_message:
+                        existing_changed = False
+                        if existing_message.get("mode") != "online":
+                            existing_message["mode"] = "online"
+                            existing_changed = True
+                        merged_delivery_state = merge_delivery_states(
+                            existing_message.get("deliveryState"),
+                            "migrated",
+                            "online",
+                        )
+                        if existing_message.get("deliveryState") != merged_delivery_state:
+                            existing_message["deliveryState"] = merged_delivery_state
+                            existing_changed = True
+                        if existing_message.get("kind") != kind:
+                            existing_message["kind"] = kind
+                            existing_changed = True
+                        if not normalized_optional_string(existing_message.get("text")) and text:
+                            existing_message["text"] = text
+                            existing_changed = True
+                        if not existing_message.get("attachments") and attachments:
+                            existing_message["attachments"] = attachments
+                            existing_changed = True
+                        if not existing_message.get("voiceMessage") and voice_message:
+                            existing_message["voiceMessage"] = voice_message
+                            existing_changed = True
+                        if not normalized_optional_string(existing_message.get("senderDisplayName")) and sender_display_name:
+                            existing_message["senderDisplayName"] = sender_display_name
+                            existing_changed = True
+                        if existing_message.get("status") != "read":
+                            existing_message["status"] = "read"
+                            existing_changed = True
+                        imported_messages.append(existing_message)
+                        if existing_changed:
+                            updated_messages.append(existing_message)
+                            did_change = True
+                        continue
+
+                    message = {
+                        "id": str(uuid.uuid4()),
+                        "chatID": chat["id"],
+                        "senderID": sender_id,
+                        "clientMessageID": client_message_id,
+                        "senderDisplayName": sender_display_name,
+                        "mode": "online",
+                        "deliveryState": "migrated",
+                        "kind": kind,
+                        "text": text,
+                        "attachments": attachments,
+                        "replyToMessageID": None,
+                        "replyPreview": None,
+                        "communityContext": None,
+                        "deliveryOptions": None,
+                        "voiceMessage": voice_message,
+                        "status": "read",
+                        "createdAt": created_at,
+                        "editedAt": None,
+                        "deletedForEveryoneAt": None,
+                        "reactions": [],
+                    }
+                    database["messages"].append(message)
+                    imported_messages.append(message)
+                    created_messages.append(message)
+                    did_change = True
+
+                if imported_messages and latest_imported_at:
+                    for participant_id in participant_ids:
+                        if upsert_chat_read_marker(database, participant_id, chat["id"], latest_imported_at.isoformat()):
+                            did_change = True
+
+                if did_change:
+                    save_db(database)
+                    realtime_publish_chat_event(
+                        database,
+                        chat,
+                        event_type="chat.updated",
+                        actor_user_id=importer["id"],
+                    )
+                    realtime_publish_chat_resync_event(
+                        database,
+                        chat,
+                        actor_user_id=importer["id"],
+                    )
+                    log_event(
+                        "chat.import_history.accepted",
+                        chat_id=chat["id"],
+                        importer_id=importer["id"],
+                        imported_count=len(imported_messages),
+                        created_count=len(created_messages),
+                        updated_count=len(updated_messages),
+                    )
+
+                return self.respond(
+                    200,
+                    {
+                        "chat": serialize_chat(chat, importer["id"], database),
+                        "messages": [serialize_message(message, database) for message in imported_messages],
+                        "imported_count": len(imported_messages),
+                    },
+                )
+
             if method == "POST" and parsed.path == "/messages/send":
                 chat_id = normalized_entity_id(payload.get("chat_id"))
                 sender, _, auth_error = request_user_with_fallback(
@@ -10135,6 +12263,7 @@ class Handler(BaseHTTPRequestHandler):
                 if reply_to_message_id and not reply_target_message:
                     reply_to_message_id = None
                 reply_preview = sanitized_reply_preview(payload.get("reply_preview"))
+                link_preview = sanitized_link_preview(payload.get("link_preview"))
                 community_context = sanitized_community_message_context(
                     payload.get("community_context"),
                     chat=chat,
@@ -10261,6 +12390,8 @@ class Handler(BaseHTTPRequestHandler):
                         existing_message["communityContext"] = community_context
                     if not existing_message.get("deliveryOptions") and delivery_options:
                         existing_message["deliveryOptions"] = delivery_options
+                    if not existing_message.get("linkPreview") and link_preview:
+                        existing_message["linkPreview"] = link_preview
                     if not normalized_optional_string(existing_message.get("text")) and text:
                         existing_message["text"] = text
                     if not existing_message.get("attachments") and attachments:
@@ -10305,6 +12436,7 @@ class Handler(BaseHTTPRequestHandler):
                     "kind": kind,
                     "text": text,
                     "attachments": attachments,
+                    "linkPreview": link_preview,
                     "replyToMessageID": reply_to_message_id,
                     "replyPreview": reply_preview,
                     "communityContext": community_context,
@@ -10319,19 +12451,41 @@ class Handler(BaseHTTPRequestHandler):
                 backfill_group_member_snapshots(chat, database)
                 database["messages"].append(message)
                 save_db(database)
-                realtime_publish_message_event(
-                    database,
-                    chat,
-                    message,
-                    event_type="message.created",
-                    actor_user_id=sender_id,
-                )
-                realtime_publish_chat_event(
-                    database,
-                    chat,
-                    event_type="chat.updated",
-                    actor_user_id=sender_id,
-                )
+                try:
+                    realtime_publish_message_event(
+                        database,
+                        chat,
+                        message,
+                        event_type="message.created",
+                        actor_user_id=sender_id,
+                    )
+                except Exception as error:
+                    log_event(
+                        "message.send.side_effect_failed",
+                        stage="realtime_publish_message_event",
+                        chat_id=chat.get("id"),
+                        message_id=message.get("id"),
+                        sender_id=sender_id,
+                        error=type(error).__name__,
+                        detail=str(error),
+                    )
+                try:
+                    realtime_publish_chat_event(
+                        database,
+                        chat,
+                        event_type="chat.updated",
+                        actor_user_id=sender_id,
+                    )
+                except Exception as error:
+                    log_event(
+                        "message.send.side_effect_failed",
+                        stage="realtime_publish_chat_event",
+                        chat_id=chat.get("id"),
+                        message_id=message.get("id"),
+                        sender_id=sender_id,
+                        error=type(error).__name__,
+                        detail=str(error),
+                    )
                 log_event(
                     "message.send.accepted",
                     chat_id=chat["id"],
@@ -10340,7 +12494,18 @@ class Handler(BaseHTTPRequestHandler):
                     status=message.get("status"),
                     recipient_token_count=recipient_token_count,
                 )
-                log_push_dispatch_attempt(database, chat, message)
+                try:
+                    log_push_dispatch_attempt(database, chat, message)
+                except Exception as error:
+                    log_event(
+                        "message.send.side_effect_failed",
+                        stage="log_push_dispatch_attempt",
+                        chat_id=chat.get("id"),
+                        message_id=message.get("id"),
+                        sender_id=sender_id,
+                        error=type(error).__name__,
+                        detail=str(error),
+                    )
                 return self.respond(200, serialize_message(message, database))
 
             if method == "POST" and parsed.path.startswith("/messages/") and parsed.path.endswith("/reactions"):
@@ -10524,6 +12689,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(409, {"error": "unsupported_websocket_version"})
 
         params = parse_qs(parsed.query)
+        websocket_headers = self.headers
+        query_access_token = (params.get("access_token") or [""])[0].strip()
+        if query_access_token and not bearer_token_from_headers(self.headers):
+            websocket_headers = dict(self.headers.items())
+            websocket_headers["Authorization"] = f"Bearer {query_access_token}"
         fallback_user_id = (
             (params.get("user_id") or [""])[0].strip()
             or (params.get("requester_id") or [""])[0].strip()
@@ -10533,7 +12703,7 @@ class Handler(BaseHTTPRequestHandler):
             database = load_db()
             user, _, auth_error = request_user_with_fallback(
                 database,
-                self.headers,
+                websocket_headers,
                 fallback_user_id,
                 create_if_missing=False
             )
@@ -11132,6 +13302,114 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         return True
 
+    def respond_html(self, status, html_body):
+        body = html_body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return True
+
+    def serve_apple_app_site_association(self):
+        payload = {
+            "applinks": {
+                "details": [
+                    {
+                        "appIDs": ["8HCKMUYNCN.prime1.prime-Messaging"],
+                        "components": [
+                            {"/": "/@*"},
+                            {"/": "/u/*"},
+                            {"/": "/user/*"},
+                            {"/": "/c/*"},
+                            {"/": "/g/*"},
+                            {"/": "/join/*"},
+                        ],
+                    }
+                ]
+            }
+        }
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return True
+
+    def serve_public_avatar_placeholder(self, parsed):
+        params = parse_qs(parsed.query or "")
+        kind = normalized_optional_string((params.get("kind") or ["user"])[0]) or "user"
+        title = normalized_optional_string((params.get("title") or ["Prime Messaging"])[0]) or "Prime Messaging"
+        body = render_public_avatar_placeholder_svg(kind, title).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "image/svg+xml")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        self.wfile.write(body)
+        return True
+
+    def serve_public_web_route(self, parsed, database):
+        normalized_path = parsed.path or "/"
+        if normalized_path == "/.well-known/apple-app-site-association":
+            return self.serve_apple_app_site_association()
+        if normalized_path == "/public/avatar-placeholder.svg":
+            return self.serve_public_avatar_placeholder(parsed)
+
+        username = None
+        user_id = None
+        community_handle = None
+        invite_code = None
+        kind_hint = None
+
+        path_parts = [part for part in normalized_path.split("/") if part]
+        if len(path_parts) == 1 and path_parts[0].startswith("@"):
+            username = path_parts[0].removeprefix("@")
+        elif len(path_parts) >= 2:
+            route = path_parts[0].lower()
+            payload = path_parts[1].strip()
+            if route in {"u", "user"}:
+                normalized_user_id = normalized_entity_id(payload)
+                if normalized_user_id:
+                    user_id = normalized_user_id
+                else:
+                    username = payload.removeprefix("@")
+            elif route in {"c", "channel"}:
+                community_handle = payload
+                kind_hint = "channel"
+            elif route in {"g", "group", "community"}:
+                community_handle = payload
+                kind_hint = "group"
+            elif route in {"join", "invite"}:
+                invite_code = normalized_invite_code(payload)
+
+        if not username and not user_id and not community_handle and not invite_code:
+            return False
+
+        if invite_code:
+            chat = find_chat_by_invite_code(database, invite_code)
+            if chat is not None:
+                payload = public_chat_payload(chat, self.base_url())
+                return self.respond_html(200, render_public_entity_page(payload, self.base_url()))
+            return self.respond_html(404, render_public_not_found_page(self.base_url()))
+
+        entity_type, entity = resolve_public_entity(
+            database,
+            username=username,
+            user_id=user_id,
+            community_handle=community_handle,
+            kind_hint=kind_hint,
+        )
+        if entity_type == "user":
+            payload = public_user_payload(entity, self.base_url())
+            return self.respond_html(200, render_public_entity_page(payload, self.base_url()))
+        if entity_type == "community":
+            payload = public_chat_payload(entity, self.base_url())
+            return self.respond_html(200, render_public_entity_page(payload, self.base_url()))
+
+        return self.respond_html(404, render_public_not_found_page(self.base_url()))
+
     def read_json(self):
         content_length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
@@ -11156,7 +13434,7 @@ class Handler(BaseHTTPRequestHandler):
             "Authorization, Content-Type, "
             "X-Prime-Admin-Token, X-Prime-Admin-Login, X-Prime-Admin-Password, "
             "X-Prime-Upload-File-Name, X-Prime-Upload-Mime-Type, X-Prime-Upload-Kind, "
-            "X-Prime-Platform, X-Prime-Device-Name, X-Prime-Device-Model, "
+            "X-Prime-Platform, X-Prime-Device-ID, X-Prime-Device-Name, X-Prime-Device-Model, "
             "X-Prime-OS-Name, X-Prime-OS-Version, X-Prime-App-Version"
         )
         self.send_header("Access-Control-Expose-Headers", "Accept-Ranges, Content-Length, Content-Range, Content-Type")

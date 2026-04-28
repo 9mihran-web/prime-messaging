@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Prime Messaging Admin Console</title>
+    <meta
+      name="description"
+      content="Browser-based admin console for Prime Messaging: users, chats, channels, communities, push broadcast, and moderation."
+    />
+    <meta name="robots" content="noindex,nofollow" />
+    <meta name="theme-color" content="#971b23" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./app.css?v=20260428a" />
+    <script src="./app.js?v=20260428a" defer></script>
+  </head>
+  <body>
+    <div class="shell">
+      <section class="auth-screen" id="auth-screen">
+        <div class="auth-card">
+          <div class="brand-lockup">
+            <div class="brand-mark">PM</div>
+            <div>
+              <p class="eyebrow">Prime Messaging</p>
+              <h1>Admin Console</h1>
+            </div>
+          </div>
+
+          <p class="auth-copy">
+            Full browser control room for Prime Messaging. Sign in with the admin
+            account, then add the server-side admin login and password to unlock
+            users, chats, communities, and push broadcasts.
+          </p>
+
+          <form class="auth-form" id="login-form">
+            <div class="form-grid">
+              <label class="field">
+                <span>Account identifier</span>
+                <input
+                  id="login-identifier"
+                  name="identifier"
+                  type="text"
+                  autocomplete="username"
+                  placeholder="@mihran or email"
+                  required
+                />
+              </label>
+
+              <label class="field">
+                <span>Account password</span>
+                <input
+                  id="login-password"
+                  name="password"
+                  type="password"
+                  autocomplete="current-password"
+                  placeholder="Your account password"
+                  required
+                />
+              </label>
+
+              <label class="field">
+                <span>Admin login</span>
+                <input
+                  id="login-admin-login"
+                  name="admin_login"
+                  type="text"
+                  autocomplete="off"
+                  placeholder="admin"
+                  required
+                />
+              </label>
+
+              <label class="field">
+                <span>Admin password</span>
+                <input
+                  id="login-admin-password"
+                  name="admin_password"
+                  type="password"
+                  autocomplete="off"
+                  placeholder="Server admin password"
+                  required
+                />
+              </label>
+            </div>
+
+            <details class="advanced-box">
+              <summary>Advanced connection settings</summary>
+              <label class="field">
+                <span>Backend API</span>
+                <input
+                  id="api-base-input"
+                  name="api_base"
+                  type="url"
+                  placeholder="https://prime-messaging-production.up.railway.app"
+                />
+              </label>
+              <p class="hint">
+                Keep the default backend unless you are testing another Prime
+                Messaging server.
+              </p>
+            </details>
+
+            <button class="primary-button" id="login-submit" type="submit">
+              Open admin console
+            </button>
+            <p class="form-status" id="auth-status" role="status" aria-live="polite"></p>
+          </form>
+        </div>
+      </section>
+
+      <section class="app-screen hidden" id="app-screen">
+        <header class="app-header">
+          <div class="brand-lockup compact">
+            <div class="brand-mark">PM</div>
+            <div>
+              <p class="eyebrow">Prime Messaging</p>
+              <h2>Admin Control Room</h2>
+            </div>
+          </div>
+
+          <div class="session-card">
+            <div>
+              <strong id="session-name">Admin</strong>
+              <span id="session-handle">@mihran</span>
+            </div>
+            <div class="header-actions">
+              <button class="ghost-button" id="refresh-dashboard-button" type="button">
+                Refresh
+              </button>
+              <button class="ghost-button danger" id="logout-button" type="button">
+                Log out
+              </button>
+            </div>
+          </div>
+        </header>
+
+        <main class="dashboard-grid">
+          <section class="panel panel-accent">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Access</p>
+                <h3>Admin credentials</h3>
+              </div>
+              <span class="status-pill" id="connection-pill">Idle</span>
+            </div>
+
+            <form class="inline-form" id="access-form">
+              <label class="field">
+                <span>Admin login</span>
+                <input id="admin-login-input" type="text" autocomplete="off" />
+              </label>
+              <label class="field">
+                <span>Admin password</span>
+                <input id="admin-password-input" type="password" autocomplete="off" />
+              </label>
+              <button class="ghost-button" id="save-access-button" type="submit">
+                Save access
+              </button>
+            </form>
+            <p class="form-status" id="access-status" role="status" aria-live="polite"></p>
+
+            <div class="summary-grid">
+              <article class="summary-card">
+                <span class="summary-label">Users</span>
+                <strong id="summary-users">0</strong>
+              </article>
+              <article class="summary-card">
+                <span class="summary-label">Legacy</span>
+                <strong id="summary-legacy-users">0</strong>
+              </article>
+              <article class="summary-card">
+                <span class="summary-label">Chats</span>
+                <strong id="summary-chats">0</strong>
+              </article>
+              <article class="summary-card">
+                <span class="summary-label">Messages</span>
+                <strong id="summary-messages">0</strong>
+              </article>
+              <article class="summary-card">
+                <span class="summary-label">Sessions</span>
+                <strong id="summary-sessions">0</strong>
+              </article>
+              <article class="summary-card">
+                <span class="summary-label">Device tokens</span>
+                <strong id="summary-device-tokens">0</strong>
+              </article>
+            </div>
+
+            <div class="maintenance-row">
+              <button class="ghost-button" id="cleanup-legacy-button" type="button">
+                Cleanup legacy placeholders
+              </button>
+              <button class="ghost-button danger" id="bulk-delete-filtered-button" type="button">
+                Bulk delete current filter
+              </button>
+            </div>
+            <p class="form-status" id="maintenance-status" role="status" aria-live="polite"></p>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Create</p>
+                <h3>Admin-managed account</h3>
+              </div>
+            </div>
+
+            <form class="stack-form" id="create-user-form">
+              <label class="field">
+                <span>Display name</span>
+                <input id="create-display-name-input" type="text" placeholder="Display name" />
+              </label>
+              <label class="field">
+                <span>Username</span>
+                <input id="create-username-input" type="text" placeholder="legacy username allowed" />
+              </label>
+              <label class="field">
+                <span>Password</span>
+                <input id="create-password-input" type="password" placeholder="Temporary password" />
+              </label>
+              <button class="primary-button" id="create-user-button" type="submit">
+                Create account
+              </button>
+              <p class="form-status" id="create-user-status" role="status" aria-live="polite"></p>
+            </form>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">App Updates</p>
+                <h3>Version policy</h3>
+              </div>
+            </div>
+
+            <form class="stack-form" id="app-update-policy-form">
+              <label class="field">
+                <span>Latest version</span>
+                <input id="update-latest-version-input" type="text" placeholder="1.1" />
+              </label>
+              <label class="field">
+                <span>Minimum supported version</span>
+                <input id="update-minimum-version-input" type="text" placeholder="1.0.2" />
+              </label>
+              <label class="field">
+                <span>App Store URL</span>
+                <input id="update-app-store-url-input" type="url" placeholder="https://apps.apple.com/..." />
+              </label>
+              <label class="field">
+                <span>Optional banner title</span>
+                <input id="update-title-input" type="text" placeholder="Update Available" />
+              </label>
+              <label class="field">
+                <span>Optional banner message</span>
+                <textarea id="update-message-input" rows="3" placeholder="A newer version of Prime Messaging is available."></textarea>
+              </label>
+              <label class="field">
+                <span>Required update title</span>
+                <input id="update-required-title-input" type="text" placeholder="Update Required" />
+              </label>
+              <label class="field">
+                <span>Required update message</span>
+                <textarea id="update-required-message-input" rows="3" placeholder="Please update Prime Messaging to continue."></textarea>
+              </label>
+
+              <div class="action-grid">
+                <button class="primary-button" id="save-update-policy-button" type="submit">
+                  Save version policy
+                </button>
+                <button class="ghost-button" id="soft-prompt-update-button" type="button">
+                  Soft prompt below latest
+                </button>
+                <button class="ghost-button danger" id="require-latest-update-button" type="button">
+                  Require latest for everyone older
+                </button>
+                <button class="ghost-button" id="reset-update-policy-button" type="button">
+                  Reset text only
+                </button>
+              </div>
+              <p class="form-status" id="update-policy-status" role="status" aria-live="polite"></p>
+            </form>
+          </section>
+
+          <section class="panel users-panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Users</p>
+                <h3>User management</h3>
+              </div>
+              <button class="ghost-button" id="users-refresh-button" type="button">
+                Reload
+              </button>
+            </div>
+
+            <div class="toolbar">
+              <label class="field grow">
+                <span>Search</span>
+                <input
+                  id="users-search-input"
+                  type="search"
+                  placeholder="Username, name, e-mail or phone"
+                />
+              </label>
+              <label class="checkbox-field">
+                <input id="users-placeholders-only-input" type="checkbox" />
+                <span>Legacy only</span>
+              </label>
+            </div>
+
+            <form class="lookup-form" id="user-lookup-form">
+              <label class="field grow">
+                <span>Quick lookup</span>
+                <input id="user-lookup-input" type="text" placeholder="@username" />
+              </label>
+              <button class="ghost-button" id="user-lookup-button" type="submit">
+                Open
+              </button>
+            </form>
+
+            <div class="subtle-row">
+              <span id="users-count">0 users</span>
+              <span id="users-filter-hint">Showing all accounts</span>
+            </div>
+            <p class="form-status" id="users-status" role="status" aria-live="polite"></p>
+            <div class="entity-list" id="users-list"></div>
+          </section>
+
+          <section class="panel detail-panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Inspector</p>
+                <h3>Selected user</h3>
+              </div>
+              <button class="ghost-button" id="selected-user-refresh-button" type="button">
+                Reload chats
+              </button>
+            </div>
+
+            <div class="empty-state" id="selected-user-empty">
+              Pick a user to inspect bans, chats, verification, and deletion.
+            </div>
+
+            <div class="hidden" id="selected-user-content">
+              <div class="identity-card">
+                <div>
+                  <h4 id="selected-user-name">User</h4>
+                  <p id="selected-user-handle">@username</p>
+                </div>
+                <div class="identity-tags" id="selected-user-tags"></div>
+              </div>
+
+              <div class="stats-grid">
+                <article class="mini-stat">
+                  <span>Chats</span>
+                  <strong id="selected-user-chat-count">0</strong>
+                </article>
+                <article class="mini-stat">
+                  <span>Messages</span>
+                  <strong id="selected-user-message-count">0</strong>
+                </article>
+                <article class="mini-stat">
+                  <span>Sessions</span>
+                  <strong id="selected-user-session-count">0</strong>
+                </article>
+              </div>
+
+              <div class="detail-copy" id="selected-user-meta"></div>
+
+              <div class="action-grid">
+                <button class="ghost-button danger" data-ban-days="1" type="button">
+                  Ban 1 day
+                </button>
+                <button class="ghost-button danger" data-ban-days="3" type="button">
+                  Ban 3 days
+                </button>
+                <button class="ghost-button danger" data-ban-days="7" type="button">
+                  Ban 1 week
+                </button>
+                <button class="ghost-button danger" id="delete-selected-user-button" type="button">
+                  Delete user
+                </button>
+              </div>
+
+              <p class="form-status" id="selected-user-status" role="status" aria-live="polite"></p>
+
+              <div class="nested-section">
+                <div class="nested-section-header">
+                  <h4>User chats</h4>
+                  <span id="selected-user-chats-count">0</span>
+                </div>
+                <div class="entity-list compact" id="selected-user-chats-list"></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel communities-panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Spaces</p>
+                <h3>Channels & communities</h3>
+              </div>
+              <button class="ghost-button" id="communities-refresh-button" type="button">
+                Reload
+              </button>
+            </div>
+
+            <div class="toolbar">
+              <label class="field grow">
+                <span>Search communities</span>
+                <input id="communities-search-input" type="search" placeholder="Search by title or preview" />
+              </label>
+              <label class="field">
+                <span>Kind</span>
+                <select id="communities-filter-select">
+                  <option value="all">All</option>
+                  <option value="group">Groups</option>
+                  <option value="supergroup">Supergroups</option>
+                  <option value="channel">Channels</option>
+                  <option value="community">Communities</option>
+                </select>
+              </label>
+            </div>
+
+            <p class="form-status" id="communities-status" role="status" aria-live="polite"></p>
+            <div class="entity-list" id="communities-list"></div>
+          </section>
+
+          <section class="panel chat-panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Chat inspector</p>
+                <h3 id="chat-panel-title">Select a chat</h3>
+              </div>
+              <button class="ghost-button" id="chat-refresh-button" type="button">
+                Reload messages
+              </button>
+            </div>
+
+            <div class="empty-state" id="chat-empty">
+              Open a user chat or community to inspect messages and moderation actions.
+            </div>
+
+            <div class="hidden" id="chat-content">
+              <div class="identity-card">
+                <div>
+                  <h4 id="chat-title">Chat</h4>
+                  <p id="chat-subtitle">Details</p>
+                </div>
+                <div class="identity-tags" id="chat-tags"></div>
+              </div>
+
+              <div class="detail-copy" id="chat-meta"></div>
+
+              <div class="action-grid" id="chat-action-grid">
+                <button class="ghost-button" id="toggle-chat-official-button" type="button">
+                  Toggle official
+                </button>
+                <button class="ghost-button" id="toggle-chat-block-button" type="button">
+                  Toggle block
+                </button>
+                <button class="ghost-button danger" id="delete-chat-button" type="button">
+                  Delete chat
+                </button>
+              </div>
+
+              <p class="form-status" id="chat-status" role="status" aria-live="polite"></p>
+              <div class="message-stream" id="chat-messages-list"></div>
+            </div>
+          </section>
+
+          <section class="panel push-panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Broadcast</p>
+                <h3>Push creator</h3>
+              </div>
+            </div>
+
+            <form class="stack-form" id="broadcast-form">
+              <label class="field">
+                <span>Title</span>
+                <input id="broadcast-title-input" type="text" placeholder="Push title" />
+              </label>
+              <label class="field">
+                <span>Message</span>
+                <textarea
+                  id="broadcast-body-input"
+                  rows="5"
+                  placeholder="Write the push body"
+                ></textarea>
+              </label>
+              <label class="field">
+                <span>Deep link (optional)</span>
+                <input id="broadcast-deep-link-input" type="text" placeholder="prime://chat/..." />
+              </label>
+              <button class="primary-button" id="broadcast-send-button" type="submit">
+                Send push broadcast
+              </button>
+              <p class="form-status" id="broadcast-status" role="status" aria-live="polite"></p>
+            </form>
+          </section>
+        </main>
+      </section>
+    </div>
+  </body>
+</html>
