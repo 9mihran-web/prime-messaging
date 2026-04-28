@@ -163,10 +163,13 @@ final class LocalPushNotificationService: NSObject, PushNotificationService {
         userInfo: [AnyHashable: Any]? = nil
     ) {
         assertPushRoutingMainThread()
-        Task {
-            await clearTypingNotifications(for: route.chatID)
-        }
         var postedUserInfo = userInfo ?? self.userInfo(for: route)
+        let notificationType = resolvedNotificationType(from: postedUserInfo)
+        if notificationType == "message" {
+            Task {
+                await clearTypingNotifications(for: route.chatID)
+            }
+        }
         if postedUserInfo["chat_id"] == nil {
             postedUserInfo["chat_id"] = route.chatID.uuidString
         }
@@ -418,6 +421,8 @@ extension LocalPushNotificationService: UNUserNotificationCenterDelegate {
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
+        let userInfo = notification.request.content.userInfo
+
         if let route = NotificationCallRoute(userInfo: notification.request.content.userInfo) {
             await MainActor.run {
                 self.logger.info("Received incoming call push while app is foreground. call=\(route.callID.uuidString, privacy: .public)")
@@ -428,28 +433,44 @@ extension LocalPushNotificationService: UNUserNotificationCenterDelegate {
             return []
         }
 
-        if let route = NotificationChatRoute(userInfo: notification.request.content.userInfo) {
-            let shouldSuppressInAppBanner = await MainActor.run { () -> Bool in
+        if let route = NotificationChatRoute(userInfo: userInfo) {
+            let notificationType = await MainActor.run { self.resolvedNotificationType(from: userInfo) }
+            let shouldSuppressForActiveChat = await MainActor.run { () -> Bool in
                 self.handleIncomingChatPushRoute(
                     route,
                     source: "will_present",
-                    userInfo: notification.request.content.userInfo
+                    userInfo: userInfo
                 )
                 return self.activeChatID == route.chatID && self.activeChatMode == route.mode
             }
 
             await MainActor.run {
-                if shouldSuppressInAppBanner {
+                if shouldSuppressForActiveChat {
                     self.logger.info(
-                        "Suppressing foreground banner for active chat \(route.chatID.uuidString, privacy: .public)"
+                        "Suppressing foreground banner for active chat \(route.chatID.uuidString, privacy: .public) type=\(notificationType, privacy: .public)"
                     )
-                } else {
+                } else if notificationType == "message" {
                     self.logger.info(
                         "Suppressing system foreground banner in favor of in-app banner chat=\(route.chatID.uuidString, privacy: .public)"
                     )
+                } else {
+                    self.logger.info(
+                        "Presenting foreground system banner for chat \(route.chatID.uuidString, privacy: .public) type=\(notificationType, privacy: .public)"
+                    )
                 }
             }
-            return []
+            if shouldSuppressForActiveChat {
+                return []
+            }
+
+            switch notificationType {
+            case "typing":
+                return [.banner, .list]
+            case "reaction":
+                return [.banner, .list, .sound]
+            default:
+                return []
+            }
         }
         return []
     }
@@ -502,5 +523,13 @@ extension LocalPushNotificationService: UNUserNotificationCenterDelegate {
             userInfo["message_id"] = messageID.uuidString
         }
         return userInfo
+    }
+
+    @MainActor
+    private func resolvedNotificationType(from userInfo: [AnyHashable: Any]) -> String {
+        ((userInfo["notification_type"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased())
+            ?? "message"
     }
 }

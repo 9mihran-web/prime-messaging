@@ -6747,8 +6747,7 @@ def apns_payload_for_message(payload, badge_count):
         "mutable-content": 1,
     }
     if notification_type == "typing":
-        aps["interruption-level"] = "passive"
-        aps["content-available"] = 1
+        aps["interruption-level"] = "active"
     else:
         aps["sound"] = "default"
 
