@@ -6748,6 +6748,7 @@ def apns_payload_for_message(payload, badge_count):
     }
     if notification_type == "typing":
         aps["interruption-level"] = "active"
+        aps["sound"] = "default"
     else:
         aps["sound"] = "default"
 
