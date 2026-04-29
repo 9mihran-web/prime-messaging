@@ -12178,8 +12178,27 @@ class Handler(BaseHTTPRequestHandler):
                 imported_messages = []
                 created_messages = []
                 updated_messages = []
+                skipped_messages = []
+                pending_reply_links = []
                 latest_imported_at = None
                 did_change = False
+
+                def import_message_fingerprint(message_like):
+                    if not isinstance(message_like, dict):
+                        return None
+                    sender_key = normalized_entity_id(message_like.get("senderID")) or ""
+                    created_key = normalized_optional_string(message_like.get("createdAt")) or ""
+                    text_key = normalized_optional_string(message_like.get("text")) or ""
+                    kind_key = str(message_like.get("kind") or "text").strip().lower()
+                    attachment_names = [
+                        normalized_optional_string(item.get("fileName")) or ""
+                        for item in (message_like.get("attachments") or [])
+                        if isinstance(item, dict)
+                    ]
+                    attachment_key = "|".join(sorted(name.lower() for name in attachment_names if name))
+                    if not any([sender_key, created_key, text_key, kind_key, attachment_key]):
+                        return None
+                    return "||".join([sender_key, created_key, text_key, kind_key, attachment_key])
 
                 for raw_message in raw_import_messages:
                     if not isinstance(raw_message, dict):
@@ -12197,6 +12216,8 @@ class Handler(BaseHTTPRequestHandler):
                     client_message_id = normalized_entity_id(raw_message.get("client_message_id")) or str(uuid.uuid4())
                     created_at_value = parse_iso_timestamp(raw_message.get("created_at")) or datetime.now(timezone.utc)
                     created_at = created_at_value.isoformat()
+                    reply_to_client_message_id = normalized_entity_id(raw_message.get("reply_to_client_message_id"))
+                    reply_preview = sanitized_reply_preview(raw_message.get("reply_preview"))
                     if latest_imported_at is None or created_at_value > latest_imported_at:
                         latest_imported_at = created_at_value
 
@@ -12272,6 +12293,15 @@ class Handler(BaseHTTPRequestHandler):
                             "remoteFileURL": remote_url,
                         }
 
+                    expected_fingerprint = import_message_fingerprint(
+                        {
+                            "senderID": sender_id,
+                            "createdAt": created_at,
+                            "text": text,
+                            "kind": kind,
+                            "attachments": attachments,
+                        }
+                    )
                     existing_message = next(
                         (
                             item
@@ -12282,6 +12312,16 @@ class Handler(BaseHTTPRequestHandler):
                         ),
                         None,
                     )
+                    if not existing_message and expected_fingerprint:
+                        existing_message = next(
+                            (
+                                item
+                                for item in database["messages"]
+                                if ids_equal(item.get("chatID"), chat["id"])
+                                and import_message_fingerprint(item) == expected_fingerprint
+                            ),
+                            None,
+                        )
 
                     if existing_message:
                         existing_changed = False
@@ -12314,10 +12354,19 @@ class Handler(BaseHTTPRequestHandler):
                         if existing_message.get("status") != "read":
                             existing_message["status"] = "read"
                             existing_changed = True
+                        pending_reply_links.append(
+                            {
+                                "message": existing_message,
+                                "reply_to_client_message_id": reply_to_client_message_id,
+                                "reply_preview": reply_preview,
+                            }
+                        )
                         imported_messages.append(existing_message)
                         if existing_changed:
                             updated_messages.append(existing_message)
                             did_change = True
+                        else:
+                            skipped_messages.append(existing_message)
                         continue
 
                     message = {
@@ -12332,7 +12381,7 @@ class Handler(BaseHTTPRequestHandler):
                         "text": text,
                         "attachments": attachments,
                         "replyToMessageID": None,
-                        "replyPreview": None,
+                        "replyPreview": reply_preview,
                         "communityContext": None,
                         "deliveryOptions": None,
                         "voiceMessage": voice_message,
@@ -12343,9 +12392,59 @@ class Handler(BaseHTTPRequestHandler):
                         "reactions": [],
                     }
                     database["messages"].append(message)
+                    pending_reply_links.append(
+                        {
+                            "message": message,
+                            "reply_to_client_message_id": reply_to_client_message_id,
+                            "reply_preview": reply_preview,
+                        }
+                    )
                     imported_messages.append(message)
                     created_messages.append(message)
                     did_change = True
+
+                if pending_reply_links:
+                    chat_messages = [
+                        item
+                        for item in database["messages"]
+                        if ids_equal(item.get("chatID"), chat["id"])
+                    ]
+                    client_message_map = {}
+                    for item in chat_messages:
+                        client_key = normalized_entity_id(item.get("clientMessageID"))
+                        if client_key and client_key not in client_message_map:
+                            client_message_map[client_key] = item
+
+                    for reply_link in pending_reply_links:
+                        message = reply_link.get("message")
+                        if not isinstance(message, dict):
+                            continue
+                        reply_target = None
+                        reply_client_message_id = normalized_entity_id(reply_link.get("reply_to_client_message_id"))
+                        if reply_client_message_id:
+                            candidate = client_message_map.get(reply_client_message_id)
+                            if candidate and not ids_equal(candidate.get("id"), message.get("id")):
+                                reply_target = candidate
+
+                        resolved_reply_preview = sanitized_reply_preview(reply_link.get("reply_preview"))
+                        if reply_target and not ids_equal(message.get("replyToMessageID"), reply_target.get("id")):
+                            message["replyToMessageID"] = reply_target.get("id")
+                            did_change = True
+                            if message not in updated_messages and message not in created_messages:
+                                updated_messages.append(message)
+
+                        if not message.get("replyPreview"):
+                            if not resolved_reply_preview and reply_target:
+                                resolved_reply_preview = {
+                                    "senderID": reply_target.get("senderID"),
+                                    "senderDisplayName": sender_display_name_for(reply_target, database),
+                                    "previewText": message_preview(reply_target),
+                                }
+                            if resolved_reply_preview:
+                                message["replyPreview"] = resolved_reply_preview
+                                did_change = True
+                                if message not in updated_messages and message not in created_messages:
+                                    updated_messages.append(message)
 
                 if imported_messages and latest_imported_at:
                     for participant_id in participant_ids:
@@ -12380,6 +12479,9 @@ class Handler(BaseHTTPRequestHandler):
                         "chat": serialize_chat(chat, importer["id"], database),
                         "messages": [serialize_message(message, database) for message in imported_messages],
                         "imported_count": len(imported_messages),
+                        "created_count": len(created_messages),
+                        "updated_count": len(updated_messages),
+                        "skipped_count": len(skipped_messages),
                     },
                 )
 
