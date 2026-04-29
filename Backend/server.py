@@ -6176,8 +6176,11 @@ def serialize_message(message, database):
         "status": message.get("status", "sent"),
         "createdAt": message["createdAt"],
         "editedAt": message.get("editedAt"),
+        "editHistory": [] if is_deleted else sanitized_edit_history(message.get("editHistory")),
         "deletedForEveryoneAt": message.get("deletedForEveryoneAt"),
         "reactions": [] if is_deleted else sanitized_reactions(message.get("reactions")),
+        "mentions": [] if is_deleted else sanitized_mentions(message.get("mentions")),
+        "viewCount": None if is_deleted else message_view_count(database, message),
         "voiceMessage": None if is_deleted else sanitized_voice_message(message.get("voiceMessage")),
         "liveLocation": None,
     }
@@ -6375,6 +6378,9 @@ def sanitized_delivery_options(delivery_options):
     }
 
 
+MESSAGE_EDIT_WINDOW_SECONDS = 48 * 60 * 60
+
+
 def sanitized_community_message_context(community_context, chat=None, database=None):
     if not isinstance(community_context, dict):
         return None
@@ -6435,6 +6441,73 @@ def sanitized_reactions(reactions):
         )
 
     return sanitized
+
+
+def sanitized_mentions(mentions):
+    if not isinstance(mentions, list):
+        return []
+
+    sanitized = []
+    for mention in mentions:
+        if not isinstance(mention, dict):
+            continue
+        handle = normalized_optional_string(mention.get("handle"))
+        if not handle:
+            continue
+        sanitized.append(
+            {
+                "id": normalized_entity_id(mention.get("id")) or str(uuid.uuid4()),
+                "userID": normalized_entity_id(mention.get("userID") or mention.get("user_id")),
+                "handle": handle,
+                "displayName": normalized_optional_string(mention.get("displayName") or mention.get("display_name")),
+            }
+        )
+    return sanitized
+
+
+def sanitized_edit_history(entries):
+    if not isinstance(entries, list):
+        return []
+
+    sanitized = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        text = normalized_optional_string(entry.get("text"))
+        edited_at = normalized_optional_string(entry.get("editedAt") or entry.get("edited_at"))
+        if not text or not edited_at:
+            continue
+        sanitized.append(
+            {
+                "id": normalized_entity_id(entry.get("id")) or str(uuid.uuid4()),
+                "text": text,
+                "editedAt": edited_at,
+                "editorID": normalized_entity_id(entry.get("editorID") or entry.get("editor_id")),
+            }
+        )
+    return sanitized
+
+
+def message_view_count(database, message):
+    if not isinstance(message, dict):
+        return None
+
+    chat = find_chat(database, message.get("chatID"))
+    if not chat or normalized_optional_string(chat.get("type")) != "group":
+        return None
+
+    created_at = parse_iso_datetime(message.get("createdAt"))
+    if not created_at:
+        return None
+
+    viewer_count = 0
+    for participant_id in unique_entity_ids(chat.get("participantIDs") or []):
+        if ids_equal(participant_id, message.get("senderID")):
+            continue
+        read_at = chat_read_marker_timestamp(database, participant_id, chat.get("id"))
+        if read_at and read_at >= created_at:
+            viewer_count += 1
+    return viewer_count
 
 
 def chat_read_marker_for(database, user_id, chat_id):
@@ -7206,6 +7279,16 @@ def schedule_apns_dispatch(dispatch_kind, device_tokens, payload, context):
 
 
 def log_push_dispatch_attempt(database, chat, message):
+    delivery_options = sanitized_delivery_options(message.get("deliveryOptions"))
+    if delivery_options and delivery_options.get("isSilent"):
+        log_event(
+            "push.dispatch.skipped",
+            reason="silent_delivery",
+            chat_id=chat["id"],
+            message_id=message["id"],
+        )
+        return
+
     device_tokens = device_tokens_for_recipients(database, chat, message.get("senderID"))
     payload = push_payload_for_message(chat, message, database)
     recipient_ids = [
@@ -12554,6 +12637,7 @@ class Handler(BaseHTTPRequestHandler):
                     reply_to_message_id = None
                 reply_preview = sanitized_reply_preview(payload.get("reply_preview"))
                 link_preview = sanitized_link_preview(payload.get("link_preview"))
+                mentions = sanitized_mentions(payload.get("mentions"))
                 community_context = sanitized_community_message_context(
                     payload.get("community_context"),
                     chat=chat,
@@ -12680,6 +12764,8 @@ class Handler(BaseHTTPRequestHandler):
                         existing_message["communityContext"] = community_context
                     if not existing_message.get("deliveryOptions") and delivery_options:
                         existing_message["deliveryOptions"] = delivery_options
+                    if not existing_message.get("mentions") and mentions:
+                        existing_message["mentions"] = mentions
                     if not existing_message.get("linkPreview") and link_preview:
                         existing_message["linkPreview"] = link_preview
                     if not normalized_optional_string(existing_message.get("text")) and text:
@@ -12734,10 +12820,12 @@ class Handler(BaseHTTPRequestHandler):
                     "replyPreview": reply_preview,
                     "communityContext": community_context,
                     "deliveryOptions": delivery_options,
+                    "mentions": mentions,
                     "voiceMessage": voice_message,
                     "status": initial_status,
                     "createdAt": created_at,
                     "editedAt": None,
+                    "editHistory": [],
                     "deletedForEveryoneAt": None,
                     "reactions": [],
                 }
@@ -12924,7 +13012,22 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(409, {"error": "edit_not_supported"})
                 if not updated_text:
                     return self.respond(409, {"error": "empty_message"})
+                created_at = parse_iso_datetime(message.get("createdAt"))
+                if created_at:
+                    edit_age_seconds = (datetime.now(timezone.utc) - created_at).total_seconds()
+                    if edit_age_seconds > MESSAGE_EDIT_WINDOW_SECONDS:
+                        return self.respond(409, {"error": "edit_window_expired"})
 
+                previous_text = normalized_optional_string(message.get("text"))
+                if previous_text and previous_text != updated_text:
+                    message.setdefault("editHistory", []).append(
+                        {
+                            "id": str(uuid.uuid4()),
+                            "text": previous_text,
+                            "editedAt": now_iso(),
+                            "editorID": editor_id,
+                        }
+                    )
                 message["text"] = updated_text
                 message["editedAt"] = now_iso()
                 save_db(database)
