@@ -13,6 +13,7 @@ struct PrivacySettingsView: View {
             Toggle("privacy.calls".localized, isOn: $settings.allowCallsFromNonContacts)
             Toggle("privacy.group_invites".localized, isOn: $settings.allowGroupInvitesFromNonContacts)
             Toggle("privacy.forwarding".localized, isOn: $settings.allowForwardLinkToProfile)
+            Toggle("Share typing status", isOn: $settings.shareTypingStatus)
 
             Picker("Guest message requests", selection: $settings.guestMessageRequests) {
                 Text("Approve first").tag(GuestMessageRequestPolicy.approvalRequired)

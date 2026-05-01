@@ -6,6 +6,7 @@ struct User: Identifiable, Codable, Equatable {
     var identityMethods: [IdentityMethod]
     var privacySettings: PrivacySettings
     var accountKind: AccountKind
+    var primePremium: PrimePremiumAccess
     var createdAt: Date
     var guestExpiresAt: Date?
 
@@ -15,6 +16,7 @@ struct User: Identifiable, Codable, Equatable {
         case identityMethods
         case privacySettings
         case accountKind
+        case primePremium
         case createdAt
         case guestExpiresAt
     }
@@ -25,6 +27,7 @@ struct User: Identifiable, Codable, Equatable {
         identityMethods: [IdentityMethod],
         privacySettings: PrivacySettings,
         accountKind: AccountKind = .standard,
+        primePremium: PrimePremiumAccess = .disabled,
         createdAt: Date = .now,
         guestExpiresAt: Date? = nil
     ) {
@@ -33,6 +36,7 @@ struct User: Identifiable, Codable, Equatable {
         self.identityMethods = identityMethods
         self.privacySettings = privacySettings
         self.accountKind = accountKind
+        self.primePremium = primePremium
         self.createdAt = createdAt
         self.guestExpiresAt = guestExpiresAt
     }
@@ -64,6 +68,7 @@ struct User: Identifiable, Codable, Equatable {
         identityMethods = try container.decodeIfPresent([IdentityMethod].self, forKey: .identityMethods) ?? []
         privacySettings = try container.decodeIfPresent(PrivacySettings.self, forKey: .privacySettings) ?? .defaultEmailOnly
         accountKind = try container.decodeIfPresent(AccountKind.self, forKey: .accountKind) ?? .standard
+        primePremium = try container.decodeIfPresent(PrimePremiumAccess.self, forKey: .primePremium) ?? .disabled
         createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? .now
         guestExpiresAt = try container.decodeIfPresent(Date.self, forKey: .guestExpiresAt)
     }
@@ -108,11 +113,33 @@ struct User: Identifiable, Codable, Equatable {
             && lhs.privacySettings.allowGroupInvitesFromNonContacts == rhs.privacySettings.allowGroupInvitesFromNonContacts
             && lhs.privacySettings.allowForwardLinkToProfile == rhs.privacySettings.allowForwardLinkToProfile
             && lhs.privacySettings.guestMessageRequests == rhs.privacySettings.guestMessageRequests
+            && lhs.privacySettings.shareTypingStatus == rhs.privacySettings.shareTypingStatus
             && lhs.accountKind == rhs.accountKind
+            && lhs.primePremium == rhs.primePremium
             && lhs.createdAt == rhs.createdAt
             && lhs.guestExpiresAt == rhs.guestExpiresAt
     }
 
+}
+
+struct PrimePremiumAccess: Codable, Equatable, Hashable, Sendable {
+    var isEnabled: Bool
+    var source: String?
+    var grantedAt: Date?
+
+    nonisolated static let disabled = PrimePremiumAccess(isEnabled: false, source: nil, grantedAt: nil)
+
+    nonisolated static func == (lhs: PrimePremiumAccess, rhs: PrimePremiumAccess) -> Bool {
+        lhs.isEnabled == rhs.isEnabled
+            && lhs.source == rhs.source
+            && lhs.grantedAt == rhs.grantedAt
+    }
+
+    nonisolated func hash(into hasher: inout Hasher) {
+        hasher.combine(isEnabled)
+        hasher.combine(source)
+        hasher.combine(grantedAt)
+    }
 }
 
 struct Profile: Codable, Hashable {
@@ -207,6 +234,7 @@ struct PrivacySettings: Codable, Hashable {
     var allowGroupInvitesFromNonContacts: Bool
     var allowForwardLinkToProfile: Bool
     var guestMessageRequests: GuestMessageRequestPolicy
+    var shareTypingStatus: Bool
 
     enum CodingKeys: String, CodingKey {
         case showEmail
@@ -217,6 +245,7 @@ struct PrivacySettings: Codable, Hashable {
         case allowGroupInvitesFromNonContacts
         case allowForwardLinkToProfile
         case guestMessageRequests
+        case shareTypingStatus
     }
 
     nonisolated init(
@@ -227,7 +256,8 @@ struct PrivacySettings: Codable, Hashable {
         allowCallsFromNonContacts: Bool,
         allowGroupInvitesFromNonContacts: Bool,
         allowForwardLinkToProfile: Bool,
-        guestMessageRequests: GuestMessageRequestPolicy
+        guestMessageRequests: GuestMessageRequestPolicy,
+        shareTypingStatus: Bool
     ) {
         self.showEmail = showEmail
         self.showPhoneNumber = showPhoneNumber
@@ -237,6 +267,7 @@ struct PrivacySettings: Codable, Hashable {
         self.allowGroupInvitesFromNonContacts = allowGroupInvitesFromNonContacts
         self.allowForwardLinkToProfile = allowForwardLinkToProfile
         self.guestMessageRequests = guestMessageRequests
+        self.shareTypingStatus = shareTypingStatus
     }
 
     nonisolated static let defaultEmailOnly = PrivacySettings(
@@ -247,7 +278,8 @@ struct PrivacySettings: Codable, Hashable {
         allowCallsFromNonContacts: false,
         allowGroupInvitesFromNonContacts: false,
         allowForwardLinkToProfile: false,
-        guestMessageRequests: .approvalRequired
+        guestMessageRequests: .approvalRequired,
+        shareTypingStatus: true
     )
 
     nonisolated init(from decoder: any Decoder) throws {
@@ -260,6 +292,7 @@ struct PrivacySettings: Codable, Hashable {
         allowGroupInvitesFromNonContacts = try container.decodeIfPresent(Bool.self, forKey: .allowGroupInvitesFromNonContacts) ?? false
         allowForwardLinkToProfile = try container.decodeIfPresent(Bool.self, forKey: .allowForwardLinkToProfile) ?? false
         guestMessageRequests = try container.decodeIfPresent(GuestMessageRequestPolicy.self, forKey: .guestMessageRequests) ?? .approvalRequired
+        shareTypingStatus = try container.decodeIfPresent(Bool.self, forKey: .shareTypingStatus) ?? true
     }
 
     nonisolated static func == (lhs: PrivacySettings, rhs: PrivacySettings) -> Bool {
@@ -271,6 +304,7 @@ struct PrivacySettings: Codable, Hashable {
             && lhs.allowGroupInvitesFromNonContacts == rhs.allowGroupInvitesFromNonContacts
             && lhs.allowForwardLinkToProfile == rhs.allowForwardLinkToProfile
             && lhs.guestMessageRequests == rhs.guestMessageRequests
+            && lhs.shareTypingStatus == rhs.shareTypingStatus
     }
 
     nonisolated func hash(into hasher: inout Hasher) {
@@ -282,5 +316,6 @@ struct PrivacySettings: Codable, Hashable {
         hasher.combine(allowGroupInvitesFromNonContacts)
         hasher.combine(allowForwardLinkToProfile)
         hasher.combine(guestMessageRequests)
+        hasher.combine(shareTypingStatus)
     }
 }

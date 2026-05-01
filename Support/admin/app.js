@@ -149,6 +149,7 @@
     dom.selectedUserMessageCount = document.getElementById("selected-user-message-count");
     dom.selectedUserSessionCount = document.getElementById("selected-user-session-count");
     dom.selectedUserMeta = document.getElementById("selected-user-meta");
+    dom.selectedUserPremiumButton = document.getElementById("selected-user-premium-button");
     dom.deleteSelectedUserButton = document.getElementById("delete-selected-user-button");
     dom.selectedUserStatus = document.getElementById("selected-user-status");
     dom.selectedUserChatsCount = document.getElementById("selected-user-chats-count");
@@ -200,6 +201,7 @@
     dom.userLookupForm.addEventListener("submit", onQuickLookupSubmit);
     dom.usersList.addEventListener("click", onUsersListClick);
     dom.selectedUserRefreshButton.addEventListener("click", () => void loadSelectedUserChats());
+    dom.selectedUserPremiumButton.addEventListener("click", () => void toggleSelectedUserPremium());
     dom.selectedUserContent.addEventListener("click", onSelectedUserPanelClick);
     dom.communitiesRefreshButton.addEventListener("click", () => void loadCommunities({ announce: true }));
     dom.communitiesSearchInput.addEventListener("input", onCommunitiesSearchInput);
@@ -871,6 +873,32 @@
     }
   }
 
+  async function toggleSelectedUserPremium() {
+    if (!state.selectedUser?.id) {
+      return;
+    }
+
+    const isEnabled = Boolean(state.selectedUser.primePremium?.isEnabled);
+    setBusy("selectedUser", true);
+    setStatus("selectedUser", isEnabled ? "Disabling Prime Premium…" : "Enabling Prime Premium…");
+
+    try {
+      const payload = await adminRequest(`/admin/users/${encodeURIComponent(state.selectedUser.id)}/premium`, {
+        method: "PATCH",
+        body: { is_enabled: !isEnabled },
+      });
+      state.selectedUser = payload;
+      replaceUserInList(payload);
+      renderUsers();
+      renderSelectedUser();
+      setStatus("selectedUser", payload.primePremium?.isEnabled ? "Prime Premium enabled." : "Prime Premium disabled.");
+    } catch (error) {
+      setStatus("selectedUser", humanizeApiError(error, "Could not change Prime Premium access."));
+    } finally {
+      setBusy("selectedUser", false);
+    }
+  }
+
   async function deleteSelectedUser() {
     if (!state.selectedUser?.id) {
       return;
@@ -1333,6 +1361,7 @@
         const selected = state.selectedUser?.id === user.id ? " selected" : "";
         const tags = [
           user.isLegacyPlaceholder ? `<span class="tag legacy">LEGACY</span>` : "",
+          user.primePremium?.isEnabled ? `<span class="tag">PREMIUM</span>` : "",
           isUserBanned(user) ? `<span class="tag banned">BANNED</span>` : "",
         ].join("");
         const subtitle = [
@@ -1388,6 +1417,9 @@
     if (user.isLegacyPlaceholder) {
       tags.push(`<span class="tag legacy">LEGACY</span>`);
     }
+    if (user.primePremium?.isEnabled) {
+      tags.push(`<span class="tag">PREMIUM</span>`);
+    }
     if (isUserBanned(user)) {
       tags.push(`<span class="tag banned">BANNED</span>`);
     }
@@ -1397,10 +1429,14 @@
       user.email ? `E-mail: ${escapeHtml(user.email)}` : "",
       user.phoneNumber ? `Phone: ${escapeHtml(user.phoneNumber)}` : "",
       `Created: ${escapeHtml(formatDateTime(user.createdAt))}`,
+      user.primePremium?.isEnabled
+        ? `Prime Premium: enabled${user.primePremium.grantedAt ? ` (${escapeHtml(formatDateTime(user.primePremium.grantedAt))})` : ""}`
+        : "Prime Premium: disabled",
       user.guestExpiresAt ? `Guest expires: ${escapeHtml(formatDateTime(user.guestExpiresAt))}` : "",
       user.bannedUntil ? `Banned until: ${escapeHtml(formatDateTime(user.bannedUntil))}` : "",
     ].filter(Boolean);
     dom.selectedUserMeta.innerHTML = metaLines.join("<br />");
+    dom.selectedUserPremiumButton.textContent = user.primePremium?.isEnabled ? "Disable Prime Premium" : "Enable Prime Premium";
 
     dom.selectedUserChatsCount.textContent = `${state.selectedUserChats.length}`;
     if (!state.selectedUserChats.length) {

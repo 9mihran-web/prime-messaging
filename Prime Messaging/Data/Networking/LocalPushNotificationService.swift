@@ -449,10 +449,6 @@ extension LocalPushNotificationService: UNUserNotificationCenterDelegate {
                     self.logger.info(
                         "Suppressing foreground banner for active chat \(route.chatID.uuidString, privacy: .public) type=\(notificationType, privacy: .public)"
                     )
-                } else if notificationType == "message" {
-                    self.logger.info(
-                        "Suppressing system foreground banner in favor of in-app banner chat=\(route.chatID.uuidString, privacy: .public)"
-                    )
                 } else {
                     self.logger.info(
                         "Presenting foreground system banner for chat \(route.chatID.uuidString, privacy: .public) type=\(notificationType, privacy: .public)"
@@ -460,13 +456,21 @@ extension LocalPushNotificationService: UNUserNotificationCenterDelegate {
                 }
             }
             if shouldSuppressForActiveChat {
+                let isPremiumActivity = ["premium_chat_opened", "premium_chat_closed", "premium_screenshot", "premium_screen_recording"].contains(notificationType)
+                if isPremiumActivity {
+                    return [.banner, .list, .sound]
+                }
                 return []
             }
 
             switch notificationType {
+            case "message":
+                return [.banner, .list, .sound]
             case "typing":
-                return [.banner, .list]
+                return [.banner, .list, .sound]
             case "reaction":
+                return [.banner, .list, .sound]
+            case "premium_chat_opened", "premium_chat_closed", "premium_screenshot", "premium_screen_recording":
                 return [.banner, .list, .sound]
             default:
                 return []

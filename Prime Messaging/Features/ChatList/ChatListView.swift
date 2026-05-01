@@ -42,6 +42,7 @@ struct ChatListView: View {
     @State private var pendingDeferredRefresh = false
     @State private var pendingForegroundRefreshAfterActivation = false
     @State private var isShowingPinLimitAlert = false
+    @State private var selectedPremiumActivity: SelectedPremiumActivityDetails?
     @State private var realtimeFeedTask: Task<Void, Never>?
     @State private var deferredInitialRefreshTask: Task<Void, Never>?
 
@@ -144,6 +145,10 @@ struct ChatListView: View {
             Button("common.ok".localized, role: .cancel) { }
         } message: {
             Text("chat.pin.limit.message".localized)
+        }
+        .sheet(item: $selectedPremiumActivity) { details in
+            PrimePremiumActivityDetailsSheet(details: details)
+                .presentationDetents([.medium, .large])
         }
     }
 
@@ -264,7 +269,15 @@ struct ChatListView: View {
                         chat: chat,
                         presentation: row.presentation,
                         currentUserID: appState.currentUser.id,
-                        visibleMode: mode
+                        visibleMode: mode,
+                        onTapPremiumStatus: {
+                            guard let activity = chat.primePremiumActivity else { return }
+                            selectedPremiumActivity = SelectedPremiumActivityDetails(
+                                chatTitle: chat.displayTitle(for: appState.currentUser.id),
+                                participantName: chat.displayTitle(for: appState.currentUser.id),
+                                activity: activity
+                            )
+                        }
                     )
                         .equatable()
                 }
@@ -319,6 +332,7 @@ struct ChatListView: View {
             }
             return chat.lastActivityAt.formatted(.dateTime.day().month(.twoDigits).year(.twoDigits))
         }()
+        let premiumStatus = ChatRowPresentation.PremiumStatus(activity: chat.primePremiumActivity)
 
         return ChatRowPresentation(
             title: title,
@@ -326,6 +340,7 @@ struct ChatListView: View {
             eventStatus: chat.eventStatusText(),
             communityStatus: chat.communityStatusText(),
             moderationStatus: chat.moderationStatusText(),
+            premiumStatus: premiumStatus,
             timestampText: timestampText,
             avatarPhotoURL: avatarPhotoURL,
             avatarPlaceholderText: avatarPlaceholderText,
@@ -414,17 +429,20 @@ struct ChatRowView: View, Equatable {
     let presentation: ChatRowPresentation
     let currentUserID: UUID
     let visibleMode: ChatMode
+    let onTapPremiumStatus: (() -> Void)?
 
     init(
         chat: Chat,
         presentation: ChatRowPresentation? = nil,
         currentUserID: UUID,
-        visibleMode: ChatMode
+        visibleMode: ChatMode,
+        onTapPremiumStatus: (() -> Void)? = nil
     ) {
         self.chat = chat
         self.currentUserID = currentUserID
         self.visibleMode = visibleMode
         self.presentation = presentation ?? Self.makePresentation(for: chat, currentUserID: currentUserID)
+        self.onTapPremiumStatus = onTapPremiumStatus
     }
 
     static func == (lhs: ChatRowView, rhs: ChatRowView) -> Bool {
@@ -497,6 +515,8 @@ struct ChatRowView: View, Equatable {
                                 .font(.caption.weight(.medium))
                                 .foregroundStyle(PrimeTheme.Colors.warning)
                                 .lineLimit(1)
+                        } else if let premiumStatus = presentation.premiumStatus {
+                            premiumStatusView(premiumStatus)
                         }
                     }
 
@@ -537,6 +557,34 @@ struct ChatRowView: View, Equatable {
         .padding(.vertical, 14)
         .padding(.horizontal, PrimeTheme.Spacing.medium)
         .background(PrimeTheme.Colors.background)
+    }
+
+    @ViewBuilder
+    private func premiumStatusView(_ premiumStatus: ChatRowPresentation.PremiumStatus) -> some View {
+        let content = HStack(spacing: 6) {
+            if premiumStatus.isViewingNow {
+                PrimePremiumEyesIndicator()
+            } else {
+                Image(systemName: "clock.arrow.trianglehead.counterclockwise.rotate.90")
+                    .font(.caption2.weight(.semibold))
+            }
+            Text(premiumStatus.label)
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+        }
+        .foregroundStyle(premiumStatus.isViewingNow ? PrimeTheme.Colors.accent : PrimeTheme.Colors.textSecondary)
+
+        if let onTapPremiumStatus {
+            content
+                .contentShape(Rectangle())
+                .highPriorityGesture(
+                    TapGesture().onEnded {
+                        onTapPremiumStatus()
+                    }
+                )
+        } else {
+            content
+        }
     }
 
     private var avatarView: some View {
@@ -610,6 +658,7 @@ struct ChatRowView: View, Equatable {
             eventStatus: chat.eventStatusText(),
             communityStatus: chat.communityStatusText(),
             moderationStatus: chat.moderationStatusText(),
+            premiumStatus: .init(activity: chat.primePremiumActivity),
             timestampText: timestampText,
             avatarPhotoURL: avatarPhotoURL,
             avatarPlaceholderText: avatarPlaceholderText,
@@ -635,11 +684,36 @@ struct ChatRowPresentation: Equatable {
         let systemName: String
     }
 
+    struct PremiumStatus: Equatable {
+        let label: String
+        let isViewingNow: Bool
+
+        init?(activity: PrimePremiumChatActivity?) {
+            guard let activity else { return nil }
+            if activity.isViewingNow {
+                self.label = "Viewing your chat now"
+                self.isViewingNow = true
+                return
+            }
+            let formatter = RelativeDateTimeFormatter()
+            formatter.unitsStyle = .full
+            if let closedAt = activity.closedAt {
+                self.label = "Viewed \(formatter.localizedString(for: closedAt, relativeTo: .now))"
+            } else if let lastEventAt = activity.lastEventAt {
+                self.label = "Viewed \(formatter.localizedString(for: lastEventAt, relativeTo: .now))"
+            } else {
+                return nil
+            }
+            self.isViewingNow = false
+        }
+    }
+
     let title: String
     let previewText: String
     let eventStatus: String?
     let communityStatus: String?
     let moderationStatus: String?
+    let premiumStatus: PremiumStatus?
     let timestampText: String?
     let avatarPhotoURL: URL?
     let avatarPlaceholderText: String
@@ -649,6 +723,73 @@ struct ChatRowPresentation: Equatable {
     let unreadCount: Int
     let isPinned: Bool
     let draftText: String?
+}
+
+struct SelectedPremiumActivityDetails: Identifiable, Equatable {
+    let id = UUID()
+    let chatTitle: String
+    let participantName: String
+    let activity: PrimePremiumChatActivity
+}
+
+private struct PrimePremiumActivityDetailsSheet: View {
+    let details: SelectedPremiumActivityDetails
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Prime Premium") {
+                    if let openedAt = details.activity.openedAt {
+                        Text("\(details.participantName) opened your chat at \(openedAt.formatted(.dateTime.hour().minute()))")
+                    }
+                    if let duration = details.activity.viewedDurationSeconds, duration > 0 {
+                        Text("\(details.participantName) viewed your chat for \(max(1, duration / 60)) min")
+                    }
+                    if let closedAt = details.activity.closedAt {
+                        Text("\(details.participantName) closed the chat at \(closedAt.formatted(.dateTime.hour().minute()))")
+                    }
+                    if let screenshotAt = details.activity.lastScreenshotAt {
+                        Text("Screenshot at \(screenshotAt.formatted(.dateTime.hour().minute()))")
+                    }
+                    if let recordingAt = details.activity.lastScreenRecordingAt {
+                        Text("Screen recording at \(recordingAt.formatted(.dateTime.hour().minute()))")
+                    }
+                    if details.activity.isViewingNow {
+                        Text("Currently viewing the chat")
+                    }
+                }
+            }
+            .navigationTitle(details.chatTitle)
+        }
+    }
+}
+
+private struct PrimePremiumEyesIndicator: View {
+    @State private var lookOffset: CGFloat = -1.5
+
+    var body: some View {
+        HStack(spacing: 3) {
+            eye
+            eye
+        }
+        .onAppear {
+            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+                lookOffset = 1.5
+            }
+        }
+    }
+
+    private var eye: some View {
+        ZStack {
+            Capsule(style: .continuous)
+                .fill(Color.white.opacity(0.9))
+                .frame(width: 14, height: 9)
+            Circle()
+                .fill(PrimeTheme.Colors.accent)
+                .frame(width: 4.5, height: 4.5)
+                .offset(x: lookOffset)
+        }
+    }
 }
 
 @MainActor

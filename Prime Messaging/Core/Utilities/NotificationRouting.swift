@@ -584,6 +584,28 @@ actor ChatRealtimeService {
         ])
     }
 
+    func sendChatActivity(
+        chatID: UUID,
+        userID: UUID,
+        mode: ChatMode,
+        kind: String,
+        isActive: Bool? = nil
+    ) async {
+        await activate(userID: userID, mode: mode)
+        guard mode == .online else { return }
+        guard activeUserID == userID else { return }
+
+        var payload: [String: Any] = [
+            "action": "chat_activity",
+            "chat_id": chatID.uuidString,
+            "kind": kind,
+        ]
+        if let isActive {
+            payload["is_active"] = isActive
+        }
+        await sendCommand(payload)
+    }
+
     func sendPresenceHeartbeat(
         userID: UUID,
         mode: ChatMode,

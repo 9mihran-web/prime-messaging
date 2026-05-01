@@ -20,6 +20,7 @@ struct Chat: Identifiable, Codable, Hashable {
     var eventDetails: EventChatDetails?
     var communityDetails: CommunityChatDetails?
     var moderationSettings: GroupModerationSettings?
+    var primePremiumActivity: PrimePremiumChatActivity?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -41,6 +42,7 @@ struct Chat: Identifiable, Codable, Hashable {
         case eventDetails
         case communityDetails
         case moderationSettings
+        case primePremiumActivity
     }
 
     init(
@@ -62,7 +64,8 @@ struct Chat: Identifiable, Codable, Hashable {
         guestRequest: GuestRequest? = nil,
         eventDetails: EventChatDetails? = nil,
         communityDetails: CommunityChatDetails? = nil,
-        moderationSettings: GroupModerationSettings? = nil
+        moderationSettings: GroupModerationSettings? = nil,
+        primePremiumActivity: PrimePremiumChatActivity? = nil
     ) {
         self.id = id
         self.mode = mode
@@ -83,6 +86,7 @@ struct Chat: Identifiable, Codable, Hashable {
         self.eventDetails = eventDetails
         self.communityDetails = communityDetails
         self.moderationSettings = moderationSettings
+        self.primePremiumActivity = primePremiumActivity
     }
 
     init(from decoder: any Decoder) throws {
@@ -106,7 +110,20 @@ struct Chat: Identifiable, Codable, Hashable {
         eventDetails = try container.decodeIfPresent(EventChatDetails.self, forKey: .eventDetails)
         communityDetails = try container.decodeIfPresent(CommunityChatDetails.self, forKey: .communityDetails)
         moderationSettings = try container.decodeIfPresent(GroupModerationSettings.self, forKey: .moderationSettings)
+        primePremiumActivity = try container.decodeIfPresent(PrimePremiumChatActivity.self, forKey: .primePremiumActivity)
     }
+}
+
+struct PrimePremiumChatActivity: Codable, Hashable {
+    var actorUserID: UUID
+    var isViewingNow: Bool
+    var openedAt: Date?
+    var closedAt: Date?
+    var viewedDurationSeconds: Int?
+    var lastEventAt: Date?
+    var lastEventKind: String?
+    var lastScreenshotAt: Date?
+    var lastScreenRecordingAt: Date?
 }
 
 enum CommunityKind: String, Codable, CaseIterable, Hashable, Identifiable {

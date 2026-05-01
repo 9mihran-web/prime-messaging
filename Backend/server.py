@@ -164,6 +164,10 @@ ADMIN_LOGIN = (os.environ.get("PRIME_MESSAGING_ADMIN_LOGIN", "admin") or "admin"
 ADMIN_PASSWORD = os.environ.get("PRIME_MESSAGING_ADMIN_PASSWORD", "Prime-admin-very-secret-2026").strip()
 ADMIN_TOKEN = os.environ.get("PRIME_MESSAGING_ADMIN_TOKEN", "").strip()
 ADMIN_USERNAME = (os.environ.get("PRIME_MESSAGING_ADMIN_USERNAME", "mihran") or "mihran").strip().lower()
+PRIME_PREMIUM_SEEDED_USERNAMES = {
+    "mihran",
+    "1haka",
+}
 APNS_KEY_PATH = os.environ.get("PRIME_MESSAGING_APNS_KEY_PATH", "").strip()
 APNS_KEY_P8 = os.environ.get("PRIME_MESSAGING_APNS_KEY_P8", "").strip()
 APNS_KEY_ID = os.environ.get("PRIME_MESSAGING_APNS_KEY_ID", "").strip()
@@ -456,6 +460,8 @@ class RealtimeClientState:
         self.subscribed_chat_ids = set()
         self.typing_chat_ids = set()
         self.typing_activity_at_by_chat = {}
+        self.active_chat_view_sessions = {}
+        self.active_screen_recording_chat_ids = set()
 
     def send_payload(self, payload):
         if self.closed:
@@ -527,10 +533,16 @@ class RealtimeHub:
             typing_chat_ids = list(client.typing_chat_ids)
             client.typing_chat_ids.clear()
             client.typing_activity_at_by_chat.clear()
+            active_chat_view_sessions = dict(client.active_chat_view_sessions)
+            client.active_chat_view_sessions.clear()
+            active_screen_recording_chat_ids = list(client.active_screen_recording_chat_ids)
+            client.active_screen_recording_chat_ids.clear()
             return {
                 "user_id": client.user_id,
                 "remaining_connection_count": remaining_connection_count,
                 "typing_chat_ids": typing_chat_ids,
+                "active_chat_view_sessions": active_chat_view_sessions,
+                "active_screen_recording_chat_ids": active_screen_recording_chat_ids,
             }
 
     def set_feed_subscription(self, connection_id, subscribed):
@@ -588,6 +600,45 @@ class RealtimeHub:
             if normalized_chat_id not in client.typing_chat_ids:
                 return None
             client.typing_chat_ids.discard(normalized_chat_id)
+            return "stopped"
+
+    def set_chat_view_state(self, connection_id, chat_id, is_open):
+        normalized_chat_id = normalized_entity_id(chat_id)
+        if not normalized_chat_id:
+            return None, None
+        with self.lock:
+            client = self.clients_by_id.get(connection_id)
+            if not client:
+                return None, None
+            previous_opened_at = client.active_chat_view_sessions.get(normalized_chat_id)
+            if is_open:
+                if previous_opened_at:
+                    return "refreshed", previous_opened_at
+                opened_at = now_iso()
+                client.active_chat_view_sessions[normalized_chat_id] = opened_at
+                return "opened", opened_at
+            if not previous_opened_at:
+                return "noop", None
+            client.active_chat_view_sessions.pop(normalized_chat_id, None)
+            client.active_screen_recording_chat_ids.discard(normalized_chat_id)
+            return "closed", previous_opened_at
+
+    def set_screen_recording_state(self, connection_id, chat_id, is_recording):
+        normalized_chat_id = normalized_entity_id(chat_id)
+        if not normalized_chat_id:
+            return None
+        with self.lock:
+            client = self.clients_by_id.get(connection_id)
+            if not client:
+                return None
+            if is_recording:
+                if normalized_chat_id in client.active_screen_recording_chat_ids:
+                    return "noop"
+                client.active_screen_recording_chat_ids.add(normalized_chat_id)
+                return "started"
+            if normalized_chat_id not in client.active_screen_recording_chat_ids:
+                return "noop"
+            client.active_screen_recording_chat_ids.discard(normalized_chat_id)
             return "stopped"
 
     def collect_expired_typing_states(self):
@@ -1623,7 +1674,7 @@ def prune_stale_call_events(database, retention_seconds=TERMINAL_CALL_EVENT_RETE
 def ensure_database_schema(database):
     did_update = False
 
-    for key in ("users", "chats", "messages", "sessions", "deviceTokens", "otpChallenges", "calls", "callEvents", "chatReadMarkers", "blocks"):
+    for key in ("users", "chats", "messages", "sessions", "deviceTokens", "otpChallenges", "calls", "callEvents", "chatReadMarkers", "blocks", "chatActivityStates"):
         if key not in database:
             database[key] = []
             did_update = True
@@ -2910,6 +2961,7 @@ def serialize_user(user, viewer=None):
         "privacySettings": privacy_settings,
         "securitySettings": security_settings_for(user),
         "accountKind": user.get("accountKind") or "standard",
+        "primePremium": prime_premium_payload(user),
         "createdAt": user.get("createdAt") or now_iso(),
         "guestExpiresAt": user.get("guestExpiresAt"),
     }
@@ -2925,6 +2977,7 @@ def default_privacy_settings():
         "allowGroupInvitesFromNonContacts": False,
         "allowForwardLinkToProfile": False,
         "guestMessageRequests": "approvalRequired",
+        "shareTypingStatus": True,
     }
 
 
@@ -2935,7 +2988,202 @@ def privacy_settings_for(user):
     if guest_policy not in {"approvalRequired", "blocked"}:
         guest_policy = "approvalRequired"
     settings["guestMessageRequests"] = guest_policy
+    settings["shareTypingStatus"] = bool(settings.get("shareTypingStatus", True))
     return settings
+
+
+def normalized_username_for_user(user):
+    if not isinstance(user, dict):
+        return ""
+    username = normalized_optional_string((user.get("profile") or {}).get("username")) or ""
+    return username.lower().removeprefix("@")
+
+
+def prime_premium_override_for_user(user):
+    if not isinstance(user, dict):
+        return None
+    if "primePremiumEnabled" in user:
+        override = normalized_optional_bool(user.get("primePremiumEnabled"))
+        if override is not None:
+            return override
+    premium_payload = user.get("primePremium")
+    if isinstance(premium_payload, dict):
+        key = "isEnabled" if "isEnabled" in premium_payload else ("is_enabled" if "is_enabled" in premium_payload else None)
+        if key:
+            nested_override = normalized_optional_bool(premium_payload.get(key))
+            if nested_override is not None:
+                return nested_override
+    return None
+
+
+def prime_premium_granted_at_for_user(user):
+    if not isinstance(user, dict):
+        return None
+    direct_value = normalized_optional_string(user.get("primePremiumGrantedAt"))
+    if direct_value:
+        return direct_value
+    premium_payload = user.get("primePremium")
+    if isinstance(premium_payload, dict):
+        return normalized_optional_string(
+            premium_payload.get("grantedAt")
+            if "grantedAt" in premium_payload
+            else premium_payload.get("granted_at")
+        )
+    return None
+
+
+def prime_premium_source_for_user(user):
+    if not isinstance(user, dict):
+        return None
+    normalized_username = normalized_username_for_user(user)
+    override = prime_premium_override_for_user(user)
+    if override is not None:
+        return "admin"
+    if normalized_username in PRIME_PREMIUM_SEEDED_USERNAMES:
+        return "seeded"
+    return None
+
+
+def is_prime_premium_enabled(user):
+    if not isinstance(user, dict):
+        return False
+    override = prime_premium_override_for_user(user)
+    if override is not None:
+        return override
+    normalized_username = normalized_username_for_user(user)
+    return normalized_username in PRIME_PREMIUM_SEEDED_USERNAMES
+
+
+def prime_premium_payload(user):
+    enabled = is_prime_premium_enabled(user)
+    return {
+        "isEnabled": enabled,
+        "source": prime_premium_source_for_user(user),
+        "grantedAt": prime_premium_granted_at_for_user(user),
+    }
+
+
+def set_prime_premium_enabled(user, enabled):
+    if not isinstance(user, dict):
+        return False
+    enabled = bool(enabled)
+    previous_override = prime_premium_override_for_user(user)
+    previous_granted_at = prime_premium_granted_at_for_user(user)
+
+    user["primePremiumEnabled"] = enabled
+    if enabled:
+        if not previous_override or not previous_granted_at:
+            user["primePremiumGrantedAt"] = now_iso()
+    else:
+        user["primePremiumGrantedAt"] = None
+
+    user["primePremium"] = {
+        "isEnabled": enabled,
+        "source": "admin" if enabled else None,
+        "grantedAt": user.get("primePremiumGrantedAt"),
+    }
+    return previous_override != enabled
+
+
+def chat_activity_entry(database, chat_id, actor_user_id):
+    normalized_chat_id = normalized_entity_id(chat_id)
+    normalized_actor_user_id = normalized_entity_id(actor_user_id)
+    if not normalized_chat_id or not normalized_actor_user_id:
+        return None
+    for entry in database.get("chatActivityStates", []):
+        if ids_equal(entry.get("chatID"), normalized_chat_id) and ids_equal(entry.get("actorUserID"), normalized_actor_user_id):
+            return entry
+    return None
+
+
+def ensure_chat_activity_entry(database, chat_id, actor_user_id):
+    existing = chat_activity_entry(database, chat_id, actor_user_id)
+    if existing:
+        return existing
+    entry = {
+        "id": str(uuid.uuid4()),
+        "chatID": normalized_entity_id(chat_id),
+        "actorUserID": normalized_entity_id(actor_user_id),
+        "isViewingNow": False,
+        "openedAt": None,
+        "closedAt": None,
+        "viewedDurationSeconds": None,
+        "lastEventAt": None,
+        "lastEventKind": None,
+        "lastScreenshotAt": None,
+        "lastScreenRecordingAt": None,
+    }
+    database.setdefault("chatActivityStates", []).append(entry)
+    return entry
+
+
+def can_view_prime_premium_chat_activity(viewer_user):
+    return is_prime_premium_enabled(viewer_user)
+
+
+def chat_activity_payload_for_viewer(database, chat, current_user_id):
+    if not chat or chat.get("type") != "direct":
+        return None
+    viewer = find_user(database, current_user_id)
+    if can_view_prime_premium_chat_activity(viewer) is False:
+        return None
+    other_user = direct_chat_other_user(chat, current_user_id, database)
+    if not other_user:
+        return None
+    entry = chat_activity_entry(database, chat.get("id"), other_user.get("id"))
+    if not entry:
+        return None
+    return {
+        "actorUserID": other_user.get("id"),
+        "isViewingNow": bool(entry.get("isViewingNow")),
+        "openedAt": entry.get("openedAt"),
+        "closedAt": entry.get("closedAt"),
+        "viewedDurationSeconds": entry.get("viewedDurationSeconds"),
+        "lastEventAt": entry.get("lastEventAt"),
+        "lastEventKind": entry.get("lastEventKind"),
+        "lastScreenshotAt": entry.get("lastScreenshotAt"),
+        "lastScreenRecordingAt": entry.get("lastScreenRecordingAt"),
+    }
+
+
+def update_chat_activity_state(
+    database,
+    chat,
+    actor_user_id,
+    activity_kind,
+    opened_at=None,
+    closed_at=None,
+):
+    if not chat or chat.get("type") != "direct":
+        return None
+    normalized_kind = normalized_optional_string(activity_kind)
+    if not normalized_kind:
+        return None
+    entry = ensure_chat_activity_entry(database, chat.get("id"), actor_user_id)
+    timestamp = now_iso()
+    entry["lastEventKind"] = normalized_kind
+    entry["lastEventAt"] = timestamp
+
+    if normalized_kind == "opened":
+        entry["isViewingNow"] = True
+        entry["openedAt"] = normalized_optional_string(opened_at) or timestamp
+        entry["closedAt"] = None
+        entry["viewedDurationSeconds"] = None
+    elif normalized_kind == "closed":
+        opened_timestamp = parse_iso_timestamp(opened_at or entry.get("openedAt"))
+        closed_timestamp = parse_iso_timestamp(closed_at or timestamp)
+        duration_seconds = None
+        if opened_timestamp and closed_timestamp:
+            duration_seconds = max(0, int((closed_timestamp - opened_timestamp).total_seconds()))
+        entry["isViewingNow"] = False
+        entry["closedAt"] = normalized_optional_string(closed_at) or timestamp
+        entry["viewedDurationSeconds"] = duration_seconds
+    elif normalized_kind == "screenshot":
+        entry["lastScreenshotAt"] = timestamp
+    elif normalized_kind == "screen_recording":
+        entry["lastScreenRecordingAt"] = timestamp
+
+    return entry
 
 
 def find_user_by_identifier(database, identifier):
@@ -5388,6 +5636,7 @@ def admin_user_payload(database, user):
         "email": profile.get("email"),
         "phoneNumber": profile.get("phoneNumber"),
         "accountKind": user.get("accountKind") or "standard",
+        "primePremium": prime_premium_payload(user),
         "createdAt": user.get("createdAt") or now_iso(),
         "guestExpiresAt": user.get("guestExpiresAt"),
         "bannedUntil": user.get("bannedUntil"),
@@ -6151,6 +6400,7 @@ def serialize_chat(chat, current_user_id, database):
         "communityDetails": sanitized_community_details(chat.get("communityDetails")),
         "eventDetails": chat.get("eventDetails"),
         "moderationSettings": chat.get("moderationSettings"),
+        "primePremiumActivity": chat_activity_payload_for_viewer(database, chat, current_user_id),
     }
 
 
@@ -6677,6 +6927,22 @@ def device_tokens_for_recipients(database, chat, excluding_user_id):
     return deduplicated
 
 
+def premium_device_tokens_for_recipients(database, chat, excluding_user_id):
+    eligible_recipient_ids = {
+        normalized_entity_id(participant_id)
+        for participant_id in (chat.get("participantIDs") or [])
+        if not ids_equal(participant_id, excluding_user_id)
+        and is_prime_premium_enabled(find_user(database, participant_id))
+    }
+    if not eligible_recipient_ids:
+        return []
+    return [
+        entry
+        for entry in device_tokens_for_recipients(database, chat, excluding_user_id)
+        if normalized_entity_id(entry.get("userID")) in eligible_recipient_ids
+    ]
+
+
 def is_ios_apns_target(entry):
     platform = normalized_device_platform(entry.get("platform")) or "ios"
     return platform in {"ios", "iphone", "ipad", "ipados"}
@@ -6800,6 +7066,54 @@ def push_payload_for_reaction(chat, message, reactor_user_id, emoji, database):
         "reaction_emoji": emoji,
         "target_message_id": message["id"],
         "target_message_sender_id": normalized_optional_string(message.get("senderID")),
+    }
+
+
+def push_payload_for_chat_activity(chat, actor_user_id, activity_kind, database, duration_seconds=None):
+    if not chat or chat.get("mode") != "online" or chat.get("type") != "direct":
+        return None
+
+    normalized_kind = normalized_optional_string(activity_kind)
+    actor_user_id = normalized_entity_id(actor_user_id)
+    if not normalized_kind or not actor_user_id:
+        return None
+
+    actor_user = find_user(database, actor_user_id)
+    if not actor_user:
+        return None
+
+    actor_name = resolved_user_display_name(actor_user) or "Someone"
+    actor_profile = actor_user.get("profile") or {}
+    if normalized_kind == "opened":
+        body = f"{actor_name} opened your shared chat."
+        notification_type = "premium_chat_opened"
+    elif normalized_kind == "closed":
+        duration_minutes = max(1, int(round(max(0, int(duration_seconds or 0)) / 60.0)))
+        body = f"{actor_name} closed your shared chat after {duration_minutes} min."
+        notification_type = "premium_chat_closed"
+    elif normalized_kind == "screenshot":
+        body = f"{actor_name} took a screenshot of the chat."
+        notification_type = "premium_screenshot"
+    elif normalized_kind == "screen_recording":
+        body = f"{actor_name} screen recorded the chat."
+        notification_type = "premium_screen_recording"
+    else:
+        return None
+
+    return {
+        "chat_id": chat["id"],
+        "message_id": None,
+        "mode": chat["mode"],
+        "chat_type": chat["type"],
+        "notification_type": notification_type,
+        "title": "Prime Premium",
+        "body": body,
+        "sender_id": actor_user_id,
+        "sender_name": actor_name,
+        "sender_photo_url": normalized_optional_url_string(actor_profile.get("profilePhotoURL")),
+        "group_title": None,
+        "group_photo_url": None,
+        "community_kind": None,
     }
 
 
@@ -7400,6 +7714,35 @@ def log_reaction_push_dispatch_attempt(database, chat, message, reactor_user_id,
         "push.reaction.queued",
         recipient_count=len(device_tokens),
         emoji=emoji,
+        **context,
+    )
+    schedule_apns_dispatch("push", device_tokens, payload, context)
+
+
+def log_chat_activity_push_dispatch_attempt(database, chat, actor_user_id, activity_kind, duration_seconds=None):
+    payload = push_payload_for_chat_activity(
+        chat,
+        actor_user_id,
+        activity_kind,
+        database,
+        duration_seconds=duration_seconds,
+    )
+    if not payload:
+        return
+
+    device_tokens = premium_device_tokens_for_recipients(database, chat, actor_user_id)
+    if not device_tokens:
+        return
+
+    context = {
+        "chat_id": chat["id"],
+        "activity_actor_user_id": actor_user_id,
+        "activity_kind": normalized_optional_string(activity_kind) or "unknown",
+        "collapse_id": f"premium-activity-{normalized_entity_id(chat.get('id')) or 'unknown'}-{normalized_optional_string(activity_kind) or 'unknown'}",
+    }
+    log_event(
+        "push.premium_activity.queued",
+        recipient_count=len(device_tokens),
         **context,
     )
     schedule_apns_dispatch("push", device_tokens, payload, context)
@@ -9077,6 +9420,32 @@ class Handler(BaseHTTPRequestHandler):
                 ban_user_account(database, user_id, duration_days)
                 save_db(database)
                 return self.respond(200, {"ok": True, "bannedUntil": target_user.get("bannedUntil")})
+
+            if method == "PATCH" and parsed.path.startswith("/admin/users/") and parsed.path.endswith("/premium"):
+                admin_error = admin_request_error(database, self.headers)
+                if admin_error:
+                    return self.respond(401 if admin_error in {"admin_not_configured", "admin_token_required", "admin_auth_required"} else 403, {"error": admin_error})
+
+                path_parts = parsed.path.split("/")
+                user_id = normalized_entity_id(path_parts[3] if len(path_parts) > 3 else None)
+                if not user_id:
+                    return self.respond(404, {"error": "user_not_found"})
+
+                target_user = find_user(database, user_id)
+                if not target_user:
+                    return self.respond(404, {"error": "user_not_found"})
+
+                requested_enabled = normalized_optional_bool(
+                    payload.get("is_enabled")
+                    if "is_enabled" in payload
+                    else payload.get("isEnabled")
+                )
+                if requested_enabled is None:
+                    return self.respond(409, {"error": "invalid_prime_premium_state"})
+
+                set_prime_premium_enabled(target_user, requested_enabled)
+                save_db(database)
+                return self.respond(200, admin_user_payload(database, target_user))
 
             if method == "PATCH" and parsed.path.startswith("/admin/chats/") and parsed.path.endswith("/official"):
                 admin_error = admin_request_error(database, self.headers)
@@ -11053,7 +11422,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 updated_settings = default_privacy_settings()
                 updated_settings.update(current_user.get("privacySettings") or {})
-                for key in ("showEmail", "showPhoneNumber", "allowLastSeen", "allowProfilePhoto", "allowCallsFromNonContacts", "allowGroupInvitesFromNonContacts", "allowForwardLinkToProfile"):
+                for key in ("showEmail", "showPhoneNumber", "allowLastSeen", "allowProfilePhoto", "allowCallsFromNonContacts", "allowGroupInvitesFromNonContacts", "allowForwardLinkToProfile", "shareTypingStatus"):
                     if key in incoming:
                         updated_settings[key] = bool(incoming.get(key))
                 if "guestMessageRequests" in incoming:
@@ -13233,6 +13602,35 @@ class Handler(BaseHTTPRequestHandler):
                                     unregister_snapshot.get("user_id"),
                                     is_typing=False,
                                 )
+                active_chat_view_sessions = unregister_snapshot.get("active_chat_view_sessions") or {}
+                if active_chat_view_sessions:
+                    with LOCK:
+                        database = load_db()
+                        for chat_id, opened_at in active_chat_view_sessions.items():
+                            chat = find_chat(database, chat_id)
+                            if not chat:
+                                continue
+                            updated_entry = update_chat_activity_state(
+                                database,
+                                chat,
+                                unregister_snapshot.get("user_id"),
+                                "closed",
+                                opened_at=opened_at,
+                                closed_at=now_iso(),
+                            )
+                            if updated_entry:
+                                realtime_publish_chat_event(database, chat, event_type="chat.updated")
+                                try:
+                                    log_chat_activity_push_dispatch_attempt(
+                                        database,
+                                        chat,
+                                        unregister_snapshot.get("user_id"),
+                                        "closed",
+                                        duration_seconds=updated_entry.get("viewedDurationSeconds"),
+                                    )
+                                except Exception:
+                                    pass
+                        save_db(database)
                 if int(unregister_snapshot.get("remaining_connection_count") or 0) == 0:
                     with LOCK:
                         database = load_db()
@@ -13343,6 +13741,7 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 database = load_db()
                 chat = find_chat(database, chat_id)
+                sender_user = find_user(database, client.user_id)
             if not chat:
                 REALTIME_HUB.send_to_connection(
                     client.connection_id,
@@ -13383,6 +13782,44 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if sender_user and privacy_settings_for(sender_user).get("shareTypingStatus") is False:
+                if is_typing:
+                    REALTIME_HUB.send_to_connection(
+                        client.connection_id,
+                        {
+                            "type": "system.typing_ack",
+                            "chatID": chat_id,
+                            "mode": "online",
+                            "timestamp": now_iso(),
+                            "isTyping": False,
+                            "transition": "disabled",
+                        },
+                    )
+                    return
+                typing_transition = REALTIME_HUB.set_typing_state(client.connection_id, chat_id, False)
+                if typing_transition:
+                    with LOCK:
+                        database = load_db()
+                        fresh_chat = find_chat(database, chat_id)
+                        if fresh_chat:
+                            realtime_publish_typing_event(
+                                database,
+                                fresh_chat,
+                                client.user_id,
+                                is_typing=False,
+                            )
+                REALTIME_HUB.send_to_connection(
+                    client.connection_id,
+                    {
+                        "type": "system.typing_ack",
+                        "chatID": chat_id,
+                        "mode": "online",
+                        "timestamp": now_iso(),
+                        "isTyping": False,
+                        "transition": "disabled",
+                    },
+                )
+                return
 
             REALTIME_HUB.touch_user_presence(client.user_id)
             typing_transition = REALTIME_HUB.set_typing_state(client.connection_id, chat_id, is_typing)
@@ -13418,6 +13855,123 @@ class Handler(BaseHTTPRequestHandler):
                     "timestamp": now_iso(),
                     "isTyping": bool(is_typing),
                     "transition": typing_transition or "noop",
+                },
+            )
+            return
+
+        if action == "chat_activity":
+            chat_id = normalized_entity_id(command.get("chat_id"))
+            activity_kind = normalized_optional_string(command.get("kind")) or normalized_optional_string(command.get("activity_kind"))
+            if not chat_id or activity_kind not in {"opened", "closed", "screenshot", "screen_recording"}:
+                REALTIME_HUB.send_to_connection(
+                    client.connection_id,
+                    {
+                        "type": "system.error",
+                        "reason": "invalid_chat_activity",
+                        "timestamp": now_iso(),
+                    },
+                )
+                return
+
+            with LOCK:
+                database = load_db()
+                chat = find_chat(database, chat_id)
+            if not chat:
+                REALTIME_HUB.send_to_connection(
+                    client.connection_id,
+                    {
+                        "type": "system.error",
+                        "reason": "chat_not_found",
+                        "timestamp": now_iso(),
+                    },
+                )
+                return
+            if chat.get("mode") != "online" or chat.get("type") != "direct":
+                REALTIME_HUB.send_to_connection(
+                    client.connection_id,
+                    {
+                        "type": "system.error",
+                        "reason": "invalid_chat_activity_scope",
+                        "timestamp": now_iso(),
+                    },
+                )
+                return
+            if not any(ids_equal(participant_id, client.user_id) for participant_id in (chat.get("participantIDs") or [])):
+                REALTIME_HUB.send_to_connection(
+                    client.connection_id,
+                    {
+                        "type": "system.error",
+                        "reason": "sender_not_in_chat",
+                        "timestamp": now_iso(),
+                    },
+                )
+                return
+
+            opened_at = None
+            if activity_kind == "opened":
+                _, opened_at = REALTIME_HUB.set_chat_view_state(client.connection_id, chat_id, True)
+            elif activity_kind == "closed":
+                _, opened_at = REALTIME_HUB.set_chat_view_state(client.connection_id, chat_id, False)
+            elif activity_kind == "screen_recording":
+                recording_enabled = normalized_optional_bool(command.get("is_active"))
+                if recording_enabled is None:
+                    recording_enabled = True
+                recording_transition = REALTIME_HUB.set_screen_recording_state(client.connection_id, chat_id, recording_enabled)
+                if recording_enabled is False or recording_transition != "started":
+                    REALTIME_HUB.send_to_connection(
+                        client.connection_id,
+                        {
+                            "type": "system.chat_activity_ack",
+                            "chatID": chat_id,
+                            "mode": "online",
+                            "timestamp": now_iso(),
+                            "kind": activity_kind,
+                            "transition": recording_transition or "noop",
+                        },
+                    )
+                    return
+
+            with LOCK:
+                database = load_db()
+                fresh_chat = find_chat(database, chat_id)
+                if not fresh_chat:
+                    return
+                updated_entry = update_chat_activity_state(
+                    database,
+                    fresh_chat,
+                    client.user_id,
+                    activity_kind,
+                    opened_at=opened_at,
+                    closed_at=now_iso() if activity_kind == "closed" else None,
+                )
+                realtime_publish_chat_event(database, fresh_chat, event_type="chat.updated")
+                save_db(database)
+                try:
+                    log_chat_activity_push_dispatch_attempt(
+                        database,
+                        fresh_chat,
+                        client.user_id,
+                        activity_kind,
+                        duration_seconds=(updated_entry or {}).get("viewedDurationSeconds") if isinstance(updated_entry, dict) else None,
+                    )
+                except Exception as error:
+                    log_event(
+                        "chat_activity.push_failed",
+                        chat_id=chat_id,
+                        actor_user_id=client.user_id,
+                        activity_kind=activity_kind,
+                        error=type(error).__name__,
+                    )
+
+            REALTIME_HUB.send_to_connection(
+                client.connection_id,
+                {
+                    "type": "system.chat_activity_ack",
+                    "chatID": chat_id,
+                    "mode": "online",
+                    "timestamp": now_iso(),
+                    "kind": activity_kind,
+                    "transition": "applied",
                 },
             )
             return
